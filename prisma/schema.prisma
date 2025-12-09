@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+model Company {
+  id        Int            @id @default(autoincrement())
+  name      String
+  accounts  Account[]
+  entries   JournalEntry[]
+  events    Event[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model Account {
+  id          Int          @id @default(autoincrement())
+  companyId   Int
+  company     Company      @relation(fields: [companyId], references: [id])
+
+  code        String       // e.g. "1000", "4100"
+  name        String       // e.g. "Cash on Hand"
+  type        AccountType
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  lines       JournalLine[]
+
+  @@unique([companyId, code])  // one code per company
+}
+
+model JournalEntry {
+  id          Int           @id @default(autoincrement())
+  companyId   Int
+  company     Company       @relation(fields: [companyId], references: [id])
+
+  date        DateTime
+  description String
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  lines       JournalLine[]
+}
+
+model JournalLine {
+  id             Int           @id @default(autoincrement())
+
+  journalEntryId Int
+  journalEntry   JournalEntry  @relation(fields: [journalEntryId], references: [id])
+
+  accountId      Int
+  account        Account       @relation(fields: [accountId], references: [id])
+
+  debit          Decimal       @db.Decimal(18, 2)
+  credit         Decimal       @db.Decimal(18, 2)
+}
+
+model Event {
+  id        Int       @id @default(autoincrement())
+  companyId Int?
+  company   Company?  @relation(fields: [companyId], references: [id])
+
+  type      String    // e.g. "JournalEntryCreated"
+  payload   Json      // flexible JSON payload
+  createdAt DateTime  @default(now())
+}

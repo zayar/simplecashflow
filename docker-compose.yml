@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cashflow-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: cashflow_dev
+      MYSQL_USER: cashflow_user
+      MYSQL_PASSWORD: cashflow_pass
+    ports:
+      - "3306:3306"
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --sql-mode=STRICT_ALL_TABLES
+
+  adminer:
+    image: adminer
+    container_name: cashflow-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
