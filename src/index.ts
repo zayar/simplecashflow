@@ -1,8 +1,22 @@
 import Fastify from 'fastify';
 import { PrismaClient, AccountType } from '@prisma/client';
 
+import { PubSub } from '@google-cloud/pubsub';
+
+const pubsub = new PubSub();
+const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || 'cashflow-events';
+
 const fastify = Fastify({ logger: true });
 const prisma = new PrismaClient();
+
+async function publishLedgerEvent(event: string, data: unknown) {
+  try {
+    const buffer = Buffer.from(JSON.stringify({ event, data }));
+    await pubsub.topic(PUBSUB_TOPIC).publish(buffer);
+  } catch (err) {
+    console.error('Failed to publish Pub/Sub event', err);
+  }
+}
 
 // Health check
 fastify.get('/health', async () => {
@@ -138,14 +152,14 @@ fastify.post('/journal-entries', async (request, reply) => {
   const date = body.date ? new Date(body.date) : new Date();
 
   // Wrap in a transaction so entry + event are consistent
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx: any) => {
     const entry = await tx.journalEntry.create({
       data: {
         companyId: body.companyId!,
         date,
         description: body.description ?? '',
         lines: {
-          create: body.lines.map((line) => ({
+          create: (body.lines ?? []).map((line) => ({
             accountId: line.accountId!,
             debit: line.debit ?? 0,
             credit: line.credit ?? 0,
@@ -168,6 +182,13 @@ fastify.post('/journal-entries', async (request, reply) => {
     });
 
     return entry;
+  });
+
+  await publishLedgerEvent('journal.entry.created', {
+    companyId: body.companyId,
+    journalEntryId: result.id,
+    totalDebit,
+    totalCredit,
   });
 
   return result;
@@ -210,7 +231,7 @@ fastify.post('/integrations/piti/sale', async (request, reply) => {
 
   const date = new Date();
 
-  const entry = await prisma.$transaction(async (tx) => {
+  const entry = await prisma.$transaction(async (tx: any) => {
     const journalEntry = await tx.journalEntry.create({
       data: {
         companyId,
@@ -313,7 +334,7 @@ fastify.get('/reports/pnl', async (request, reply) => {
       if (!income[acc.code]) {
         income[acc.code] = { code: acc.code, name: acc.name, amount: 0 };
       }
-      income[acc.code].amount += delta;
+      income[acc.code]!.amount += delta;
     }
 
     if (acc.type === 'EXPENSE') {
@@ -323,7 +344,7 @@ fastify.get('/reports/pnl', async (request, reply) => {
       if (!expense[acc.code]) {
         expense[acc.code] = { code: acc.code, name: acc.name, amount: 0 };
       }
-      expense[acc.code].amount += delta;
+      expense[acc.code]!.amount += delta;
     }
   }
 
@@ -348,8 +369,9 @@ fastify.get('/reports/pnl', async (request, reply) => {
 
 const start = async () => {
   try {
-    await fastify.listen({ port: 3000, host: '0.0.0.0' });
-    console.log('Server running on http://localhost:3000');
+    const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+    await fastify.listen({ port, host: '0.0.0.0' });
+    console.log(`Server running on http://localhost:${port}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

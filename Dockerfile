@@ -1,0 +1,29 @@
+# Use Node 22 (you have Node 22 locally too)
+FROM node:22-slim
+
+# Install OpenSSL (required by Prisma)
+RUN apt-get update -y && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Install dependencies (only package.json & package-lock first for better cache)
+COPY package*.json ./
+
+RUN npm install
+
+# Copy the rest of the source
+COPY . .
+
+# Generate Prisma Client
+RUN npx prisma generate
+
+# Build TypeScript
+RUN npm run build
+
+# Expose the port Cloud Run will use
+ENV PORT=8080
+EXPOSE 8080
+
+# Start the app
+CMD ["npm", "start"]

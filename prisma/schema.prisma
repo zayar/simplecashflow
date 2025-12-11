@@ -21,6 +21,7 @@ model Company {
   accounts  Account[]
   entries   JournalEntry[]
   events    Event[]
+  summaries DailySummary[] 
   createdAt DateTime       @default(now())
   updatedAt DateTime       @updatedAt
 }
@@ -76,4 +77,16 @@ model Event {
   type      String    // e.g. "JournalEntryCreated"
   payload   Json      // flexible JSON payload
   createdAt DateTime  @default(now())
+}
+model DailySummary {
+  id           Int      @id @default(autoincrement())
+  companyId    Int
+  company      Company  @relation(fields: [companyId], references: [id])
+  date         DateTime // we will store "day" (00:00 time) here
+  totalIncome  Decimal  @db.Decimal(18, 2)
+  totalExpense Decimal  @db.Decimal(18, 2)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([companyId, date])
 }
