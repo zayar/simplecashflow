@@ -27,3 +27,4 @@ EXPOSE 8080
 # Start the worker
 CMD ["npm", "run", "start:worker"]
 
+

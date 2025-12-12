@@ -4,6 +4,16 @@ import { PrismaClient, AccountType } from '@prisma/client';
 const fastify = Fastify({ logger: true });
 const prisma = new PrismaClient();
 
+type DomainEventEnvelope = {
+  eventId: string;
+  eventType: string;
+  schemaVersion: string;
+  occurredAt: string;
+  companyId: number;
+  source: string;
+  payload: any;
+};
+
 // helper: get "day" (00:00) from a Date
 function normalizeToDay(date: Date): Date {
   const d = new Date(date);
@@ -24,15 +34,13 @@ fastify.post('/pubsub/push', async (request, reply) => {
   try {
     const dataBuffer = Buffer.from(body.message.data, 'base64');
     const decoded = dataBuffer.toString('utf8');
-    const payload = JSON.parse(decoded) as {
-      event?: string;
-      data?: any;
-    };
+    const envelope = JSON.parse(decoded) as DomainEventEnvelope;
 
-    fastify.log.info({ payload }, 'Received Pub/Sub event');
+    fastify.log.info({ envelope }, 'Received Pub/Sub event');
 
-    if (payload.event === 'journal.entry.created') {
-      await handleJournalEntryCreated(payload.data);
+    // Handle both regular journal entries and piti sales (which also create journal entries)
+    if (envelope.eventType === 'journal.entry.created' || envelope.eventType === 'piti.sale.imported') {
+      await handleJournalEntryCreated(envelope);
     }
 
     reply.status(204); // No Content
@@ -44,90 +52,115 @@ fastify.post('/pubsub/push', async (request, reply) => {
   }
 });
 
-async function handleJournalEntryCreated(data: any) {
-  const { companyId, journalEntryId } = data || {};
-  if (!companyId || !journalEntryId) {
-    fastify.log.error('Missing companyId or journalEntryId in event data', data);
-    return;
-  }
+async function handleJournalEntryCreated(event: DomainEventEnvelope) {
+  const { eventId, companyId, payload } = event;
+  const { journalEntryId } = payload || {};
 
-  // 1. Load the journal entry with its lines and accounts
-  const entry = await prisma.journalEntry.findUnique({
-    where: { id: journalEntryId },
-    include: {
-      lines: {
-        include: {
-          account: true,
-        },
-      },
-    },
-  });
-
-  if (!entry) {
-    fastify.log.error('Journal entry not found for id', journalEntryId);
-    return;
-  }
-
-  // 2. Compute how much income and expense this entry represents
-  let incomeDelta = 0;
-  let expenseDelta = 0;
-
-  for (const line of entry.lines) {
-    const acc = line.account;
-
-    // Prisma Decimal -> JS number
-    const debit = Number(line.debit);
-    const credit = Number(line.credit);
-
-    if (acc.type === AccountType.INCOME) {
-      // Income increases with credit
-      incomeDelta += credit - debit;
-    }
-
-    if (acc.type === AccountType.EXPENSE) {
-      // Expense increases with debit
-      expenseDelta += debit - credit;
-    }
-  }
-
-  if (incomeDelta === 0 && expenseDelta === 0) {
-    fastify.log.info(
-      { journalEntryId, incomeDelta, expenseDelta },
-      'No income/expense impact, skipping summary update'
+  if (!eventId || !companyId || !journalEntryId) {
+    fastify.log.error(
+      { event },
+      'Missing eventId, companyId, or journalEntryId in event payload'
     );
     return;
   }
 
-  const day = normalizeToDay(entry.date);
+  try {
+    await prisma.$transaction(async (tx) => {
+      // 1) Idempotency check: insert ProcessedEvent
+      // If eventId exists, this throws P2002
+      await tx.processedEvent.create({
+        data: { eventId },
+      });
 
-  // 3. Upsert into DailySummary for that company + date
-  fastify.log.info(
-    { companyId, day, incomeDelta, expenseDelta },
-    'Updating DailySummary'
-  );
+      // 2) Load the journal entry with its lines and accounts
+      const entry = await tx.journalEntry.findUnique({
+        where: { id: journalEntryId },
+        include: {
+          lines: {
+            include: {
+              account: true,
+            },
+          },
+        },
+      });
 
-  await prisma.dailySummary.upsert({
-    where: {
-      companyId_date: {
-        companyId,
-        date: day,
-      },
-    },
-    update: {
-      totalIncome: {
-        increment: incomeDelta,
-      },
-      totalExpense: {
-        increment: expenseDelta,
-      },
-    },
-    create: {
-      companyId,
-      date: day,
-      totalIncome: incomeDelta,
-      totalExpense: expenseDelta,
-    },
-  });
+      if (!entry) {
+        fastify.log.error('Journal entry not found for id', journalEntryId);
+        return;
+      }
+
+      // 3) Compute how much income and expense this entry represents
+      let incomeDelta = 0;
+      let expenseDelta = 0;
+
+      for (const line of entry.lines) {
+        const acc = line.account;
+        const debit = Number(line.debit);
+        const credit = Number(line.credit);
+
+        if (acc.type === AccountType.INCOME) {
+          // Income increases with credit
+          incomeDelta += credit - debit;
+        }
+
+        if (acc.type === AccountType.EXPENSE) {
+          // Expense increases with debit
+          expenseDelta += debit - credit;
+        }
+      }
+
+      if (incomeDelta === 0 && expenseDelta === 0) {
+        fastify.log.info(
+          { journalEntryId, incomeDelta, expenseDelta },
+          'No income/expense impact, skipping summary update'
+        );
+        return;
+      }
+
+      const day = normalizeToDay(entry.date);
+
+      // 4) Upsert into DailySummary for that company + date
+      fastify.log.info(
+        { companyId, day, incomeDelta, expenseDelta },
+        'Updating DailySummary'
+      );
+
+      await tx.dailySummary.upsert({
+        where: {
+          companyId_date: {
+            companyId,
+            date: day,
+          },
+        },
+        update: {
+          totalIncome: {
+            increment: incomeDelta,
+          },
+          totalExpense: {
+            increment: expenseDelta,
+          },
+        },
+        create: {
+          companyId,
+          date: day,
+          totalIncome: incomeDelta,
+          totalExpense: expenseDelta,
+        },
+      });
+    });
+  } catch (err: any) {
+    // If ProcessedEvent unique constraint fails, it means we already processed this eventId
+    if (err.code === 'P2002') {
+      fastify.log.warn(
+        { eventId },
+        'Duplicate event detected, skipping (idempotent)'
+      );
+      return;
+    }
+
+    fastify.log.error({ err, eventId }, 'Error handling journal entry event');
+    throw err;
+  }
 }
 
 const start = async () => {

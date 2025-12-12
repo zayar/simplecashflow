@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { PrismaClient, AccountType } from '@prisma/client';
-
+import { randomUUID } from 'node:crypto';
 import { PubSub } from '@google-cloud/pubsub';
 
 const pubsub = new PubSub();
@@ -9,10 +9,31 @@ const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || 'cashflow-events';
 const fastify = Fastify({ logger: true });
 const prisma = new PrismaClient();
 
-async function publishLedgerEvent(event: string, data: unknown) {
+type DomainEventEnvelope = {
+  eventId: string;
+  eventType: string;
+  schemaVersion: string;
+  occurredAt: string;
+  companyId: number;
+  source: string;
+  payload: any;
+};
+
+async function publishDomainEvent(event: DomainEventEnvelope) {
   try {
-    const buffer = Buffer.from(JSON.stringify({ event, data }));
-    await pubsub.topic(PUBSUB_TOPIC).publish(buffer);
+    const dataBuffer = Buffer.from(JSON.stringify(event));
+
+    const attributes = {
+      eventId: event.eventId,
+      eventType: event.eventType,
+      companyId: event.companyId.toString(),
+      schemaVersion: event.schemaVersion,
+    };
+
+    await pubsub.topic(PUBSUB_TOPIC).publishMessage({
+      data: dataBuffer,
+      attributes,
+    });
   } catch (err) {
     console.error('Failed to publish Pub/Sub event', err);
   }
@@ -151,6 +172,13 @@ fastify.post('/journal-entries', async (request, reply) => {
 
   const date = body.date ? new Date(body.date) : new Date();
 
+  // Prepare event data
+  const eventId = randomUUID();
+  const occurredAt = new Date().toISOString();
+  const eventType = 'journal.entry.created';
+  const schemaVersion = 'v1';
+  const source = 'cashflow-api';
+
   // Wrap in a transaction so entry + event are consistent
   const result = await prisma.$transaction(async (tx: any) => {
     const entry = await tx.journalEntry.create({
@@ -172,9 +200,15 @@ fastify.post('/journal-entries', async (request, reply) => {
     await tx.event.create({
       data: {
         companyId: body.companyId!,
-        type: 'JournalEntryCreated',
+        eventId,
+        eventType,
+        schemaVersion,
+        occurredAt: new Date(occurredAt),
+        source,
+        type: 'JournalEntryCreated', // Legacy field, keeping for now
         payload: {
           journalEntryId: entry.id,
+          companyId: body.companyId!,
           totalDebit,
           totalCredit,
         },
@@ -184,12 +218,22 @@ fastify.post('/journal-entries', async (request, reply) => {
     return entry;
   });
 
-  await publishLedgerEvent('journal.entry.created', {
-    companyId: body.companyId,
-    journalEntryId: result.id,
-    totalDebit,
-    totalCredit,
-  });
+  const envelope: DomainEventEnvelope = {
+    eventId,
+    eventType,
+    schemaVersion,
+    occurredAt,
+    companyId: body.companyId!,
+    source,
+    payload: {
+      journalEntryId: result.id,
+      companyId: body.companyId!,
+      totalDebit,
+      totalCredit,
+    },
+  };
+
+  await publishDomainEvent(envelope);
 
   return result;
 });
@@ -231,6 +275,13 @@ fastify.post('/integrations/piti/sale', async (request, reply) => {
 
   const date = new Date();
 
+  // Prepare event data
+  const eventId = randomUUID();
+  const occurredAt = new Date().toISOString();
+  const eventType = 'piti.sale.imported'; // Differentiated event type
+  const schemaVersion = 'v1';
+  const source = 'integration:piti';
+
   const entry = await prisma.$transaction(async (tx: any) => {
     const journalEntry = await tx.journalEntry.create({
       data: {
@@ -258,7 +309,12 @@ fastify.post('/integrations/piti/sale', async (request, reply) => {
     await tx.event.create({
       data: {
         companyId,
-        type: 'PitiSaleImported',
+        eventId,
+        eventType,
+        schemaVersion,
+        occurredAt: new Date(occurredAt),
+        source,
+        type: 'PitiSaleImported', // Legacy field
         payload: {
           journalEntryId: journalEntry.id,
           amount,
@@ -268,6 +324,21 @@ fastify.post('/integrations/piti/sale', async (request, reply) => {
 
     return journalEntry;
   });
+
+  const envelope: DomainEventEnvelope = {
+    eventId,
+    eventType,
+    schemaVersion,
+    occurredAt,
+    companyId,
+    source,
+    payload: {
+      journalEntryId: entry.id,
+      amount,
+    },
+  };
+
+  await publishDomainEvent(envelope);
 
   return entry;
 });
@@ -385,6 +456,6 @@ const DEFAULT_ACCOUNTS = [
   { code: "3000", name: "Owner Equity", type: "EQUITY" as const },
   { code: "4000", name: "Sales Income", type: "INCOME" as const },
   { code: "5000", name: "General Expense", type: "EXPENSE" as const },
-];
+  ];
 
 start();

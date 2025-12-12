@@ -74,10 +74,23 @@ model Event {
   companyId Int?
   company   Company?  @relation(fields: [companyId], references: [id])
 
+  eventId       String   @unique      // same ID we publish to Pub/Sub
+  eventType     String               // e.g. "journal.entry.created"
+  schemaVersion String               // e.g. "v1"
+  occurredAt    DateTime @default(now())
+  source        String?              // e.g. "cashflow-api"
+
   type      String    // e.g. "JournalEntryCreated"
   payload   Json      // flexible JSON payload
   createdAt DateTime  @default(now())
 }
+
+model ProcessedEvent {
+  id          Int      @id @default(autoincrement())
+  eventId     String   @unique
+  processedAt DateTime @default(now())
+}
+
 model DailySummary {
   id           Int      @id @default(autoincrement())
   companyId    Int
