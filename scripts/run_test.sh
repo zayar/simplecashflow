@@ -23,7 +23,7 @@ NC='\033[0m' # No Color
 
 # Step 1: Check API health
 echo "Step 1: Checking API health..."
-API_HEALTH=$(curl -s "$API_URL/health")
+API_HEALTH=$(curl -k -s "$API_URL/health")
 if echo "$API_HEALTH" | grep -q "ok"; then
   echo -e "${GREEN}✅ API is healthy${NC}"
 else
@@ -35,7 +35,7 @@ echo ""
 
 # Step 2: Get companies (to verify companyId exists)
 echo "Step 2: Fetching companies..."
-COMPANIES=$(curl -s "$API_URL/companies")
+COMPANIES=$(curl -k -s "$API_URL/companies")
 if echo "$COMPANIES" | grep -q "error"; then
   echo -e "${YELLOW}⚠️  Could not fetch companies (database connection issue?)${NC}"
   echo "Response: $COMPANIES"
@@ -50,7 +50,7 @@ fi
 
 # Step 3: Get accounts for the company
 echo "Step 3: Fetching accounts for company $COMPANY_ID..."
-ACCOUNTS=$(curl -s "$API_URL/companies/$COMPANY_ID/accounts")
+ACCOUNTS=$(curl -k -s "$API_URL/companies/$COMPANY_ID/accounts")
 if echo "$ACCOUNTS" | grep -q "error"; then
   echo -e "${YELLOW}⚠️  Could not fetch accounts${NC}"
   echo "Response: $ACCOUNTS"
@@ -125,7 +125,7 @@ echo "Payload:"
 echo "$ENTRY_PAYLOAD" | python3 -m json.tool 2>/dev/null || echo "$ENTRY_PAYLOAD"
 echo ""
 
-ENTRY_RESPONSE=$(curl -s -X POST "$API_URL/journal-entries" \
+ENTRY_RESPONSE=$(curl -k -s -X POST "$API_URL/journal-entries" \
   -H "Content-Type: application/json" \
   -d "$ENTRY_PAYLOAD")
 

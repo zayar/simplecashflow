@@ -26,16 +26,54 @@ gcloud config set project "$PROJECT_ID" 1>/dev/null
 
 # ---- Build images ----
 echo "Building images with Cloud Build..."
-gcloud builds submit --config cloudbuild.api.yaml
-#gcloud builds submit --config cloudbuild.worker.yaml
-gcloud builds submit --config cloudbuild.publisher.yaml
+# Note: config is in ./deploy/, but build needs root context, so we pass current directory '.' as source
+# but point to the config file in deploy/ folder.
+# Actually, gcloud builds submit takes source as arg (default .).
+# We must ensure we run this script from project root or adjust paths.
+
+# Assuming user runs ./deploy/deploy_gcp.sh from root, or we cd to root.
+# Let's find root based on script location.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+echo "Deploying from root: $ROOT_DIR"
+cd "$ROOT_DIR"
+
+gcloud builds submit --config deploy/cloudbuild.api.yaml .
+#gcloud builds submit --config deploy/cloudbuild.worker.yaml .
+gcloud builds submit --config deploy/cloudbuild.publisher.yaml .
 # NOTE: uncomment the line above if you want to rebuild worker every run.
 
-# ---- Apply migrations to Cloud SQL via public IP ----
-# (Using public IP because your machine is already authorized. For production hardening,
-# prefer running migrations from a private build/job inside GCP.)
-echo "Applying Prisma migrations to Cloud SQL (${DB_PUBLIC_IP})..."
-export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@${DB_PUBLIC_IP}:3306/${DB_NAME}"
+# ---- Apply migrations to Cloud SQL via Proxy ----
+echo "Setting up Cloud SQL Proxy..."
+
+if command -v cloud-sql-proxy >/dev/null; then
+  PROXY_CMD="cloud-sql-proxy"
+elif [ -f "./cloud-sql-proxy" ]; then
+  PROXY_CMD="./cloud-sql-proxy"
+else
+  echo "Downloading cloud-sql-proxy..."
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.darwin.amd64
+  else
+    curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.linux.amd64
+  fi
+  chmod +x cloud-sql-proxy
+  PROXY_CMD="./cloud-sql-proxy"
+fi
+
+echo "Starting proxy on port 3307..."
+$PROXY_CMD --address 0.0.0.0 --port 3307 "$INSTANCE_CONN" > /dev/null 2>&1 &
+PROXY_PID=$!
+
+# Ensure proxy is killed on script exit
+trap "kill $PROXY_PID 2>/dev/null" EXIT
+
+echo "Waiting for proxy..."
+sleep 5
+
+echo "Applying Prisma migrations to Cloud SQL..."
+export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@localhost:3307/${DB_NAME}"
 npx prisma migrate deploy
 
 # ---- Create runtime service account (if missing) ----

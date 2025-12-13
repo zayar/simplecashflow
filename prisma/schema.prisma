@@ -27,6 +27,11 @@ enum InvoiceStatus {
   PARTIAL
 }
 
+enum ExpenseStatus {
+  DRAFT
+  POSTED
+}
+
 model Company {
   id        Int            @id @default(autoincrement())
   name      String
@@ -38,7 +43,11 @@ model Company {
   items     Item[]
   invoices  Invoice[]
   payments  Payment[]
+  expenses  Expense[]
   users     User[]
+  journalLines JournalLine[]
+  processedEvents ProcessedEvent[]
+  invoiceLines InvoiceLine[]
 
   // Default account settings for this company (multi-tenant safe).
   // Used when posting invoices (Debit AR).
@@ -87,10 +96,13 @@ model JournalEntry {
   // Documents that created this journal entry (optional)
   invoice     Invoice? @relation("Invoice_JournalEntry")
   payment     Payment? @relation("Payment_JournalEntry")
+  expense     Expense? @relation("Expense_JournalEntry")
 }
 
 model JournalLine {
   id             Int           @id @default(autoincrement())
+  companyId      Int
+  company        Company       @relation(fields: [companyId], references: [id])
 
   journalEntryId Int
   journalEntry   JournalEntry  @relation(fields: [journalEntryId], references: [id])
@@ -100,6 +112,8 @@ model JournalLine {
 
   debit          Decimal       @db.Decimal(18, 2)
   credit         Decimal       @db.Decimal(18, 2)
+  
+  @@index([companyId])
 }
 
 model Event {
@@ -140,7 +154,11 @@ model Event {
 model ProcessedEvent {
   id          Int      @id @default(autoincrement())
   eventId     String   @unique
+  companyId   Int
+  company     Company  @relation(fields: [companyId], references: [id])
   processedAt DateTime @default(now())
+
+  @@index([companyId])
 }
 
 model DailySummary {
@@ -198,6 +216,7 @@ model Item {
 
   isActive         Boolean  @default(true)
   invoiceLines     InvoiceLine[]
+  expenses         Expense[]
 
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -236,6 +255,9 @@ model Invoice {
 
 model InvoiceLine {
   id          Int      @id @default(autoincrement())
+  companyId   Int
+  company     Company  @relation(fields: [companyId], references: [id])
+
   invoiceId    Int
   invoice       Invoice  @relation(fields: [invoiceId], references: [id])
 
@@ -247,6 +269,8 @@ model InvoiceLine {
   unitPrice    Decimal  @db.Decimal(18, 2)
   lineTotal    Decimal  @db.Decimal(18, 2)
   taxRate      Decimal? @db.Decimal(5, 2)
+
+  @@index([companyId])
 }
 
 model Payment {
@@ -271,6 +295,35 @@ model Payment {
 
   @@index([companyId, paymentDate])
   @@index([invoiceId])
+}
+
+model Expense {
+  id            Int      @id @default(autoincrement())
+  companyId      Int
+  company        Company  @relation(fields: [companyId], references: [id])
+
+  expenseNumber  String
+  status         ExpenseStatus
+  expenseDate    DateTime
+  description    String
+
+  amount         Decimal  @db.Decimal(18, 2)
+  currency       String?
+
+  // Optional item reference for COGS tracking
+  itemId         Int?
+  item           Item?    @relation(fields: [itemId], references: [id])
+
+  // When posted, links to journal entry (Debit expense account, Credit cash/bank)
+  journalEntryId Int?     @unique
+  journalEntry   JournalEntry? @relation("Expense_JournalEntry", fields: [journalEntryId], references: [id])
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, expenseNumber])
+  @@index([companyId, expenseDate])
+  @@index([companyId, status])
 }
 
 model User {
