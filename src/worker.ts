@@ -1,18 +1,11 @@
 import Fastify from 'fastify';
 import { PrismaClient, AccountType } from '@prisma/client';
+import type { DomainEventEnvelopeV1 } from './events/domainEvent.js';
 
 const fastify = Fastify({ logger: true });
 const prisma = new PrismaClient();
 
-type DomainEventEnvelope = {
-  eventId: string;
-  eventType: string;
-  schemaVersion: string;
-  occurredAt: string;
-  companyId: number;
-  source: string;
-  payload: any;
-};
+type DomainEventEnvelope = DomainEventEnvelopeV1<any>;
 
 // helper: get "day" (00:00) from a Date
 function normalizeToDay(date: Date): Date {
@@ -38,8 +31,13 @@ fastify.post('/pubsub/push', async (request, reply) => {
 
     fastify.log.info({ envelope }, 'Received Pub/Sub event');
 
-    // Handle both regular journal entries and piti sales (which also create journal entries)
-    if (envelope.eventType === 'journal.entry.created' || envelope.eventType === 'piti.sale.imported') {
+    // Handle both regular journal entries and Piti sales (which also create journal entries)
+    // Keep backward compatibility for older eventType values.
+    if (
+      envelope.eventType === 'journal.entry.created' ||
+      envelope.eventType === 'integration.piti.sale.imported' ||
+      envelope.eventType === 'piti.sale.imported'
+    ) {
       await handleJournalEntryCreated(envelope);
     }
 
