@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import bcrypt from 'bcryptjs';
 import { DEFAULT_ACCOUNTS } from '../companies/company.constants.js';
+import { AccountType, BankingAccountKind } from '@prisma/client';
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/register', async (request, reply) => {
@@ -50,6 +51,29 @@ export async function authRoutes(fastify: FastifyInstance) {
           where: { id: company.id },
           data: { accountsReceivableAccountId: arAccount.id }
         });
+      }
+
+      // Create default BankingAccount for Cash (so "Deposit To" can be restricted safely).
+      const cashAccount = company.accounts.find(
+        (a) => a.code === '1000' || a.name.toLowerCase().includes('cash')
+      );
+      if (cashAccount) {
+        // Ensure it's an ASSET account
+        if (cashAccount.type === AccountType.ASSET) {
+          await tx.bankingAccount.create({
+            data: {
+              companyId: company.id,
+              accountId: cashAccount.id,
+              kind: BankingAccountKind.CASH,
+              bankName: null,
+              accountNumber: null,
+              identifierCode: null,
+              branch: null,
+              description: 'Default cash account',
+              isPrimary: true,
+            },
+          });
+        }
       }
 
       const user = await tx.user.create({

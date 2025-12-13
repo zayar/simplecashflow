@@ -32,119 +32,167 @@ enum ExpenseStatus {
   POSTED
 }
 
+enum BankingAccountKind {
+  CASH
+  BANK
+  E_WALLET
+  CREDIT_CARD
+}
+
 model Company {
-  id        Int            @id @default(autoincrement())
-  name      String
-  accounts  Account[]
-  entries   JournalEntry[]
-  events    Event[]
-  summaries DailySummary[] 
-  customers Customer[]
-  items     Item[]
-  invoices  Invoice[]
-  payments  Payment[]
-  expenses  Expense[]
-  users     User[]
-  journalLines JournalLine[]
+  id              Int              @id @default(autoincrement())
+  name            String
+  accounts        Account[]
+  entries         JournalEntry[]
+  events          Event[]
+  summaries       DailySummary[]
+  customers       Customer[]
+  items           Item[]
+  invoices        Invoice[]
+  payments        Payment[]
+  expenses        Expense[]
+  users           User[]
+  journalLines    JournalLine[]
   processedEvents ProcessedEvent[]
-  invoiceLines InvoiceLine[]
+  invoiceLines    InvoiceLine[]
+  bankingAccounts BankingAccount[]
 
   // Default account settings for this company (multi-tenant safe).
   // Used when posting invoices (Debit AR).
   accountsReceivableAccountId Int?
   accountsReceivableAccount   Account? @relation("Company_AR", fields: [accountsReceivableAccountId], references: [id])
 
-  createdAt DateTime       @default(now())
-  updatedAt DateTime       @updatedAt
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  idempotentRequests IdempotentRequest[]
 }
 
 model Account {
-  id          Int          @id @default(autoincrement())
-  companyId   Int
-  company     Company      @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  code        String       // e.g. "1000", "4100"
-  name        String       // e.g. "Cash on Hand"
-  type        AccountType
-  isActive    Boolean      @default(true)
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  code      String // e.g. "1000", "4100"
+  name      String // e.g. "Cash on Hand"
+  type      AccountType
+  isActive  Boolean     @default(true)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
 
-  lines       JournalLine[]
+  lines JournalLine[]
 
   // Books layer relations
   accountsReceivableFor Company[] @relation("Company_AR")
   incomeItems           Item[]    @relation("Account_IncomeItems")
   expenseItems          Item[]    @relation("Account_ExpenseItems")
   bankPayments          Payment[] @relation("Payment_BankAccount")
+  bankingAccount        BankingAccount?
 
-  @@unique([companyId, code])  // one code per company
+  @@unique([companyId, code]) // one code per company
+}
+
+model BankingAccount {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  // Each banking account maps 1:1 to a Chart of Accounts Account (ASSET).
+  accountId Int     @unique
+  account   Account @relation(fields: [accountId], references: [id])
+
+  kind BankingAccountKind
+
+  bankName       String?
+  accountNumber  String?
+  identifierCode String?
+  branch         String?
+  description    String? @db.Text
+  isPrimary      Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId])
 }
 
 model JournalEntry {
-  id          Int           @id @default(autoincrement())
-  companyId   Int
-  company     Company       @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
   date        DateTime
   description String
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  lines       JournalLine[]
+  // Audit trail: who created this entry (nullable for system/integration jobs)
+  createdByUserId Int?
+  createdByUser   User? @relation(fields: [createdByUserId], references: [id])
+
+  // Immutable ledger semantics:
+  // - Journal entries should never be edited after creation (use reversal/adjustment).
+  // - Reversal links back to the original entry.
+  postedAt DateTime @default(now())
+  reversalOfJournalEntryId Int? @unique
+  reversalOfJournalEntry   JournalEntry? @relation("JournalEntry_Reversal", fields: [reversalOfJournalEntryId], references: [id])
+  reversalEntry            JournalEntry? @relation("JournalEntry_Reversal")
+  reversalReason           String? @db.Text
+
+  lines JournalLine[]
 
   // Documents that created this journal entry (optional)
-  invoice     Invoice? @relation("Invoice_JournalEntry")
-  payment     Payment? @relation("Payment_JournalEntry")
-  expense     Expense? @relation("Expense_JournalEntry")
+  invoice Invoice? @relation("Invoice_JournalEntry")
+  payment Payment? @relation("Payment_JournalEntry")
+  paymentReversal Payment? @relation("Payment_ReversalJournalEntry")
+  expense Expense? @relation("Expense_JournalEntry")
 }
 
 model JournalLine {
-  id             Int           @id @default(autoincrement())
-  companyId      Int
-  company        Company       @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
   journalEntryId Int
-  journalEntry   JournalEntry  @relation(fields: [journalEntryId], references: [id])
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id])
 
-  accountId      Int
-  account        Account       @relation(fields: [accountId], references: [id])
+  accountId Int
+  account   Account @relation(fields: [accountId], references: [id])
 
-  debit          Decimal       @db.Decimal(18, 2)
-  credit         Decimal       @db.Decimal(18, 2)
-  
+  debit  Decimal @db.Decimal(18, 2)
+  credit Decimal @db.Decimal(18, 2)
+
   @@index([companyId])
 }
 
 model Event {
-  id        Int       @id @default(autoincrement())
+  id        Int      @id @default(autoincrement())
   companyId Int?
-  company   Company?  @relation(fields: [companyId], references: [id])
+  company   Company? @relation(fields: [companyId], references: [id])
 
-  eventId       String   @unique      // same ID we publish to Pub/Sub
-  eventType     String               // e.g. "journal.entry.created"
-  schemaVersion String               // e.g. "v1"
+  eventId       String   @unique // same ID we publish to Pub/Sub
+  eventType     String // e.g. "journal.entry.created"
+  schemaVersion String // e.g. "v1"
   occurredAt    DateTime @default(now())
-  source        String?              // e.g. "cashflow-api"
+  source        String? // e.g. "cashflow-api"
 
   // --- Event envelope metadata (Step 1) ---
-  partitionKey  String?  // recommended: String(companyId)
-  correlationId String?  // recommended: eventId for first event in flow
+  partitionKey  String? // recommended: String(companyId)
+  correlationId String? // recommended: eventId for first event in flow
   causationId   String?
-  aggregateType String?  // e.g. "JournalEntry"
-  aggregateId   String?  // e.g. "123"
+  aggregateType String? // e.g. "JournalEntry"
+  aggregateId   String? // e.g. "123"
 
   // --- Outbox fields (Step 2) ---
-  publishedAt           DateTime?
-  nextPublishAttemptAt  DateTime? @default(now())
-  publishAttempts       Int      @default(0)
-  lastPublishError      String?  @db.Text
-  lockedAt              DateTime?
-  lockId                String?
+  publishedAt          DateTime?
+  nextPublishAttemptAt DateTime? @default(now())
+  publishAttempts      Int       @default(0)
+  lastPublishError     String?   @db.Text
+  lockedAt             DateTime?
+  lockId               String?
 
-  type      String    // e.g. "JournalEntryCreated"
-  payload   Json      // flexible JSON payload
-  createdAt DateTime  @default(now())
+  type      String // e.g. "JournalEntryCreated"
+  payload   Json // flexible JSON payload
+  createdAt DateTime @default(now())
 
   @@index([publishedAt, nextPublishAttemptAt])
   @@index([lockedAt])
@@ -177,76 +225,78 @@ model DailySummary {
 // --- Books layer (documents on top of ledger) ---
 
 model Customer {
-  id             Int      @id @default(autoincrement())
-  companyId       Int
-  company         Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  name            String
-  email           String?
-  phone           String?
-  currency        String?  // e.g. "MMK"
-  openingBalance  Decimal? @db.Decimal(18, 2)
+  name           String
+  email          String?
+  phone          String?
+  currency       String? // e.g. "MMK"
+  openingBalance Decimal? @db.Decimal(18, 2)
 
-  invoices        Invoice[]
+  invoices Invoice[]
 
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId])
 }
 
 model Item {
-  id              Int      @id @default(autoincrement())
-  companyId        Int
-  company          Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  name             String
-  sku              String?
-  type             ItemType
-  sellingPrice     Decimal  @db.Decimal(18, 2)
-  costPrice        Decimal? @db.Decimal(18, 2)
+  name         String
+  sku          String?
+  type         ItemType
+  sellingPrice Decimal  @db.Decimal(18, 2)
+  costPrice    Decimal? @db.Decimal(18, 2)
 
   // Revenue account for sales (should be INCOME)
-  incomeAccountId  Int
-  incomeAccount    Account  @relation("Account_IncomeItems", fields: [incomeAccountId], references: [id])
+  incomeAccountId Int
+  incomeAccount   Account @relation("Account_IncomeItems", fields: [incomeAccountId], references: [id])
 
   // Optional expense account for COGS later
   expenseAccountId Int?
   expenseAccount   Account? @relation("Account_ExpenseItems", fields: [expenseAccountId], references: [id])
 
-  isActive         Boolean  @default(true)
-  invoiceLines     InvoiceLine[]
-  expenses         Expense[]
+  isActive     Boolean       @default(true)
+  invoiceLines InvoiceLine[]
+  expenses     Expense[]
 
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId])
 }
 
 model Invoice {
-  id            Int      @id @default(autoincrement())
-  companyId      Int
-  company        Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  customerId     Int
-  customer       Customer @relation(fields: [customerId], references: [id])
+  customerId Int
+  customer   Customer @relation(fields: [customerId], references: [id])
 
-  invoiceNumber  String
-  status         InvoiceStatus
-  invoiceDate    DateTime
-  dueDate        DateTime?
-  currency       String?
-  total          Decimal  @db.Decimal(18, 2) // recomputed and stored when posted
+  invoiceNumber String
+  status        InvoiceStatus
+  invoiceDate   DateTime
+  dueDate       DateTime?
+  currency      String?
+  total         Decimal       @db.Decimal(18, 2) // recomputed and stored when posted
+  // Denormalized for performance (avoid summing Payment table on every payment record).
+  amountPaid    Decimal       @db.Decimal(18, 2) @default(0)
 
-  journalEntryId Int?     @unique
+  journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
 
-  lines          InvoiceLine[]
-  payments       Payment[]
+  lines    InvoiceLine[]
+  payments Payment[]
 
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([companyId, invoiceNumber])
   @@index([companyId, invoiceDate])
@@ -254,72 +304,80 @@ model Invoice {
 }
 
 model InvoiceLine {
-  id          Int      @id @default(autoincrement())
-  companyId   Int
-  company     Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  invoiceId    Int
-  invoice       Invoice  @relation(fields: [invoiceId], references: [id])
+  invoiceId Int
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
 
-  itemId       Int
-  item         Item     @relation(fields: [itemId], references: [id])
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
 
-  description  String?
-  quantity     Decimal  @db.Decimal(18, 2)
-  unitPrice    Decimal  @db.Decimal(18, 2)
-  lineTotal    Decimal  @db.Decimal(18, 2)
-  taxRate      Decimal? @db.Decimal(5, 2)
+  description String?
+  quantity    Decimal  @db.Decimal(18, 2)
+  unitPrice   Decimal  @db.Decimal(18, 2)
+  lineTotal   Decimal  @db.Decimal(18, 2)
+  taxRate     Decimal? @db.Decimal(5, 2)
 
   @@index([companyId])
 }
 
 model Payment {
-  id            Int      @id @default(autoincrement())
-  companyId      Int
-  company        Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  invoiceId      Int
-  invoice        Invoice  @relation(fields: [invoiceId], references: [id])
+  invoiceId Int
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
 
-  paymentDate    DateTime
-  amount         Decimal  @db.Decimal(18, 2)
+  paymentDate DateTime
+  amount      Decimal  @db.Decimal(18, 2)
 
-  bankAccountId  Int
-  bankAccount    Account  @relation("Payment_BankAccount", fields: [bankAccountId], references: [id])
+  bankAccountId Int
+  bankAccount   Account @relation("Payment_BankAccount", fields: [bankAccountId], references: [id])
 
-  journalEntryId Int?     @unique
+  journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Payment_JournalEntry", fields: [journalEntryId], references: [id])
 
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
+  reversedAt              DateTime?
+  reversalReason          String?   @db.Text
+  reversalJournalEntryId  Int?      @unique
+  reversalJournalEntry    JournalEntry? @relation("Payment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUserId        Int?
+  reversedByUser          User? @relation("User_ReversedPayments", fields: [reversedByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([companyId, paymentDate])
   @@index([invoiceId])
 }
 
 model Expense {
-  id            Int      @id @default(autoincrement())
-  companyId      Int
-  company        Company  @relation(fields: [companyId], references: [id])
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
 
-  expenseNumber  String
-  status         ExpenseStatus
-  expenseDate    DateTime
-  description    String
+  expenseNumber String
+  status        ExpenseStatus
+  expenseDate   DateTime
+  description   String
 
-  amount         Decimal  @db.Decimal(18, 2)
-  currency       String?
+  amount   Decimal @db.Decimal(18, 2)
+  currency String?
 
   // Optional item reference for COGS tracking
-  itemId         Int?
-  item           Item?    @relation(fields: [itemId], references: [id])
+  itemId Int?
+  item   Item? @relation(fields: [itemId], references: [id])
 
   // When posted, links to journal entry (Debit expense account, Credit cash/bank)
-  journalEntryId Int?     @unique
+  journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Expense_JournalEntry", fields: [journalEntryId], references: [id])
 
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([companyId, expenseNumber])
   @@index([companyId, expenseDate])
@@ -329,12 +387,31 @@ model Expense {
 model User {
   id        Int      @id @default(autoincrement())
   email     String   @unique
-  password  String   // hashed
+  password  String // hashed
   name      String?
   companyId Int
   company   Company  @relation(fields: [companyId], references: [id])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  journalEntriesCreated JournalEntry[]
+  reversedPayments      Payment[] @relation("User_ReversedPayments")
+
   @@index([companyId])
+}
+
+// Command-level idempotency for HTTP writes (safe under retries).
+// Unique per (companyId, key). Store the previously returned response so retries can return the same result.
+model IdempotentRequest {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  key      String
+  response Json
+
+  createdAt DateTime @default(now())
+
+  @@unique([companyId, key])
+  @@index([companyId, createdAt])
 }

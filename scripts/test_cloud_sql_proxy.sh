@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Test Cloud SQL Proxy connectivity
 echo "Testing Cloud SQL Proxy setup..."
@@ -19,24 +20,49 @@ DB_USER="root"
 
 # Start Cloud SQL Proxy
 echo "Starting Cloud SQL Proxy..."
-./cloud-sql-proxy --address 0.0.0.0 --port 3307 "$INSTANCE_CONN" > /dev/null 2>&1 &
+PROXY_BIN=""
+if command -v cloud-sql-proxy >/dev/null 2>&1; then
+  PROXY_BIN="cloud-sql-proxy"
+elif [ -f "./cloud-sql-proxy" ]; then
+  PROXY_BIN="./cloud-sql-proxy"
+else
+  echo "❌ cloud-sql-proxy not found (expected ./cloud-sql-proxy or cloud-sql-proxy in PATH)"
+  exit 1
+fi
+
+PROXY_LOG="$(mktemp -t cloud-sql-proxy.XXXXXX.log)"
+echo "Proxy log: $PROXY_LOG"
+
+# Bind to localhost for safety; show logs for debugging.
+$PROXY_BIN --address 127.0.0.1 --port 3307 "$INSTANCE_CONN" > "$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 
 # Wait for proxy to start
 sleep 3
 
+# Fail fast if proxy already exited
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  echo "❌ Cloud SQL Proxy exited early. Logs:"
+  cat "$PROXY_LOG" || true
+  exit 1
+fi
+
 # Test database connection
 echo "Testing database connection..."
 export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@localhost:3307/${DB_NAME}"
+echo "DATABASE_URL=mysql://${DB_USER}:***@localhost:3307/${DB_NAME}"
 
 # Try to connect using mysql2 (if available) or just check if port is open
 if command -v mysql >/dev/null 2>&1; then
   echo "Testing with mysql client..."
   mysql --version
-  if mysql -h localhost -P 3307 -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "SELECT 1 as test;" 2>/dev/null; then
+  # Force TCP to avoid MySQL client trying unix socket (/tmp/mysql.sock) on some setups.
+  if mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "SELECT 1 as test;"; then
     echo "✅ Database connection successful!"
   else
     echo "❌ Database connection failed"
+    echo "---- Proxy logs (last 200 lines) ----"
+    tail -n 200 "$PROXY_LOG" || true
   fi
 else
   echo "MySQL client not available, testing port connectivity..."
@@ -44,6 +70,8 @@ else
     echo "✅ Port 3307 is open (proxy running)"
   else
     echo "❌ Port 3307 is not accessible"
+    echo "---- Proxy logs (last 200 lines) ----"
+    tail -n 200 "$PROXY_LOG" || true
   fi
 fi
 

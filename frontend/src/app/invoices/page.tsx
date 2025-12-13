@@ -6,12 +6,20 @@ import { fetchApi } from '@/lib/api';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Plus, CheckCircle, DollarSign } from 'lucide-react';
+import { Plus, CheckCircle, DollarSign, Eye } from 'lucide-react';
 
 export default function InvoicesPage() {
   const { user } = useAuth();
   const [invoices, setInvoices] = useState<any[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const makeIdempotencyKey = () => {
+    // Browser-safe unique key (best effort).
+    // crypto.randomUUID is supported in modern browsers; fallback is timestamp+random.
+    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? (crypto as any).randomUUID()
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
 
   useEffect(() => {
     if (user?.companyId) {
@@ -28,6 +36,9 @@ export default function InvoicesPage() {
     try {
       await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/post`, {
         method: 'POST',
+        headers: {
+          'Idempotency-Key': makeIdempotencyKey(),
+        },
         body: JSON.stringify({}), // Fix: Send empty JSON object to satisfy Content-Type
       });
       setRefreshKey((k) => k + 1); // Refresh list
@@ -83,6 +94,11 @@ export default function InvoicesPage() {
                     </td>
                     <td className="p-4 align-middle text-right font-medium">{Number(inv.total).toLocaleString()}</td>
                     <td className="p-4 align-middle text-right flex justify-end gap-2">
+                      <Link href={`/invoices/${inv.id}`}>
+                        <Button variant="ghost" size="sm">
+                          <Eye className="mr-2 h-4 w-4" /> View
+                        </Button>
+                      </Link>
                       {inv.status === 'DRAFT' && (
                         <Button variant="ghost" size="sm" onClick={() => handlePost(inv.id)}>
                           <CheckCircle className="mr-2 h-4 w-4" /> Post

@@ -1,49 +1,34 @@
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
-import { parseCompanyId } from '../../utils/request.js';
-import { AccountType } from '@prisma/client';
+import { AccountType, BankingAccountKind } from '@prisma/client';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
+import { enforceCompanyScope, getAuthCompanyId, requireCompanyIdParam } from '../../utils/tenant.js';
 
 export async function companiesRoutes(fastify: FastifyInstance) {
+  // Company endpoints are tenant scoped; require JWT.
+  fastify.addHook('preHandler', fastify.authenticate);
+
   // List companies
-  fastify.get('/companies', async () => {
-    const companies = await prisma.company.findMany();
-    return companies;
+  fastify.get('/companies', async (request) => {
+    const companyId = getAuthCompanyId(request);
+    // Return only the authenticated tenant's company.
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+    });
+    return company ? [company] : [];
   });
 
   // Create company
   fastify.post('/companies', async (request, reply) => {
-    const body = request.body as { name?: string };
-
-    if (!body.name) {
-      reply.status(400);
-      return { error: 'name is required' };
-    }
-
-    const company = await prisma.company.create({
-      data: {
-        name: body.name,
-        accounts: {
-          create: DEFAULT_ACCOUNTS.map((acc) => ({
-            code: acc.code,
-            name: acc.name,
-            type: acc.type,
-          })),
-        },
-      },
-      include: { accounts: true },
-    });
-
-    return company;
+    // In production fintech: creating a company is part of onboarding (/register)
+    // and should not be exposed as a general authenticated endpoint.
+    reply.status(403);
+    return { error: 'forbidden: use /register to create a company' };
   });
 
   // --- Company settings (Books layer) ---
   fastify.get('/companies/:companyId/settings', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     const company = await prisma.company.findUnique({
       where: { id: companyId },
@@ -73,11 +58,7 @@ export async function companiesRoutes(fastify: FastifyInstance) {
   });
 
   fastify.put('/companies/:companyId/settings', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     const body = request.body as {
       accountsReceivableAccountId?: number | null;
@@ -141,6 +122,7 @@ export async function companiesRoutes(fastify: FastifyInstance) {
   fastify.get('/companies/:companyId/accounts', async (request, reply) => {
     const { companyId } = request.params as { companyId: string };
     const query = request.query as { type?: AccountType };
+    enforceCompanyScope(request, reply, Number(companyId));
 
     const accounts = await prisma.account.findMany({
       where: {
@@ -166,6 +148,7 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       reply.status(400);
       return { error: 'companyId, code, name, type are required' };
     }
+    enforceCompanyScope(request, reply, body.companyId);
 
     const account = await prisma.account.create({
       data: {
@@ -177,6 +160,228 @@ export async function companiesRoutes(fastify: FastifyInstance) {
     });
 
     return account;
+  });
+
+  // --- Banking accounts (Cash/Bank/E-wallet) ---
+  // These are liquidity accounts used for "Deposit To" and for cash/bank movements.
+  // They map 1:1 to a Chart of Accounts Account (ASSET).
+  fastify.get('/companies/:companyId/banking-accounts', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+
+    const rows = await prisma.bankingAccount.findMany({
+      where: { companyId },
+      include: {
+        account: { select: { id: true, code: true, name: true, type: true } },
+      },
+      orderBy: [{ isPrimary: 'desc' }, { account: { code: 'asc' } }],
+    });
+
+    // Backward compatibility: ensure company has a CASH BankingAccount row for default cash account (code 1000).
+    const hasCash = rows.some((r) => r.kind === BankingAccountKind.CASH);
+    if (!hasCash) {
+      const cash = await prisma.account.findFirst({
+        where: { companyId, type: AccountType.ASSET, code: '1000' },
+        select: { id: true, code: true, name: true, type: true },
+      });
+      if (cash) {
+        try {
+          const created = await prisma.bankingAccount.create({
+            data: {
+              companyId,
+              accountId: cash.id,
+              kind: BankingAccountKind.CASH,
+              description: 'Default cash account',
+              isPrimary: rows.length === 0, // only primary if no other banking accounts exist
+            },
+            include: {
+              account: { select: { id: true, code: true, name: true, type: true } },
+            },
+          });
+          rows.unshift(created);
+        } catch {
+          // Another request might have created it concurrently; ignore.
+        }
+      }
+    }
+
+    return rows.map((r) => ({
+      id: r.id,
+      kind: r.kind,
+      isPrimary: r.isPrimary,
+      bankName: r.bankName,
+      accountNumber: r.accountNumber,
+      identifierCode: r.identifierCode,
+      branch: r.branch,
+      description: r.description,
+      account: r.account,
+    }));
+  });
+
+  // Banking account detail: balance + recent transactions for UI
+  fastify.get('/companies/:companyId/banking-accounts/:bankingAccountId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const bankingAccountId = Number((request.params as any)?.bankingAccountId);
+    if (Number.isNaN(bankingAccountId)) {
+      reply.status(400);
+      return { error: 'invalid bankingAccountId' };
+    }
+
+    const banking = await prisma.bankingAccount.findFirst({
+      where: { id: bankingAccountId, companyId },
+      include: {
+        account: { select: { id: true, code: true, name: true, type: true } },
+      },
+    });
+    if (!banking) {
+      reply.status(404);
+      return { error: 'banking account not found' };
+    }
+
+    const sums = await prisma.journalLine.aggregate({
+      where: { companyId, accountId: banking.accountId },
+      _sum: { debit: true, credit: true },
+    });
+    const totalDebit = Number(sums._sum.debit ?? 0);
+    const totalCredit = Number(sums._sum.credit ?? 0);
+
+    // For ASSET accounts: balance = debit - credit.
+    // (We only allow ASSET accounts for BankingAccount today.)
+    const balance = totalDebit - totalCredit;
+
+    const lines = await prisma.journalLine.findMany({
+      where: { companyId, accountId: banking.accountId },
+      orderBy: [
+        { journalEntry: { date: 'desc' } },
+        { journalEntryId: 'desc' },
+        { id: 'desc' },
+      ],
+      take: 50,
+      include: {
+        journalEntry: {
+          include: {
+            invoice: true,
+            payment: { include: { invoice: true } },
+          },
+        },
+      },
+    });
+
+    const transactions = lines.map((l) => {
+      const je: any = l.journalEntry;
+      const type =
+        je?.payment ? 'Invoice Payment' : je?.invoice ? 'Invoice Posted' : 'Journal Entry';
+      const details =
+        je?.payment?.invoice?.invoiceNumber
+          ? `Payment for ${je.payment.invoice.invoiceNumber}`
+          : je?.invoice?.invoiceNumber
+            ? `Invoice ${je.invoice.invoiceNumber}`
+            : je?.description ?? '';
+
+      return {
+        date: je?.date ?? null,
+        type,
+        details,
+        journalEntryId: l.journalEntryId,
+        debit: l.debit.toString(),
+        credit: l.credit.toString(),
+      };
+    });
+
+    return {
+      id: banking.id,
+      kind: banking.kind,
+      isPrimary: banking.isPrimary,
+      bankName: banking.bankName,
+      accountNumber: banking.accountNumber,
+      identifierCode: banking.identifierCode,
+      branch: banking.branch,
+      description: banking.description,
+      account: banking.account,
+      balance,
+      transactions,
+    };
+  });
+
+  fastify.post('/companies/:companyId/banking-accounts', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const body = request.body as {
+      kind?: BankingAccountKind;
+      accountCode?: string;
+      accountName?: string;
+      bankName?: string;
+      accountNumber?: string;
+      identifierCode?: string;
+      branch?: string;
+      description?: string;
+      isPrimary?: boolean;
+    };
+
+    if (!body.kind || !body.accountCode || !body.accountName) {
+      reply.status(400);
+      return { error: 'kind, accountCode, accountName are required' };
+    }
+
+    const kind = body.kind as BankingAccountKind;
+    if (!Object.values(BankingAccountKind).includes(kind)) {
+      reply.status(400);
+      return { error: 'invalid kind' };
+    }
+
+    // Bank/Cash/E-wallet should be ASSET accounts.
+    const created = await prisma.$transaction(async (tx) => {
+      const account = await tx.account.create({
+        data: {
+          companyId,
+          code: body.accountCode!,
+          name: body.accountName!,
+          type: AccountType.ASSET,
+        },
+      });
+
+      // If primary, unset other primaries
+      if (body.isPrimary) {
+        await tx.bankingAccount.updateMany({
+          where: { companyId, isPrimary: true },
+          data: { isPrimary: false },
+        });
+      }
+
+      const banking = await tx.bankingAccount.create({
+        data: {
+          companyId,
+          accountId: account.id,
+          kind,
+          bankName: body.bankName ?? null,
+          accountNumber: body.accountNumber ?? null,
+          identifierCode: body.identifierCode ?? null,
+          branch: body.branch ?? null,
+          description: body.description ?? null,
+          isPrimary: body.isPrimary ?? false,
+        },
+        include: {
+          account: true,
+        },
+      });
+
+      return banking;
+    });
+
+    return {
+      id: created.id,
+      kind: created.kind,
+      isPrimary: created.isPrimary,
+      bankName: created.bankName,
+      accountNumber: created.accountNumber,
+      identifierCode: created.identifierCode,
+      branch: created.branch,
+      description: created.description,
+      account: {
+        id: created.account.id,
+        code: created.account.code,
+        name: created.account.name,
+        type: created.account.type,
+      },
+    };
   });
 }
 

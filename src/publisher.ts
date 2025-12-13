@@ -141,7 +141,10 @@ async function tick() {
       try {
         const envelope = buildEnvelopeFromEventRow(e);
         // Use the shared publishDomainEvent which wraps the PubSub logic
-        await publishDomainEvent(envelope);
+        const ok = await publishDomainEvent(envelope);
+        if (!ok) {
+          throw new Error('Pub/Sub publish failed (publishDomainEvent returned false)');
+        }
         await markPublishedAndUnlock(e.eventId);
       } catch (err) {
         fastify.log.error(

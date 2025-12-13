@@ -74,7 +74,7 @@ sleep 5
 
 echo "Applying Prisma migrations to Cloud SQL..."
 export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@localhost:3307/${DB_NAME}"
-npx prisma migrate deploy
+./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma
 
 # ---- Create runtime service account (if missing) ----
 if ! gcloud iam service-accounts describe "$RUNTIME_SA_EMAIL" >/dev/null 2>&1; then
@@ -135,8 +135,10 @@ gcloud run deploy cashflow-worker \
   --image "gcr.io/${PROJECT_ID}/cashflow-worker" \
   --region "$REGION" \
   --add-cloudsql-instances "$INSTANCE_CONN" \
+  --set-env-vars "ENFORCE_PUBSUB_OIDC_AUTH=true,PUBSUB_PUSH_AUDIENCE=cashflow-worker,PUBSUB_PUSH_SA_EMAIL=${RUNTIME_SA_EMAIL}" \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest" \
-  --service-account "$RUNTIME_SA_EMAIL"
+  --service-account "$RUNTIME_SA_EMAIL" \
+  --no-allow-unauthenticated
 
 echo "Deploying cashflow-publisher..."
 gcloud run deploy cashflow-publisher \
@@ -162,6 +164,8 @@ gcloud pubsub subscriptions delete "$WORKER_SUBSCRIPTION" --quiet 2>/dev/null ||
 gcloud pubsub subscriptions create "$WORKER_SUBSCRIPTION" \
   --topic "$PUBSUB_TOPIC" \
   --push-endpoint "${WORKER_URL}/pubsub/push" \
+  --push-auth-service-account "$RUNTIME_SA_EMAIL" \
+  --push-auth-token-audience "cashflow-worker" \
   --enable-message-ordering \
   --ack-deadline=60 \
   --quiet

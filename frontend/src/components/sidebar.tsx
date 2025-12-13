@@ -3,14 +3,16 @@
 import { useAuth } from '@/contexts/auth-context';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Package, FileText, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Users, Package, FileText, BookOpen, Landmark, Settings, LogOut } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/customers', label: 'Customers', icon: Users },
   { href: '/items', label: 'Items', icon: Package },
+  { href: '/banking', label: 'Banking', icon: Landmark },
   { href: '/invoices', label: 'Invoices', icon: FileText },
+  { href: '/journal', label: 'Journal', icon: BookOpen },
   // { href: '/settings', label: 'Settings', icon: Settings },
 ];
 

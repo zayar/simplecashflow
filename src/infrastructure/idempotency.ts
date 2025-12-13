@@ -5,6 +5,7 @@ type PrismaTx = Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transa
 
 export async function runIdempotent(
   prisma: PrismaClient,
+  companyId: number,
   eventId: string,
   work: (tx: PrismaTx) => Promise<void>
 ): Promise<void> {
@@ -13,7 +14,7 @@ export async function runIdempotent(
       // 1. Idempotency check: insert ProcessedEvent
       // If eventId exists, this throws P2002
       await tx.processedEvent.create({
-        data: { eventId },
+        data: { eventId, companyId },
       });
 
       // 2. Perform the actual work

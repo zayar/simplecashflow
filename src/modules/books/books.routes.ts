@@ -7,6 +7,10 @@ import { publishDomainEvent } from '../../infrastructure/pubsub.js';
 import { markEventPublished } from '../../infrastructure/events.js';
 import { randomUUID } from 'node:crypto';
 import { AccountType, ItemType, Prisma } from '@prisma/client';
+import { postJournalEntry } from '../ledger/posting.service.js';
+import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
+import { requireCompanyIdParam } from '../../utils/tenant.js';
+import { BankingAccountKind } from '@prisma/client';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -15,13 +19,12 @@ function generateInvoiceNumber(): string {
 }
 
 export async function booksRoutes(fastify: FastifyInstance) {
+  // All Books endpoints are tenant-scoped and must be authenticated.
+  fastify.addHook('preHandler', fastify.authenticate);
+
   // --- Books: Customers ---
   fastify.get('/companies/:companyId/customers', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     return await prisma.customer.findMany({
       where: { companyId },
@@ -30,11 +33,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   });
 
   fastify.post('/companies/:companyId/customers', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     const body = request.body as {
       name?: string;
@@ -66,11 +65,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
   // --- Books: Items ---
   fastify.get('/companies/:companyId/items', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     return await prisma.item.findMany({
       where: { companyId },
@@ -83,11 +78,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   });
 
   fastify.post('/companies/:companyId/items', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     const body = request.body as {
       name?: string;
@@ -145,11 +136,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
   // --- Books: Invoices (DRAFT) ---
   fastify.get('/companies/:companyId/invoices', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
-      reply.status(400);
-      return { error: 'invalid companyId' };
-    }
+    const companyId = requireCompanyIdParam(request, reply);
 
     const invoices = await prisma.invoice.findMany({
       where: { companyId },
@@ -170,12 +157,121 @@ export async function booksRoutes(fastify: FastifyInstance) {
     }));
   });
 
-  fastify.post('/companies/:companyId/invoices', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
-    if (!companyId) {
+  // Get single invoice with payments
+  fastify.get('/companies/:companyId/invoices/:invoiceId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const invoiceId = Number((request.params as any)?.invoiceId);
+    if (Number.isNaN(invoiceId)) {
       reply.status(400);
-      return { error: 'invalid companyId' };
+      return { error: 'invalid invoiceId' };
     }
+
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: invoiceId, companyId },
+      include: {
+        customer: true,
+        lines: { include: { item: true } },
+        journalEntry: {
+          include: {
+            lines: {
+              include: {
+                account: { select: { id: true, code: true, name: true, type: true } },
+              },
+            },
+          },
+        },
+        payments: {
+          include: {
+            bankAccount: true,
+            journalEntry: {
+              include: {
+                lines: {
+                  include: {
+                    account: { select: { id: true, code: true, name: true, type: true } },
+                  },
+                },
+              },
+            },
+          },
+          orderBy: { paymentDate: 'desc' },
+        },
+      },
+    });
+
+    if (!invoice) {
+      reply.status(404);
+      return { error: 'invoice not found' };
+    }
+
+    // Calculate total paid from payments (source of truth), excluding reversed payments.
+    // This keeps UI correct even if Invoice.amountPaid wasn't backfilled for older invoices.
+    const totalPaid = invoice.payments
+      .filter((p: any) => !p.reversedAt)
+      .reduce((sum, p) => sum + Number(p.amount), 0);
+
+    const journalEntries = [];
+    if (invoice.status !== 'DRAFT' && invoice.journalEntry) {
+      journalEntries.push({
+        kind: 'INVOICE_POSTED',
+        journalEntryId: invoice.journalEntry.id,
+        date: invoice.journalEntry.date,
+        description: invoice.journalEntry.description,
+        lines: invoice.journalEntry.lines.map((l) => ({
+          account: l.account,
+          debit: l.debit.toString(),
+          credit: l.credit.toString(),
+        })),
+      });
+    }
+    for (const p of invoice.payments) {
+      if (p.journalEntry) {
+        journalEntries.push({
+          kind: 'PAYMENT_RECORDED',
+          paymentId: p.id,
+          journalEntryId: p.journalEntry.id,
+          date: p.journalEntry.date,
+          description: p.journalEntry.description,
+          lines: p.journalEntry.lines.map((l) => ({
+            account: l.account,
+            debit: l.debit.toString(),
+            credit: l.credit.toString(),
+          })),
+        });
+      }
+    }
+
+    return {
+      id: invoice.id,
+      invoiceNumber: invoice.invoiceNumber,
+      customer: invoice.customer,
+      status: invoice.status,
+      invoiceDate: invoice.invoiceDate,
+      dueDate: invoice.dueDate,
+      total: invoice.total,
+      currency: invoice.currency,
+      lines: invoice.lines,
+      payments: invoice.payments.map((p) => ({
+        id: p.id,
+        paymentDate: p.paymentDate,
+        amount: p.amount,
+        bankAccount: {
+          id: p.bankAccount.id,
+          code: p.bankAccount.code,
+          name: p.bankAccount.name,
+        },
+        journalEntryId: p.journalEntry?.id ?? null,
+        reversedAt: (p as any).reversedAt ?? null,
+        reversalReason: (p as any).reversalReason ?? null,
+        reversalJournalEntryId: (p as any).reversalJournalEntryId ?? null,
+      })),
+      totalPaid: totalPaid,
+      remainingBalance: Number(invoice.total) - totalPaid,
+      journalEntries,
+    };
+  });
+
+  fastify.post('/companies/:companyId/invoices', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
 
     const body = request.body as {
       customerId?: number;
@@ -230,6 +326,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       total = total.add(lineTotal);
 
       return {
+        companyId,
         itemId: item.id,
         description: line.description ?? null,
         quantity: qty,
@@ -261,223 +358,242 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
   // POST (confirm) an invoice: DRAFT -> POSTED creates journal entry
   fastify.post('/companies/:companyId/invoices/:invoiceId/post', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
+    const companyId = requireCompanyIdParam(request, reply);
     const invoiceId = Number((request.params as any)?.invoiceId);
     if (!companyId || Number.isNaN(invoiceId)) {
       reply.status(400);
       return { error: 'invalid companyId or invoiceId' };
     }
 
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
     const correlationId = randomUUID(); // one correlationId for the whole posting transaction
     const occurredAt = isoNow();
 
-    const result = await prisma.$transaction(async (tx) => {
-      const invoice = await tx.invoice.findFirst({
-        where: { id: invoiceId, companyId },
-        include: {
-          company: true,
-          customer: true,
-          lines: { include: { item: true } },
-        },
-      });
+    const { replay, response: result } = await runIdempotentRequest(
+      prisma,
+      companyId,
+      idempotencyKey,
+      async () => {
+        const txResult = await prisma.$transaction(
+          async (tx) => {
+          const invoice = await tx.invoice.findFirst({
+            where: { id: invoiceId, companyId },
+            include: {
+              company: true,
+              customer: true,
+              lines: { include: { item: true } },
+            },
+          });
 
-      if (!invoice) {
-        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
-      }
-      if (invoice.status !== 'DRAFT') {
-        throw Object.assign(new Error('only DRAFT invoices can be posted'), { statusCode: 400 });
-      }
+          if (!invoice) {
+            throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+          }
+          if (invoice.status !== 'DRAFT') {
+            throw Object.assign(new Error('only DRAFT invoices can be posted'), { statusCode: 400 });
+          }
 
-      if (!invoice.company.accountsReceivableAccountId) {
-        throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
-          statusCode: 400,
-        });
-      }
+          if (!invoice.company.accountsReceivableAccountId) {
+            throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
+              statusCode: 400,
+            });
+          }
 
-      // Validate AR account belongs to this company and is an ASSET (Accounts Receivable).
-      const arAccount = await tx.account.findFirst({
-        where: {
-          id: invoice.company.accountsReceivableAccountId,
-          companyId,
-          type: AccountType.ASSET,
-        },
-      });
-      if (!arAccount) {
-        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
-          statusCode: 400,
-        });
-      }
+          // Validate AR account belongs to this company and is an ASSET (Accounts Receivable).
+          const arAccount = await tx.account.findFirst({
+            where: {
+              id: invoice.company.accountsReceivableAccountId,
+              companyId,
+              type: AccountType.ASSET,
+            },
+          });
+          if (!arAccount) {
+            throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
+              statusCode: 400,
+            });
+          }
 
-      // Recompute totals from stored lines (source of truth).
-      let total = new Prisma.Decimal(0);
-      const incomeBuckets = new Map<number, Prisma.Decimal>();
+          // Recompute totals from stored lines (source of truth).
+          let total = new Prisma.Decimal(0);
+          const incomeBuckets = new Map<number, Prisma.Decimal>();
 
-      for (const line of invoice.lines) {
-        // lineTotal is already stored, but recompute to be safe.
-        const qty = new Prisma.Decimal(line.quantity);
-        const unit = new Prisma.Decimal(line.unitPrice);
-        const lineTotal = qty.mul(unit).toDecimalPlaces(2);
-        total = total.add(lineTotal);
+          for (const line of invoice.lines) {
+            const qty = new Prisma.Decimal(line.quantity);
+            const unit = new Prisma.Decimal(line.unitPrice);
+            const lineTotal = qty.mul(unit).toDecimalPlaces(2);
+            total = total.add(lineTotal);
 
-        const incomeAccountId = line.item.incomeAccountId;
-        const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-        incomeBuckets.set(incomeAccountId, prev.add(lineTotal));
-      }
+            const incomeAccountId = line.item.incomeAccountId;
+            const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
+            incomeBuckets.set(incomeAccountId, prev.add(lineTotal));
+          }
 
-      total = total.toDecimalPlaces(2);
+          total = total.toDecimalPlaces(2);
 
-      // Create JournalEntry for posting invoice:
-      // Debit  Accounts Receivable (AR)
-      // Credit Sales Income (grouped by incomeAccountId)
-      const journalEntry = await tx.journalEntry.create({
-        data: {
-          companyId,
-          date: invoice.invoiceDate,
-          description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
-          lines: {
-            create: [
-              {
-                accountId: arAccount.id,
-                debit: total,
-                credit: new Prisma.Decimal(0),
-              },
+          const journalEntry = await postJournalEntry(tx, {
+            companyId,
+            date: invoice.invoiceDate,
+            description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
+            createdByUserId: (request as any).user?.userId ?? null,
+            lines: [
+              { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
               ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
                 accountId: incomeAccountId,
                 debit: new Prisma.Decimal(0),
                 credit: amount.toDecimalPlaces(2),
               })),
             ],
+          });
+
+          // Update invoice to POSTED and link journal entry.
+          const updatedInvoice = await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+              status: 'POSTED',
+              total,
+              amountPaid: new Prisma.Decimal(0),
+              journalEntryId: journalEntry.id,
+            },
+          });
+
+          // --- Event 1: journal.entry.created ---
+          const jeEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: jeEventId,
+              eventType: 'journal.entry.created',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(journalEntry.id),
+              type: 'JournalEntryCreated',
+              payload: {
+                journalEntryId: journalEntry.id,
+                companyId,
+              },
+            },
+          });
+
+          // --- Event 2: invoice.posted ---
+          const invoiceEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: invoiceEventId,
+              eventType: 'invoice.posted',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'Invoice',
+              aggregateId: String(invoice.id),
+              type: 'InvoicePosted',
+              payload: {
+                invoiceId: invoice.id,
+                journalEntryId: journalEntry.id,
+                total: total.toString(),
+                customerId: invoice.customerId,
+              },
+            },
+          });
+
+          return { updatedInvoice, journalEntry, jeEventId, invoiceEventId };
           },
-        },
-        include: { lines: true },
-      });
+          { timeout: 10_000 }
+        );
 
-      // Update invoice to POSTED and link journal entry.
-      const updatedInvoice = await tx.invoice.update({
-        where: { id: invoice.id },
-        data: {
-          status: 'POSTED',
-          total,
-          journalEntryId: journalEntry.id,
-        },
-      });
+        return {
+          invoiceId: txResult.updatedInvoice.id,
+          status: txResult.updatedInvoice.status,
+          total: txResult.updatedInvoice.total.toString(),
+          journalEntryId: txResult.updatedInvoice.journalEntryId,
+          // keep event ids for first execution publish step only
+          _jeEventId: txResult.jeEventId,
+          _invoiceEventId: txResult.invoiceEventId,
+          _correlationId: correlationId,
+          _occurredAt: occurredAt,
+        };
+      }
+    );
 
-      // --- Event 1: journal.entry.created (keeps existing projections like DailySummary working) ---
-      const jeEventId = randomUUID();
-      const totalDebit = Number(total);
-      const totalCredit = Number(total);
-
-      await tx.event.create({
-        data: {
-          companyId,
-          eventId: jeEventId,
-          eventType: 'journal.entry.created',
-          schemaVersion: 'v1',
-          occurredAt: new Date(occurredAt),
-          source: 'cashflow-api',
-          partitionKey: String(companyId),
-          correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(journalEntry.id),
-          type: 'JournalEntryCreated',
-          payload: {
-            journalEntryId: journalEntry.id,
-            companyId,
-            totalDebit,
-            totalCredit,
-          },
-        },
-      });
-
-      // --- Event 2: invoice.posted (document-level event) ---
-      const invoiceEventId = randomUUID();
-      await tx.event.create({
-        data: {
-          companyId,
-          eventId: invoiceEventId,
-          eventType: 'invoice.posted',
-          schemaVersion: 'v1',
-          occurredAt: new Date(occurredAt),
-          source: 'cashflow-api',
-          partitionKey: String(companyId),
-          correlationId,
-          aggregateType: 'Invoice',
-          aggregateId: String(invoice.id),
-          type: 'InvoicePosted',
-          payload: {
-            invoiceId: invoice.id,
-            journalEntryId: journalEntry.id,
-            total: total.toString(),
-            customerId: invoice.customerId,
-          },
-        },
-      });
-
-      return { updatedInvoice, journalEntry, jeEventId, invoiceEventId, totalDebit, totalCredit };
-    });
-
-    // Publish events (outside txn). If publish fails, outbox publisher will deliver later.
-    const publishJeOk = await publishDomainEvent({
-      eventId: result.jeEventId,
-      eventType: 'journal.entry.created',
-      schemaVersion: 'v1',
-      occurredAt,
-      companyId,
-      partitionKey: String(companyId),
-      correlationId,
-      aggregateType: 'JournalEntry',
-      aggregateId: String(result.journalEntry.id),
-      source: 'cashflow-api',
-      payload: {
-        journalEntryId: result.journalEntry.id,
+    // First execution: attempt publish now (still safe if it fails; outbox publisher will deliver later).
+    if (!replay) {
+      const publishJeOk = await publishDomainEvent({
+        eventId: (result as any)._jeEventId,
+        eventType: 'journal.entry.created',
+        schemaVersion: 'v1',
+        occurredAt: (result as any)._occurredAt,
         companyId,
-        totalDebit: result.totalDebit,
-        totalCredit: result.totalCredit,
-      },
-    });
-    if (publishJeOk) await markEventPublished(result.jeEventId);
+        partitionKey: String(companyId),
+        correlationId: (result as any)._correlationId,
+        aggregateType: 'JournalEntry',
+        aggregateId: String(result.journalEntryId),
+        source: 'cashflow-api',
+        payload: {
+          journalEntryId: result.journalEntryId,
+          companyId,
+        },
+      });
+      if (publishJeOk) await markEventPublished((result as any)._jeEventId);
 
-    const publishInvoiceOk = await publishDomainEvent({
-      eventId: result.invoiceEventId,
-      eventType: 'invoice.posted',
-      schemaVersion: 'v1',
-      occurredAt,
-      companyId,
-      partitionKey: String(companyId),
-      correlationId,
-      aggregateType: 'Invoice',
-      aggregateId: String(result.updatedInvoice.id),
-      source: 'cashflow-api',
-      payload: {
-        invoiceId: result.updatedInvoice.id,
-        journalEntryId: result.journalEntry.id,
-        total: result.updatedInvoice.total,
-        customerId: result.updatedInvoice.customerId,
-      },
-    });
-    if (publishInvoiceOk) await markEventPublished(result.invoiceEventId);
+      const publishInvoiceOk = await publishDomainEvent({
+        eventId: (result as any)._invoiceEventId,
+        eventType: 'invoice.posted',
+        schemaVersion: 'v1',
+        occurredAt: (result as any)._occurredAt,
+        companyId,
+        partitionKey: String(companyId),
+        correlationId: (result as any)._correlationId,
+        aggregateType: 'Invoice',
+        aggregateId: String(result.invoiceId),
+        source: 'cashflow-api',
+        payload: {
+          invoiceId: result.invoiceId,
+          journalEntryId: result.journalEntryId,
+          total: result.total,
+        },
+      });
+      if (publishInvoiceOk) await markEventPublished((result as any)._invoiceEventId);
+    }
 
+    // Always return stable business response
     return {
-      invoiceId: result.updatedInvoice.id,
-      status: result.updatedInvoice.status,
-      total: result.updatedInvoice.total,
-      journalEntryId: result.updatedInvoice.journalEntryId,
+      invoiceId: result.invoiceId,
+      status: result.status,
+      total: result.total,
+      journalEntryId: result.journalEntryId,
     };
   });
 
   // Payments: record and post to ledger (Bank/Cash Dr, AR Cr)
   fastify.post('/companies/:companyId/invoices/:invoiceId/payments', async (request, reply) => {
-    const companyId = parseCompanyId(request.params);
+    const companyId = requireCompanyIdParam(request, reply);
     const invoiceId = Number((request.params as any)?.invoiceId);
     if (!companyId || Number.isNaN(invoiceId)) {
       reply.status(400);
       return { error: 'invalid companyId or invoiceId' };
     }
 
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
     const body = request.body as {
       paymentDate?: string;
       amount?: number;
       bankAccountId?: number;
+      paymentMode?: 'CASH' | 'BANK' | 'E_WALLET';
     };
 
     if (!body.amount || body.amount <= 0 || !body.bankAccountId) {
@@ -492,11 +608,17 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const correlationId = randomUUID();
 
     try {
-      const result = await prisma.$transaction(async (tx) => {
-        const invoice = await tx.invoice.findFirst({
-          where: { id: invoiceId, companyId },
-          include: { company: true },
-        });
+      const { replay, response: result } = await runIdempotentRequest(
+        prisma,
+        companyId,
+        idempotencyKey,
+        async () => {
+          const txResult = await prisma.$transaction(
+            async (tx) => {
+            const invoice = await tx.invoice.findFirst({
+              where: { id: invoiceId, companyId },
+              include: { company: { select: { accountsReceivableAccountId: true } } },
+            });
         if (!invoice) {
           throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
         }
@@ -539,8 +661,50 @@ export async function booksRoutes(fastify: FastifyInstance) {
           });
         }
 
+        // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
+        const banking = await tx.bankingAccount.findFirst({
+          where: { companyId, accountId: bankAccount.id },
+          select: { kind: true },
+        });
+        if (!banking) {
+          throw Object.assign(
+            new Error('Deposit To must be a banking account (create it under Banking first)'),
+            { statusCode: 400 }
+          );
+        }
+        if (banking.kind === BankingAccountKind.CREDIT_CARD) {
+          throw Object.assign(new Error('cannot deposit to a credit card account'), { statusCode: 400 });
+        }
+        // Optional: if UI sends paymentMode, enforce kind matches
+        if (body.paymentMode) {
+          const expected =
+            body.paymentMode === 'CASH'
+              ? BankingAccountKind.CASH
+              : body.paymentMode === 'BANK'
+                ? BankingAccountKind.BANK
+                : BankingAccountKind.E_WALLET;
+          if (banking.kind !== expected) {
+            throw Object.assign(
+              new Error(`Deposit To account kind must be ${expected} for paymentMode ${body.paymentMode}`),
+              { statusCode: 400 }
+            );
+          }
+        }
+
         const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
         const amount = toMoneyDecimal(amountNumber);
+
+        const journalEntry = await postJournalEntry(tx, {
+          companyId,
+          date: paymentDate,
+          description: `Payment for Invoice ${invoice.invoiceNumber}`,
+          createdByUserId: (request as any).user?.userId ?? null,
+          skipAccountValidation: true,
+          lines: [
+            { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
+            { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+          ],
+        });
 
         const payment = await tx.payment.create({
           data: {
@@ -549,66 +713,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
             paymentDate,
             amount,
             bankAccountId: bankAccount.id,
+            journalEntryId: journalEntry.id,
           },
         });
 
-        const journalEntry = await tx.journalEntry.create({
-          data: {
-            companyId,
-            date: paymentDate,
-            description: `Payment for Invoice ${invoice.invoiceNumber}`,
-            lines: {
-              create: [
-                // Debit Bank/Cash
-                { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
-                // Credit Accounts Receivable
-                { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
-              ],
-            },
-          },
-        });
-
-        const updatedPayment = await tx.payment.update({
-          where: { id: payment.id },
-          data: { journalEntryId: journalEntry.id },
-        });
-
-        // Update invoice status based on total paid vs invoice total.
+        // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
+        // This remains performant (single aggregate) and is correct even under concurrency.
         const sumAgg = await tx.payment.aggregate({
-          where: { invoiceId: invoice.id, companyId },
+          where: { invoiceId: invoice.id, companyId, reversedAt: null },
           _sum: { amount: true },
         });
-
-        const totalPaid = sumAgg._sum.amount ?? new Prisma.Decimal(0);
+        const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
         const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
 
         const updatedInvoice = await tx.invoice.update({
           where: { id: invoice.id },
-          data: { status: newStatus },
-        });
-
-        // Event: journal.entry.created (for consistency; no income/expense impact but still a JE)
-        const jeEventId = randomUUID();
-        await tx.event.create({
-          data: {
-            companyId,
-            eventId: jeEventId,
-            eventType: 'journal.entry.created',
-            schemaVersion: 'v1',
-            occurredAt: new Date(occurredAt),
-            source: 'cashflow-api',
-            partitionKey: String(companyId),
-            correlationId,
-            aggregateType: 'JournalEntry',
-            aggregateId: String(journalEntry.id),
-            type: 'JournalEntryCreated',
-            payload: {
-              journalEntryId: journalEntry.id,
-              companyId,
-              totalDebit: Number(amountNumber),
-              totalCredit: Number(amountNumber),
-            },
-          },
+          data: { amountPaid: totalPaid, status: newStatus },
         });
 
         // Event: payment.recorded (document-level)
@@ -624,10 +744,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
             partitionKey: String(companyId),
             correlationId,
             aggregateType: 'Payment',
-            aggregateId: String(updatedPayment.id),
+            aggregateId: String(payment.id),
             type: 'PaymentRecorded',
             payload: {
-              paymentId: updatedPayment.id,
+              paymentId: payment.id,
               invoiceId: invoice.id,
               journalEntryId: journalEntry.id,
               amount: amount.toString(),
@@ -636,53 +756,329 @@ export async function booksRoutes(fastify: FastifyInstance) {
           },
         });
 
-        return { updatedInvoice, updatedPayment, journalEntry, jeEventId, paymentEventId };
-      });
+        return { updatedInvoice, payment, journalEntry, paymentEventId };
+            },
+            { timeout: 10_000 }
+          );
 
-      const publishPaymentJeOk = await publishDomainEvent({
-        eventId: result.jeEventId,
-        eventType: 'journal.entry.created',
-        schemaVersion: 'v1',
-        occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId,
-        aggregateType: 'JournalEntry',
-        aggregateId: String(result.journalEntry.id),
-        source: 'cashflow-api',
-        payload: {
-          journalEntryId: result.journalEntry.id,
+          return {
+            invoiceId: txResult.updatedInvoice.id,
+            invoiceStatus: txResult.updatedInvoice.status,
+            paymentId: txResult.payment.id,
+            journalEntryId: txResult.payment.journalEntryId,
+            _paymentEventId: txResult.paymentEventId,
+            _correlationId: correlationId,
+            _occurredAt: occurredAt,
+          };
+        }
+      );
+
+      if (!replay) {
+        const publishPaymentOk = await publishDomainEvent({
+          eventId: (result as any)._paymentEventId,
+          eventType: 'payment.recorded',
+          schemaVersion: 'v1',
+          occurredAt: (result as any)._occurredAt,
           companyId,
-        },
-      });
-      if (publishPaymentJeOk) await markEventPublished(result.jeEventId);
-
-      const publishPaymentOk = await publishDomainEvent({
-        eventId: result.paymentEventId,
-        eventType: 'payment.recorded',
-        schemaVersion: 'v1',
-        occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId,
-        aggregateType: 'Payment',
-        aggregateId: String(result.updatedPayment.id),
-        source: 'cashflow-api',
-        payload: {
-          paymentId: result.updatedPayment.id,
-          invoiceId: result.updatedPayment.invoiceId,
-          journalEntryId: result.updatedPayment.journalEntryId,
-          amount: result.updatedPayment.amount,
-          bankAccountId: result.updatedPayment.bankAccountId,
-        },
-      });
-      if (publishPaymentOk) await markEventPublished(result.paymentEventId);
+          partitionKey: String(companyId),
+          correlationId: (result as any)._correlationId,
+          aggregateType: 'Payment',
+          aggregateId: String(result.paymentId),
+          source: 'cashflow-api',
+          payload: {
+            paymentId: result.paymentId,
+            invoiceId,
+            journalEntryId: result.journalEntryId,
+            amount: (body.amount ?? 0).toFixed(2),
+            bankAccountId: body.bankAccountId,
+          },
+        });
+        if (publishPaymentOk) await markEventPublished((result as any)._paymentEventId);
+      }
 
       return {
-        invoiceId: result.updatedInvoice.id,
-        invoiceStatus: result.updatedInvoice.status,
-        paymentId: result.updatedPayment.id,
-        journalEntryId: result.updatedPayment.journalEntryId,
+        invoiceId: result.invoiceId,
+        invoiceStatus: result.invoiceStatus,
+        paymentId: result.paymentId,
+        journalEntryId: result.journalEntryId,
+      };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
+  });
+
+  // Reverse a payment (immutable): creates a reversing journal entry and updates invoice totals.
+  // POST /companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse
+  fastify.post('/companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const invoiceId = Number((request.params as any)?.invoiceId);
+    const paymentId = Number((request.params as any)?.paymentId);
+    if (!companyId || Number.isNaN(invoiceId) || Number.isNaN(paymentId)) {
+      reply.status(400);
+      return { error: 'invalid companyId, invoiceId, or paymentId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const body = (request.body ?? {}) as { reason?: string; date?: string };
+    const reversalDate = body.date ? new Date(body.date) : new Date();
+    if (body.date && isNaN(reversalDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid date (must be ISO string)' };
+    }
+
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+
+    try {
+      const { replay, response: result } = await runIdempotentRequest(
+        prisma,
+        companyId,
+        idempotencyKey,
+        async () => {
+          const txResult = await prisma.$transaction(
+            async (tx) => {
+              const payment = await tx.payment.findFirst({
+                where: { id: paymentId, companyId, invoiceId },
+                include: {
+                  invoice: { select: { id: true, total: true, amountPaid: true, status: true, invoiceNumber: true } },
+                  journalEntry: { include: { lines: true } },
+                },
+              });
+              if (!payment) {
+                throw Object.assign(new Error('payment not found'), { statusCode: 404 });
+              }
+              if (!payment.journalEntry) {
+                throw Object.assign(new Error('payment has no journal entry to reverse'), { statusCode: 400 });
+              }
+              if ((payment as any).reversedAt) {
+                throw Object.assign(new Error('payment already reversed'), { statusCode: 400 });
+              }
+
+              const originalJeId = payment.journalEntry.id;
+              const existingReversal = await tx.journalEntry.findFirst({
+                where: { companyId, reversalOfJournalEntryId: originalJeId },
+                select: { id: true },
+              });
+              if (existingReversal) {
+                throw Object.assign(new Error('payment journal entry already reversed'), { statusCode: 400 });
+              }
+
+              const reversalLines = payment.journalEntry.lines.map((l: any) => ({
+                accountId: l.accountId,
+                debit: new Prisma.Decimal(l.credit).toDecimalPlaces(2),
+                credit: new Prisma.Decimal(l.debit).toDecimalPlaces(2),
+              }));
+
+              const reversalEntry = await postJournalEntry(tx, {
+                companyId,
+                date: reversalDate,
+                description: `REVERSAL of Payment ${payment.id} (Invoice ${payment.invoice.invoiceNumber})`,
+                createdByUserId: (request as any).user?.userId ?? null,
+                reversalOfJournalEntryId: originalJeId,
+                reversalReason: body.reason ?? null,
+                skipAccountValidation: true,
+                lines: reversalLines,
+              });
+
+              // Recompute paid-after-refund from Payments table (source of truth) to avoid negative drift.
+              // We exclude the payment being reversed and any payments already reversed.
+              const sumAfter = await tx.payment.aggregate({
+                where: {
+                  companyId,
+                  invoiceId,
+                  reversedAt: null,
+                  id: { not: payment.id },
+                },
+                _sum: { amount: true },
+              });
+              const newPaid = (sumAfter._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+
+              const newStatus = newPaid.equals(0)
+                ? 'POSTED'
+                : newPaid.greaterThanOrEqualTo(payment.invoice.total)
+                  ? 'PAID'
+                  : 'PARTIAL';
+
+              const updatedInvoice = await tx.invoice.update({
+                where: { id: invoiceId },
+                data: { amountPaid: newPaid, status: newStatus },
+              });
+
+              // Mark payment as reversed (document audit)
+              await tx.payment.update({
+                where: { id: payment.id },
+                data: {
+                  reversedAt: new Date(occurredAt),
+                  reversalReason: body.reason ?? null,
+                  reversalJournalEntryId: reversalEntry.id,
+                  reversedByUserId: (request as any).user?.userId ?? null,
+                },
+              });
+
+              // Outbox events (ledger consistency + document semantics)
+              const createdEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: createdEventId,
+                  eventType: 'journal.entry.created',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(reversalEntry.id),
+                  type: 'JournalEntryCreated',
+                  payload: {
+                    journalEntryId: reversalEntry.id,
+                    companyId,
+                    reversalOfJournalEntryId: originalJeId,
+                  },
+                },
+              });
+
+              const reversedEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: reversedEventId,
+                  eventType: 'journal.entry.reversed',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(originalJeId),
+                  type: 'JournalEntryReversed',
+                  payload: {
+                    originalJournalEntryId: originalJeId,
+                    reversalJournalEntryId: reversalEntry.id,
+                    companyId,
+                    reason: body.reason ?? null,
+                  },
+                },
+              });
+
+              const paymentReversedEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: paymentReversedEventId,
+                  eventType: 'payment.reversed',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'Payment',
+                  aggregateId: String(payment.id),
+                  type: 'PaymentReversed',
+                  payload: {
+                    paymentId: payment.id,
+                    invoiceId,
+                    originalJournalEntryId: originalJeId,
+                    reversalJournalEntryId: reversalEntry.id,
+                    amount: payment.amount.toString(),
+                    reason: body.reason ?? null,
+                  },
+                },
+              });
+
+              return {
+                paymentId: payment.id,
+                invoiceId,
+                invoiceStatus: updatedInvoice.status,
+                originalJournalEntryId: originalJeId,
+                reversalJournalEntryId: reversalEntry.id,
+                _createdEventId: createdEventId,
+                _reversedEventId: reversedEventId,
+                _paymentReversedEventId: paymentReversedEventId,
+                _correlationId: correlationId,
+                _occurredAt: occurredAt,
+              };
+            },
+            { timeout: 10_000 }
+          );
+
+          return txResult;
+        }
+      );
+
+      if (!replay) {
+        const createdOk = await publishDomainEvent({
+          eventId: (result as any)._createdEventId,
+          eventType: 'journal.entry.created',
+          schemaVersion: 'v1',
+          occurredAt: (result as any)._occurredAt,
+          companyId,
+          partitionKey: String(companyId),
+          correlationId: (result as any)._correlationId,
+          aggregateType: 'JournalEntry',
+          aggregateId: String(result.reversalJournalEntryId),
+          source: 'cashflow-api',
+          payload: {
+            journalEntryId: result.reversalJournalEntryId,
+            companyId,
+            reversalOfJournalEntryId: result.originalJournalEntryId,
+          },
+        });
+        if (createdOk) await markEventPublished((result as any)._createdEventId);
+
+        const reversedOk = await publishDomainEvent({
+          eventId: (result as any)._reversedEventId,
+          eventType: 'journal.entry.reversed',
+          schemaVersion: 'v1',
+          occurredAt: (result as any)._occurredAt,
+          companyId,
+          partitionKey: String(companyId),
+          correlationId: (result as any)._correlationId,
+          aggregateType: 'JournalEntry',
+          aggregateId: String(result.originalJournalEntryId),
+          source: 'cashflow-api',
+          payload: {
+            companyId,
+            originalJournalEntryId: result.originalJournalEntryId,
+            reversalJournalEntryId: result.reversalJournalEntryId,
+          },
+        });
+        if (reversedOk) await markEventPublished((result as any)._reversedEventId);
+
+        const paymentRevOk = await publishDomainEvent({
+          eventId: (result as any)._paymentReversedEventId,
+          eventType: 'payment.reversed',
+          schemaVersion: 'v1',
+          occurredAt: (result as any)._occurredAt,
+          companyId,
+          partitionKey: String(companyId),
+          correlationId: (result as any)._correlationId,
+          aggregateType: 'Payment',
+          aggregateId: String(result.paymentId),
+          source: 'cashflow-api',
+          payload: {
+            paymentId: result.paymentId,
+            invoiceId: result.invoiceId,
+            reversalJournalEntryId: result.reversalJournalEntryId,
+          },
+        });
+        if (paymentRevOk) await markEventPublished((result as any)._paymentReversedEventId);
+      }
+
+      return {
+        paymentId: result.paymentId,
+        invoiceId: result.invoiceId,
+        invoiceStatus: result.invoiceStatus,
+        reversalJournalEntryId: result.reversalJournalEntryId,
       };
     } catch (err: any) {
       if (err?.statusCode) {
