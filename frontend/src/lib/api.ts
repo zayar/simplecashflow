@@ -9,6 +9,18 @@ export async function fetchApi(endpoint: string, options: RequestInit = {}) {
     ...(options.headers as Record<string, string>),
   };
 
+  // Fintech safety rail: idempotency for all non-GET writes.
+  // This prevents duplicate posting under retries / double-click / flaky networks.
+  const method = (options.method ?? 'GET').toUpperCase();
+  const isWrite = method !== 'GET' && method !== 'HEAD';
+  if (isWrite && !headers['Idempotency-Key'] && !headers['idempotency-key']) {
+    const key =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    headers['Idempotency-Key'] = key;
+  }
+
   if (options.body) {
     headers['Content-Type'] = 'application/json';
   }

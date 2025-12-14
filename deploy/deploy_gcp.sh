@@ -135,7 +135,7 @@ gcloud run deploy cashflow-worker \
   --image "gcr.io/${PROJECT_ID}/cashflow-worker" \
   --region "$REGION" \
   --add-cloudsql-instances "$INSTANCE_CONN" \
-  --set-env-vars "ENFORCE_PUBSUB_OIDC_AUTH=true,PUBSUB_PUSH_AUDIENCE=cashflow-worker,PUBSUB_PUSH_SA_EMAIL=${RUNTIME_SA_EMAIL}" \
+  --set-env-vars "ENFORCE_PUBSUB_OIDC_AUTH=true,PUBSUB_PUSH_SA_EMAIL=${RUNTIME_SA_EMAIL}" \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest" \
   --service-account "$RUNTIME_SA_EMAIL" \
   --no-allow-unauthenticated
@@ -165,9 +165,15 @@ gcloud pubsub subscriptions create "$WORKER_SUBSCRIPTION" \
   --topic "$PUBSUB_TOPIC" \
   --push-endpoint "${WORKER_URL}/pubsub/push" \
   --push-auth-service-account "$RUNTIME_SA_EMAIL" \
-  --push-auth-token-audience "cashflow-worker" \
+  --push-auth-token-audience "${WORKER_URL}/pubsub/push" \
   --enable-message-ordering \
   --ack-deadline=60 \
   --quiet
+
+# Update worker audience to match subscription push auth audience (OIDC)
+echo "Setting worker PUBSUB_PUSH_AUDIENCE to ${WORKER_URL}/pubsub/push ..."
+gcloud run services update cashflow-worker \
+  --region "$REGION" \
+  --update-env-vars "PUBSUB_PUSH_AUDIENCE=${WORKER_URL}/pubsub/push" >/dev/null
 
 echo "Done. Environment is fully deployed with Step 1 (Envelope) + Step 2 (Outbox) + Ordering."

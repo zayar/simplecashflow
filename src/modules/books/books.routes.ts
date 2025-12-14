@@ -11,6 +11,8 @@ import { postJournalEntry } from '../ledger/posting.service.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { BankingAccountKind } from '@prisma/client';
+import { getRedis } from '../../infrastructure/redis.js';
+import { withLockBestEffort } from '../../infrastructure/locks.js';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -21,6 +23,7 @@ function generateInvoiceNumber(): string {
 export async function booksRoutes(fastify: FastifyInstance) {
   // All Books endpoints are tenant-scoped and must be authenticated.
   fastify.addHook('preHandler', fastify.authenticate);
+  const redis = getRedis();
 
   // --- Books: Customers ---
   fastify.get('/companies/:companyId/customers', async (request, reply) => {
@@ -374,13 +377,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const correlationId = randomUUID(); // one correlationId for the whole posting transaction
     const occurredAt = isoNow();
 
-    const { replay, response: result } = await runIdempotentRequest(
-      prisma,
-      companyId,
-      idempotencyKey,
-      async () => {
-        const txResult = await prisma.$transaction(
-          async (tx) => {
+    const lockKey = `lock:invoice:post:${companyId}:${invoiceId}`;
+
+    const { replay, response: result } = await withLockBestEffort(
+      redis,
+      lockKey,
+      30_000,
+      async () =>
+        await runIdempotentRequest(
+          prisma,
+          companyId,
+          idempotencyKey,
+          async () => {
+            const txResult = await prisma.$transaction(
+              async (tx) => {
           const invoice = await tx.invoice.findFirst({
             where: { id: invoiceId, companyId },
             include: {
@@ -507,9 +517,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
           });
 
           return { updatedInvoice, journalEntry, jeEventId, invoiceEventId };
-          },
-          { timeout: 10_000 }
-        );
+              },
+              { timeout: 10_000 }
+            );
 
         return {
           invoiceId: txResult.updatedInvoice.id,
@@ -522,7 +532,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
           _correlationId: correlationId,
           _occurredAt: occurredAt,
         };
-      }
+          },
+          redis
+        )
     );
 
     // First execution: attempt publish now (still safe if it fails; outbox publisher will deliver later).
@@ -608,169 +620,180 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const correlationId = randomUUID();
 
     try {
-      const { replay, response: result } = await runIdempotentRequest(
-        prisma,
-        companyId,
-        idempotencyKey,
-        async () => {
-          const txResult = await prisma.$transaction(
-            async (tx) => {
-            const invoice = await tx.invoice.findFirst({
-              where: { id: invoiceId, companyId },
-              include: { company: { select: { accountsReceivableAccountId: true } } },
-            });
-        if (!invoice) {
-          throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
-        }
-        if (invoice.status === 'DRAFT') {
-          throw Object.assign(new Error('cannot record payment for DRAFT invoice'), {
-            statusCode: 400,
-          });
-        }
-        if (invoice.status !== 'POSTED' && invoice.status !== 'PARTIAL') {
-          throw Object.assign(new Error('payments allowed only for POSTED or PARTIAL invoices'), {
-            statusCode: 400,
-          });
-        }
+      const lockKey = `lock:invoice:payment:${companyId}:${invoiceId}`;
 
-        if (!invoice.company.accountsReceivableAccountId) {
-          throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
-            statusCode: 400,
-          });
-        }
-
-        const arAccount = await tx.account.findFirst({
-          where: {
-            id: invoice.company.accountsReceivableAccountId,
-            companyId,
-            type: AccountType.ASSET,
-          },
-        });
-        if (!arAccount) {
-          throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
-            statusCode: 400,
-          });
-        }
-
-        const bankAccount = await tx.account.findFirst({
-          where: { id: body.bankAccountId!, companyId, type: AccountType.ASSET },
-        });
-        if (!bankAccount) {
-          throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
-            statusCode: 400,
-          });
-        }
-
-        // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
-        const banking = await tx.bankingAccount.findFirst({
-          where: { companyId, accountId: bankAccount.id },
-          select: { kind: true },
-        });
-        if (!banking) {
-          throw Object.assign(
-            new Error('Deposit To must be a banking account (create it under Banking first)'),
-            { statusCode: 400 }
-          );
-        }
-        if (banking.kind === BankingAccountKind.CREDIT_CARD) {
-          throw Object.assign(new Error('cannot deposit to a credit card account'), { statusCode: 400 });
-        }
-        // Optional: if UI sends paymentMode, enforce kind matches
-        if (body.paymentMode) {
-          const expected =
-            body.paymentMode === 'CASH'
-              ? BankingAccountKind.CASH
-              : body.paymentMode === 'BANK'
-                ? BankingAccountKind.BANK
-                : BankingAccountKind.E_WALLET;
-          if (banking.kind !== expected) {
-            throw Object.assign(
-              new Error(`Deposit To account kind must be ${expected} for paymentMode ${body.paymentMode}`),
-              { statusCode: 400 }
-            );
-          }
-        }
-
-        const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
-        const amount = toMoneyDecimal(amountNumber);
-
-        const journalEntry = await postJournalEntry(tx, {
+      const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () =>
+        runIdempotentRequest(
+          prisma,
           companyId,
-          date: paymentDate,
-          description: `Payment for Invoice ${invoice.invoiceNumber}`,
-          createdByUserId: (request as any).user?.userId ?? null,
-          skipAccountValidation: true,
-          lines: [
-            { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
-            { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
-          ],
-        });
+          idempotencyKey,
+          async () => {
+            const txResult = await prisma.$transaction(
+              async (tx) => {
+                const invoice = await tx.invoice.findFirst({
+                  where: { id: invoiceId, companyId },
+                  include: { company: { select: { accountsReceivableAccountId: true } } },
+                });
+                if (!invoice) {
+                  throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                }
+                if (invoice.status === 'DRAFT') {
+                  throw Object.assign(new Error('cannot record payment for DRAFT invoice'), {
+                    statusCode: 400,
+                  });
+                }
+                if (invoice.status !== 'POSTED' && invoice.status !== 'PARTIAL') {
+                  throw Object.assign(new Error('payments allowed only for POSTED or PARTIAL invoices'), {
+                    statusCode: 400,
+                  });
+                }
 
-        const payment = await tx.payment.create({
-          data: {
-            companyId,
-            invoiceId: invoice.id,
-            paymentDate,
-            amount,
-            bankAccountId: bankAccount.id,
-            journalEntryId: journalEntry.id,
+                if (!invoice.company.accountsReceivableAccountId) {
+                  throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
+                    statusCode: 400,
+                  });
+                }
+
+                const arAccount = await tx.account.findFirst({
+                  where: {
+                    id: invoice.company.accountsReceivableAccountId,
+                    companyId,
+                    type: AccountType.ASSET,
+                  },
+                });
+                if (!arAccount) {
+                  throw Object.assign(
+                    new Error('accountsReceivableAccountId must be an ASSET account in this company'),
+                    {
+                      statusCode: 400,
+                    }
+                  );
+                }
+
+                const bankAccount = await tx.account.findFirst({
+                  where: { id: body.bankAccountId!, companyId, type: AccountType.ASSET },
+                });
+                if (!bankAccount) {
+                  throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
+                    statusCode: 400,
+                  });
+                }
+
+                // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
+                const banking = await tx.bankingAccount.findFirst({
+                  where: { companyId, accountId: bankAccount.id },
+                  select: { kind: true },
+                });
+                if (!banking) {
+                  throw Object.assign(
+                    new Error('Deposit To must be a banking account (create it under Banking first)'),
+                    { statusCode: 400 }
+                  );
+                }
+                if (banking.kind === BankingAccountKind.CREDIT_CARD) {
+                  throw Object.assign(new Error('cannot deposit to a credit card account'), {
+                    statusCode: 400,
+                  });
+                }
+                // Optional: if UI sends paymentMode, enforce kind matches
+                if (body.paymentMode) {
+                  const expected =
+                    body.paymentMode === 'CASH'
+                      ? BankingAccountKind.CASH
+                      : body.paymentMode === 'BANK'
+                        ? BankingAccountKind.BANK
+                        : BankingAccountKind.E_WALLET;
+                  if (banking.kind !== expected) {
+                    throw Object.assign(
+                      new Error(
+                        `Deposit To account kind must be ${expected} for paymentMode ${body.paymentMode}`
+                      ),
+                      { statusCode: 400 }
+                    );
+                  }
+                }
+
+                const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+                const amount = toMoneyDecimal(amountNumber);
+
+                const journalEntry = await postJournalEntry(tx, {
+                  companyId,
+                  date: paymentDate,
+                  description: `Payment for Invoice ${invoice.invoiceNumber}`,
+                  createdByUserId: (request as any).user?.userId ?? null,
+                  skipAccountValidation: true,
+                  lines: [
+                    { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
+                    { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+                  ],
+                });
+
+                const payment = await tx.payment.create({
+                  data: {
+                    companyId,
+                    invoiceId: invoice.id,
+                    paymentDate,
+                    amount,
+                    bankAccountId: bankAccount.id,
+                    journalEntryId: journalEntry.id,
+                  },
+                });
+
+                // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
+                const sumAgg = await tx.payment.aggregate({
+                  where: { invoiceId: invoice.id, companyId, reversedAt: null },
+                  _sum: { amount: true },
+                });
+                const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
+
+                const updatedInvoice = await tx.invoice.update({
+                  where: { id: invoice.id },
+                  data: { amountPaid: totalPaid, status: newStatus },
+                });
+
+                // Event: payment.recorded (document-level)
+                const paymentEventId = randomUUID();
+                await tx.event.create({
+                  data: {
+                    companyId,
+                    eventId: paymentEventId,
+                    eventType: 'payment.recorded',
+                    schemaVersion: 'v1',
+                    occurredAt: new Date(occurredAt),
+                    source: 'cashflow-api',
+                    partitionKey: String(companyId),
+                    correlationId,
+                    aggregateType: 'Payment',
+                    aggregateId: String(payment.id),
+                    type: 'PaymentRecorded',
+                    payload: {
+                      paymentId: payment.id,
+                      invoiceId: invoice.id,
+                      journalEntryId: journalEntry.id,
+                      amount: amount.toString(),
+                      bankAccountId: bankAccount.id,
+                    },
+                  },
+                });
+
+                return { updatedInvoice, payment, journalEntry, paymentEventId };
+              },
+              { timeout: 10_000 }
+            );
+
+            return {
+              invoiceId: txResult.updatedInvoice.id,
+              invoiceStatus: txResult.updatedInvoice.status,
+              paymentId: txResult.payment.id,
+              journalEntryId: txResult.payment.journalEntryId,
+              _paymentEventId: txResult.paymentEventId,
+              _correlationId: correlationId,
+              _occurredAt: occurredAt,
+            };
           },
-        });
-
-        // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
-        // This remains performant (single aggregate) and is correct even under concurrency.
-        const sumAgg = await tx.payment.aggregate({
-          where: { invoiceId: invoice.id, companyId, reversedAt: null },
-          _sum: { amount: true },
-        });
-        const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
-        const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
-
-        const updatedInvoice = await tx.invoice.update({
-          where: { id: invoice.id },
-          data: { amountPaid: totalPaid, status: newStatus },
-        });
-
-        // Event: payment.recorded (document-level)
-        const paymentEventId = randomUUID();
-        await tx.event.create({
-          data: {
-            companyId,
-            eventId: paymentEventId,
-            eventType: 'payment.recorded',
-            schemaVersion: 'v1',
-            occurredAt: new Date(occurredAt),
-            source: 'cashflow-api',
-            partitionKey: String(companyId),
-            correlationId,
-            aggregateType: 'Payment',
-            aggregateId: String(payment.id),
-            type: 'PaymentRecorded',
-            payload: {
-              paymentId: payment.id,
-              invoiceId: invoice.id,
-              journalEntryId: journalEntry.id,
-              amount: amount.toString(),
-              bankAccountId: bankAccount.id,
-            },
-          },
-        });
-
-        return { updatedInvoice, payment, journalEntry, paymentEventId };
-            },
-            { timeout: 10_000 }
-          );
-
-          return {
-            invoiceId: txResult.updatedInvoice.id,
-            invoiceStatus: txResult.updatedInvoice.status,
-            paymentId: txResult.payment.id,
-            journalEntryId: txResult.payment.journalEntryId,
-            _paymentEventId: txResult.paymentEventId,
-            _correlationId: correlationId,
-            _occurredAt: occurredAt,
-          };
-        }
+          redis
+        )
       );
 
       if (!replay) {
@@ -839,13 +862,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const correlationId = randomUUID();
 
     try {
-      const { replay, response: result } = await runIdempotentRequest(
-        prisma,
-        companyId,
-        idempotencyKey,
-        async () => {
-          const txResult = await prisma.$transaction(
-            async (tx) => {
+      const lockKey = `lock:payment:reverse:${companyId}:${paymentId}`;
+
+      const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () =>
+        runIdempotentRequest(
+          prisma,
+          companyId,
+          idempotencyKey,
+          async () => {
+            const txResult = await prisma.$transaction(
+              async (tx) => {
               const payment = await tx.payment.findFirst({
                 where: { id: paymentId, companyId, invoiceId },
                 include: {
@@ -1007,12 +1033,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 _correlationId: correlationId,
                 _occurredAt: occurredAt,
               };
-            },
-            { timeout: 10_000 }
-          );
+              },
+              { timeout: 10_000 }
+            );
 
-          return txResult;
-        }
+            return txResult;
+          },
+          redis
+        )
       );
 
       if (!replay) {

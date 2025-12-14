@@ -3,9 +3,11 @@ import { AccountType } from '@prisma/client';
 import type { DomainEventEnvelopeV1 } from './events/domainEvent.js';
 import { prisma } from './infrastructure/db.js';
 import { runIdempotent } from './infrastructure/idempotency.js';
+import { getRedis } from './infrastructure/redis.js';
 import { normalizeToDay } from './utils/date.js';
 
 const fastify = Fastify({ logger: true });
+const redis = getRedis();
 
 type DomainEventEnvelope = DomainEventEnvelopeV1<any>;
 
@@ -118,21 +120,37 @@ fastify.post('/pubsub/push', { preHandler: verifyPubSubOidc }, async (request, r
 });
 
 async function handleJournalEntryCreated(event: DomainEventEnvelope) {
-  const { eventId, companyId, payload } = event;
-  const { journalEntryId } = payload || {};
+  const { eventId, payload } = event;
 
-  if (!eventId || !companyId || !journalEntryId) {
+  // Backward compatibility / safety:
+  // Some older messages may have companyId missing at the top-level.
+  const companyIdRaw = (event as any)?.companyId ?? (payload as any)?.companyId;
+  const journalEntryIdRaw = (payload as any)?.journalEntryId;
+
+  const companyId = Number(companyIdRaw);
+  const journalEntryId = Number(journalEntryIdRaw);
+
+  // IMPORTANT: If message is malformed, do NOT throw.
+  // Returning normally makes the handler reply 204 and Pub/Sub won't retry forever.
+  if (
+    typeof eventId !== 'string' ||
+    !eventId ||
+    !Number.isInteger(companyId) ||
+    companyId <= 0 ||
+    !Number.isInteger(journalEntryId) ||
+    journalEntryId <= 0
+  ) {
     fastify.log.error(
-      { event },
-      'Missing eventId, companyId, or journalEntryId in event payload'
+      { eventId, companyIdRaw, journalEntryIdRaw },
+      'Invalid Pub/Sub event: missing/invalid eventId, companyId, or journalEntryId'
     );
     return;
   }
 
   await runIdempotent(prisma, companyId, eventId, async (tx) => {
-    // 2) Load the journal entry with its lines and accounts
-    const entry = await tx.journalEntry.findUnique({
-      where: { id: journalEntryId },
+    // 2) Load the journal entry with its lines and accounts, scoped to tenant
+    const entry = await tx.journalEntry.findFirst({
+      where: { id: journalEntryId, companyId },
       include: {
         lines: {
           include: {
@@ -143,7 +161,7 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
     });
 
     if (!entry) {
-      fastify.log.error('Journal entry not found for id', journalEntryId);
+      fastify.log.error({ journalEntryId }, 'Journal entry not found');
       return;
     }
     if (entry.companyId !== companyId) {
@@ -212,7 +230,7 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
         totalExpense: expenseDelta,
       },
     });
-  });
+  }, redis);
 }
 
 const start = async () => {

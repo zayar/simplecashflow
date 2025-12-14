@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client';
+import type { Redis } from 'ioredis';
 
 // Helper type to represent the transaction client
 type PrismaTx = Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends">;
@@ -7,8 +8,33 @@ export async function runIdempotent(
   prisma: PrismaClient,
   companyId: number,
   eventId: string,
-  work: (tx: PrismaTx) => Promise<void>
+  work: (tx: PrismaTx) => Promise<void>,
+  redis?: Redis,
+  redisTtlMs: number = 10 * 60 * 1000 // 10 minutes
 ): Promise<void> {
+  // Safety rail: never throw for malformed ids in background processing.
+  // If we can't trust the tenant id, we must not process anything.
+  if (!Number.isInteger(companyId) || companyId <= 0 || typeof eventId !== 'string' || !eventId) {
+    return;
+  }
+
+  const redisKey = `idemp:event:${companyId}:${eventId}`;
+  let redisGuarded = false;
+
+  // Redis is best-effort: if unavailable, we still rely on DB uniqueness for idempotency.
+  if (redis) {
+    try {
+      const ok = await redis.set(redisKey, '1', 'PX', redisTtlMs, 'NX');
+      if (ok !== 'OK') {
+        // Duplicate event already in-flight or processed recently; skip work.
+        return;
+      }
+      redisGuarded = true;
+    } catch {
+      redisGuarded = false;
+    }
+  }
+
   try {
     await prisma.$transaction(async (tx) => {
       // 1. Idempotency check: insert ProcessedEvent
@@ -26,7 +52,22 @@ export async function runIdempotent(
       // We can log this in the caller if needed, or re-throw a specific IdempotencyError
       // For now, we swallow it as "success" (idempotent no-op) but let the caller know via log if they want
       // Since this function returns void, we just return.
+      if (redisGuarded) {
+        try {
+          await redis!.set(redisKey, '1', 'PX', redisTtlMs);
+        } catch {
+          /* best-effort */
+        }
+      }
       return;
+    }
+    if (redisGuarded) {
+      // Allow retry if work failed
+      try {
+        await redis!.del(redisKey);
+      } catch {
+        /* best-effort */
+      }
     }
     throw err;
   }

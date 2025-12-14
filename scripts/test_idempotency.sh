@@ -5,8 +5,8 @@
 
 set -e
 
-API_URL="https://cashflow-api-291129507535.asia-southeast1.run.app"
-WORKER_URL="https://cashflow-worker-291129507535.asia-southeast1.run.app"
+API_URL="${API_URL:-https://cashflow-api-291129507535.asia-southeast1.run.app}"
+WORKER_URL="${WORKER_URL:-https://cashflow-worker-291129507535.asia-southeast1.run.app}"
 
 echo "=========================================="
 echo "STEP 1: Create a Journal Entry via API"
@@ -18,22 +18,25 @@ COMPANY_ID=${1:-1}  # Use first argument or default to 1
 echo "Using companyId: $COMPANY_ID"
 echo ""
 
-# Create a journal entry with income/expense impact
+# Create a journal entry with income/expense impact.
+# NOTE: This script no longer contains any DB credentials. Provide ACCOUNT ids manually.
 echo "Creating journal entry..."
 RESPONSE=$(curl -s -X POST "$API_URL/journal-entries" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Idempotency-Key: idemp-$(date +%s)" \
   -d "{
     \"companyId\": $COMPANY_ID,
     \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
     \"description\": \"Test entry for idempotency\",
     \"lines\": [
       {
-        \"accountId\": $(mysql -h 34.87.113.215 -u root -p'P@ssw0rd' cashflow_prod -se "SELECT id FROM Account WHERE companyId=$COMPANY_ID AND code='4000' LIMIT 1" 2>/dev/null || echo "null"),
+        \"accountId\": ${SALES_ACCOUNT_ID:-null},
         \"debit\": 0,
         \"credit\": 1000
       },
       {
-        \"accountId\": $(mysql -h 34.87.113.215 -u root -p'P@ssw0rd' cashflow_prod -se "SELECT id FROM Account WHERE companyId=$COMPANY_ID AND code='1000' LIMIT 1" 2>/dev/null || echo "null"),
+        \"accountId\": ${CASH_ACCOUNT_ID:-null},
         \"debit\": 1000,
         \"credit\": 0
       }

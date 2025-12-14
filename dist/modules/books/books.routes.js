@@ -1,0 +1,949 @@
+import { prisma } from '../../infrastructure/db.js';
+import { parseCompanyId } from '../../utils/request.js';
+import { toMoneyDecimal } from '../../utils/money.js';
+import { isoNow } from '../../utils/date.js';
+import { publishDomainEvent } from '../../infrastructure/pubsub.js';
+import { markEventPublished } from '../../infrastructure/events.js';
+import { randomUUID } from 'node:crypto';
+import { AccountType, ItemType, Prisma } from '@prisma/client';
+import { postJournalEntry } from '../ledger/posting.service.js';
+import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
+import { requireCompanyIdParam } from '../../utils/tenant.js';
+import { BankingAccountKind } from '@prisma/client';
+import { getRedis } from '../../infrastructure/redis.js';
+import { withLockBestEffort } from '../../infrastructure/locks.js';
+function generateInvoiceNumber() {
+    // Beginner-friendly and “good enough” for now.
+    // Later we can make this per-company sequential numbers (INV-0001).
+    return `INV-${Date.now()}`;
+}
+export async function booksRoutes(fastify) {
+    // All Books endpoints are tenant-scoped and must be authenticated.
+    fastify.addHook('preHandler', fastify.authenticate);
+    const redis = getRedis();
+    // --- Books: Customers ---
+    fastify.get('/companies/:companyId/customers', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        return await prisma.customer.findMany({
+            where: { companyId },
+            orderBy: { createdAt: 'desc' },
+        });
+    });
+    fastify.post('/companies/:companyId/customers', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        if (!body.name) {
+            reply.status(400);
+            return { error: 'name is required' };
+        }
+        const customer = await prisma.customer.create({
+            data: {
+                companyId,
+                name: body.name,
+                email: body.email ?? null,
+                phone: body.phone ?? null,
+                currency: body.currency ?? null,
+                openingBalance: body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance),
+            },
+        });
+        return customer;
+    });
+    // --- Books: Items ---
+    fastify.get('/companies/:companyId/items', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        return await prisma.item.findMany({
+            where: { companyId },
+            orderBy: { createdAt: 'desc' },
+            include: {
+                incomeAccount: true,
+                expenseAccount: true,
+            },
+        });
+    });
+    fastify.post('/companies/:companyId/items', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        if (!body.name || !body.type || body.sellingPrice === undefined || !body.incomeAccountId) {
+            reply.status(400);
+            return { error: 'name, type, sellingPrice, incomeAccountId are required' };
+        }
+        // Tenant-safe validation: incomeAccount must belong to same company and be INCOME.
+        const incomeAccount = await prisma.account.findFirst({
+            where: { id: body.incomeAccountId, companyId, type: AccountType.INCOME },
+        });
+        if (!incomeAccount) {
+            reply.status(400);
+            return { error: 'incomeAccountId must be an INCOME account in this company' };
+        }
+        if (body.expenseAccountId) {
+            const expenseAccount = await prisma.account.findFirst({
+                where: { id: body.expenseAccountId, companyId, type: AccountType.EXPENSE },
+            });
+            if (!expenseAccount) {
+                reply.status(400);
+                return { error: 'expenseAccountId must be an EXPENSE account in this company' };
+            }
+        }
+        const item = await prisma.item.create({
+            data: {
+                companyId,
+                name: body.name,
+                sku: body.sku ?? null,
+                type: body.type,
+                sellingPrice: toMoneyDecimal(body.sellingPrice),
+                costPrice: body.costPrice === undefined ? null : toMoneyDecimal(body.costPrice),
+                incomeAccountId: body.incomeAccountId,
+                expenseAccountId: body.expenseAccountId ?? null,
+            },
+            include: {
+                incomeAccount: true,
+                expenseAccount: true,
+            },
+        });
+        return item;
+    });
+    // --- Books: Invoices (DRAFT) ---
+    fastify.get('/companies/:companyId/invoices', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const invoices = await prisma.invoice.findMany({
+            where: { companyId },
+            orderBy: { invoiceDate: 'desc' },
+            include: { customer: true },
+        });
+        // Keep response simple and UI-friendly.
+        return invoices.map((inv) => ({
+            id: inv.id,
+            invoiceNumber: inv.invoiceNumber,
+            customerName: inv.customer.name,
+            status: inv.status,
+            total: inv.total,
+            invoiceDate: inv.invoiceDate,
+            dueDate: inv.dueDate,
+            createdAt: inv.createdAt,
+        }));
+    });
+    // Get single invoice with payments
+    fastify.get('/companies/:companyId/invoices/:invoiceId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const invoiceId = Number(request.params?.invoiceId);
+        if (Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid invoiceId' };
+        }
+        const invoice = await prisma.invoice.findFirst({
+            where: { id: invoiceId, companyId },
+            include: {
+                customer: true,
+                lines: { include: { item: true } },
+                journalEntry: {
+                    include: {
+                        lines: {
+                            include: {
+                                account: { select: { id: true, code: true, name: true, type: true } },
+                            },
+                        },
+                    },
+                },
+                payments: {
+                    include: {
+                        bankAccount: true,
+                        journalEntry: {
+                            include: {
+                                lines: {
+                                    include: {
+                                        account: { select: { id: true, code: true, name: true, type: true } },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    orderBy: { paymentDate: 'desc' },
+                },
+            },
+        });
+        if (!invoice) {
+            reply.status(404);
+            return { error: 'invoice not found' };
+        }
+        // Calculate total paid from payments (source of truth), excluding reversed payments.
+        // This keeps UI correct even if Invoice.amountPaid wasn't backfilled for older invoices.
+        const totalPaid = invoice.payments
+            .filter((p) => !p.reversedAt)
+            .reduce((sum, p) => sum + Number(p.amount), 0);
+        const journalEntries = [];
+        if (invoice.status !== 'DRAFT' && invoice.journalEntry) {
+            journalEntries.push({
+                kind: 'INVOICE_POSTED',
+                journalEntryId: invoice.journalEntry.id,
+                date: invoice.journalEntry.date,
+                description: invoice.journalEntry.description,
+                lines: invoice.journalEntry.lines.map((l) => ({
+                    account: l.account,
+                    debit: l.debit.toString(),
+                    credit: l.credit.toString(),
+                })),
+            });
+        }
+        for (const p of invoice.payments) {
+            if (p.journalEntry) {
+                journalEntries.push({
+                    kind: 'PAYMENT_RECORDED',
+                    paymentId: p.id,
+                    journalEntryId: p.journalEntry.id,
+                    date: p.journalEntry.date,
+                    description: p.journalEntry.description,
+                    lines: p.journalEntry.lines.map((l) => ({
+                        account: l.account,
+                        debit: l.debit.toString(),
+                        credit: l.credit.toString(),
+                    })),
+                });
+            }
+        }
+        return {
+            id: invoice.id,
+            invoiceNumber: invoice.invoiceNumber,
+            customer: invoice.customer,
+            status: invoice.status,
+            invoiceDate: invoice.invoiceDate,
+            dueDate: invoice.dueDate,
+            total: invoice.total,
+            currency: invoice.currency,
+            lines: invoice.lines,
+            payments: invoice.payments.map((p) => ({
+                id: p.id,
+                paymentDate: p.paymentDate,
+                amount: p.amount,
+                bankAccount: {
+                    id: p.bankAccount.id,
+                    code: p.bankAccount.code,
+                    name: p.bankAccount.name,
+                },
+                journalEntryId: p.journalEntry?.id ?? null,
+                reversedAt: p.reversedAt ?? null,
+                reversalReason: p.reversalReason ?? null,
+                reversalJournalEntryId: p.reversalJournalEntryId ?? null,
+            })),
+            totalPaid: totalPaid,
+            remainingBalance: Number(invoice.total) - totalPaid,
+            journalEntries,
+        };
+    });
+    fastify.post('/companies/:companyId/invoices', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        if (!body.customerId || !body.lines || body.lines.length === 0) {
+            reply.status(400);
+            return { error: 'customerId and at least one line are required' };
+        }
+        // Validate customer belongs to company (tenant-safe).
+        const customer = await prisma.customer.findFirst({
+            where: { id: body.customerId, companyId },
+        });
+        if (!customer) {
+            reply.status(400);
+            return { error: 'customerId not found in this company' };
+        }
+        // Validate and load items (tenant-safe).
+        const itemIds = body.lines.map((l) => l.itemId);
+        const items = await prisma.item.findMany({
+            where: { companyId, id: { in: itemIds } },
+        });
+        const itemById = new Map(items.map((i) => [i.id, i]));
+        for (const line of body.lines) {
+            if (!line.quantity || line.quantity <= 0) {
+                reply.status(400);
+                return { error: 'each line must have quantity > 0' };
+            }
+            if (!itemById.get(line.itemId)) {
+                reply.status(400);
+                return { error: `itemId ${line.itemId} not found in this company` };
+            }
+        }
+        const invoiceDate = body.invoiceDate ? new Date(body.invoiceDate) : new Date();
+        const dueDate = body.dueDate ? new Date(body.dueDate) : null;
+        // Compute totals using Decimal (money-safe).
+        let total = new Prisma.Decimal(0);
+        const computedLines = body.lines.map((line) => {
+            const item = itemById.get(line.itemId);
+            const qty = toMoneyDecimal(line.quantity);
+            const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
+            const lineTotal = qty.mul(unit).toDecimalPlaces(2);
+            total = total.add(lineTotal);
+            return {
+                companyId,
+                itemId: item.id,
+                description: line.description ?? null,
+                quantity: qty,
+                unitPrice: unit,
+                lineTotal,
+            };
+        });
+        const invoice = await prisma.invoice.create({
+            data: {
+                companyId,
+                customerId: customer.id,
+                invoiceNumber: generateInvoiceNumber(),
+                status: 'DRAFT',
+                invoiceDate,
+                dueDate,
+                currency: body.currency ?? customer.currency ?? null,
+                total: total.toDecimalPlaces(2), // stored but will be recomputed when posted
+                lines: { create: computedLines },
+            },
+            include: {
+                customer: true,
+                lines: { include: { item: true } },
+            },
+        });
+        return invoice;
+    });
+    // POST (confirm) an invoice: DRAFT -> POSTED creates journal entry
+    fastify.post('/companies/:companyId/invoices/:invoiceId/post', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const correlationId = randomUUID(); // one correlationId for the whole posting transaction
+        const occurredAt = isoNow();
+        const lockKey = `lock:invoice:post:${companyId}:${invoiceId}`;
+        const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const txResult = await prisma.$transaction(async (tx) => {
+                const invoice = await tx.invoice.findFirst({
+                    where: { id: invoiceId, companyId },
+                    include: {
+                        company: true,
+                        customer: true,
+                        lines: { include: { item: true } },
+                    },
+                });
+                if (!invoice) {
+                    throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                }
+                if (invoice.status !== 'DRAFT') {
+                    throw Object.assign(new Error('only DRAFT invoices can be posted'), { statusCode: 400 });
+                }
+                if (!invoice.company.accountsReceivableAccountId) {
+                    throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
+                        statusCode: 400,
+                    });
+                }
+                // Validate AR account belongs to this company and is an ASSET (Accounts Receivable).
+                const arAccount = await tx.account.findFirst({
+                    where: {
+                        id: invoice.company.accountsReceivableAccountId,
+                        companyId,
+                        type: AccountType.ASSET,
+                    },
+                });
+                if (!arAccount) {
+                    throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
+                        statusCode: 400,
+                    });
+                }
+                // Recompute totals from stored lines (source of truth).
+                let total = new Prisma.Decimal(0);
+                const incomeBuckets = new Map();
+                for (const line of invoice.lines) {
+                    const qty = new Prisma.Decimal(line.quantity);
+                    const unit = new Prisma.Decimal(line.unitPrice);
+                    const lineTotal = qty.mul(unit).toDecimalPlaces(2);
+                    total = total.add(lineTotal);
+                    const incomeAccountId = line.item.incomeAccountId;
+                    const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
+                    incomeBuckets.set(incomeAccountId, prev.add(lineTotal));
+                }
+                total = total.toDecimalPlaces(2);
+                const journalEntry = await postJournalEntry(tx, {
+                    companyId,
+                    date: invoice.invoiceDate,
+                    description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
+                    createdByUserId: request.user?.userId ?? null,
+                    lines: [
+                        { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
+                        ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
+                            accountId: incomeAccountId,
+                            debit: new Prisma.Decimal(0),
+                            credit: amount.toDecimalPlaces(2),
+                        })),
+                    ],
+                });
+                // Update invoice to POSTED and link journal entry.
+                const updatedInvoice = await tx.invoice.update({
+                    where: { id: invoice.id },
+                    data: {
+                        status: 'POSTED',
+                        total,
+                        amountPaid: new Prisma.Decimal(0),
+                        journalEntryId: journalEntry.id,
+                    },
+                });
+                // --- Event 1: journal.entry.created ---
+                const jeEventId = randomUUID();
+                await tx.event.create({
+                    data: {
+                        companyId,
+                        eventId: jeEventId,
+                        eventType: 'journal.entry.created',
+                        schemaVersion: 'v1',
+                        occurredAt: new Date(occurredAt),
+                        source: 'cashflow-api',
+                        partitionKey: String(companyId),
+                        correlationId,
+                        aggregateType: 'JournalEntry',
+                        aggregateId: String(journalEntry.id),
+                        type: 'JournalEntryCreated',
+                        payload: {
+                            journalEntryId: journalEntry.id,
+                            companyId,
+                        },
+                    },
+                });
+                // --- Event 2: invoice.posted ---
+                const invoiceEventId = randomUUID();
+                await tx.event.create({
+                    data: {
+                        companyId,
+                        eventId: invoiceEventId,
+                        eventType: 'invoice.posted',
+                        schemaVersion: 'v1',
+                        occurredAt: new Date(occurredAt),
+                        source: 'cashflow-api',
+                        partitionKey: String(companyId),
+                        correlationId,
+                        aggregateType: 'Invoice',
+                        aggregateId: String(invoice.id),
+                        type: 'InvoicePosted',
+                        payload: {
+                            invoiceId: invoice.id,
+                            journalEntryId: journalEntry.id,
+                            total: total.toString(),
+                            customerId: invoice.customerId,
+                        },
+                    },
+                });
+                return { updatedInvoice, journalEntry, jeEventId, invoiceEventId };
+            }, { timeout: 10_000 });
+            return {
+                invoiceId: txResult.updatedInvoice.id,
+                status: txResult.updatedInvoice.status,
+                total: txResult.updatedInvoice.total.toString(),
+                journalEntryId: txResult.updatedInvoice.journalEntryId,
+                // keep event ids for first execution publish step only
+                _jeEventId: txResult.jeEventId,
+                _invoiceEventId: txResult.invoiceEventId,
+                _correlationId: correlationId,
+                _occurredAt: occurredAt,
+            };
+        }, redis));
+        // First execution: attempt publish now (still safe if it fails; outbox publisher will deliver later).
+        if (!replay) {
+            const publishJeOk = await publishDomainEvent({
+                eventId: result._jeEventId,
+                eventType: 'journal.entry.created',
+                schemaVersion: 'v1',
+                occurredAt: result._occurredAt,
+                companyId,
+                partitionKey: String(companyId),
+                correlationId: result._correlationId,
+                aggregateType: 'JournalEntry',
+                aggregateId: String(result.journalEntryId),
+                source: 'cashflow-api',
+                payload: {
+                    journalEntryId: result.journalEntryId,
+                    companyId,
+                },
+            });
+            if (publishJeOk)
+                await markEventPublished(result._jeEventId);
+            const publishInvoiceOk = await publishDomainEvent({
+                eventId: result._invoiceEventId,
+                eventType: 'invoice.posted',
+                schemaVersion: 'v1',
+                occurredAt: result._occurredAt,
+                companyId,
+                partitionKey: String(companyId),
+                correlationId: result._correlationId,
+                aggregateType: 'Invoice',
+                aggregateId: String(result.invoiceId),
+                source: 'cashflow-api',
+                payload: {
+                    invoiceId: result.invoiceId,
+                    journalEntryId: result.journalEntryId,
+                    total: result.total,
+                },
+            });
+            if (publishInvoiceOk)
+                await markEventPublished(result._invoiceEventId);
+        }
+        // Always return stable business response
+        return {
+            invoiceId: result.invoiceId,
+            status: result.status,
+            total: result.total,
+            journalEntryId: result.journalEntryId,
+        };
+    });
+    // Payments: record and post to ledger (Bank/Cash Dr, AR Cr)
+    fastify.post('/companies/:companyId/invoices/:invoiceId/payments', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = request.body;
+        if (!body.amount || body.amount <= 0 || !body.bankAccountId) {
+            reply.status(400);
+            return { error: 'amount (>0) and bankAccountId are required' };
+        }
+        // After validation, treat amount as a required number.
+        const amountNumber = body.amount;
+        const occurredAt = isoNow();
+        const correlationId = randomUUID();
+        try {
+            const lockKey = `lock:invoice:payment:${companyId}:${invoiceId}`;
+            const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const invoice = await tx.invoice.findFirst({
+                        where: { id: invoiceId, companyId },
+                        include: { company: { select: { accountsReceivableAccountId: true } } },
+                    });
+                    if (!invoice) {
+                        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                    }
+                    if (invoice.status === 'DRAFT') {
+                        throw Object.assign(new Error('cannot record payment for DRAFT invoice'), {
+                            statusCode: 400,
+                        });
+                    }
+                    if (invoice.status !== 'POSTED' && invoice.status !== 'PARTIAL') {
+                        throw Object.assign(new Error('payments allowed only for POSTED or PARTIAL invoices'), {
+                            statusCode: 400,
+                        });
+                    }
+                    if (!invoice.company.accountsReceivableAccountId) {
+                        throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
+                            statusCode: 400,
+                        });
+                    }
+                    const arAccount = await tx.account.findFirst({
+                        where: {
+                            id: invoice.company.accountsReceivableAccountId,
+                            companyId,
+                            type: AccountType.ASSET,
+                        },
+                    });
+                    if (!arAccount) {
+                        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
+                            statusCode: 400,
+                        });
+                    }
+                    const bankAccount = await tx.account.findFirst({
+                        where: { id: body.bankAccountId, companyId, type: AccountType.ASSET },
+                    });
+                    if (!bankAccount) {
+                        throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
+                            statusCode: 400,
+                        });
+                    }
+                    // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
+                    const banking = await tx.bankingAccount.findFirst({
+                        where: { companyId, accountId: bankAccount.id },
+                        select: { kind: true },
+                    });
+                    if (!banking) {
+                        throw Object.assign(new Error('Deposit To must be a banking account (create it under Banking first)'), { statusCode: 400 });
+                    }
+                    if (banking.kind === BankingAccountKind.CREDIT_CARD) {
+                        throw Object.assign(new Error('cannot deposit to a credit card account'), {
+                            statusCode: 400,
+                        });
+                    }
+                    // Optional: if UI sends paymentMode, enforce kind matches
+                    if (body.paymentMode) {
+                        const expected = body.paymentMode === 'CASH'
+                            ? BankingAccountKind.CASH
+                            : body.paymentMode === 'BANK'
+                                ? BankingAccountKind.BANK
+                                : BankingAccountKind.E_WALLET;
+                        if (banking.kind !== expected) {
+                            throw Object.assign(new Error(`Deposit To account kind must be ${expected} for paymentMode ${body.paymentMode}`), { statusCode: 400 });
+                        }
+                    }
+                    const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+                    const amount = toMoneyDecimal(amountNumber);
+                    const journalEntry = await postJournalEntry(tx, {
+                        companyId,
+                        date: paymentDate,
+                        description: `Payment for Invoice ${invoice.invoiceNumber}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        skipAccountValidation: true,
+                        lines: [
+                            { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
+                            { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+                        ],
+                    });
+                    const payment = await tx.payment.create({
+                        data: {
+                            companyId,
+                            invoiceId: invoice.id,
+                            paymentDate,
+                            amount,
+                            bankAccountId: bankAccount.id,
+                            journalEntryId: journalEntry.id,
+                        },
+                    });
+                    // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
+                    const sumAgg = await tx.payment.aggregate({
+                        where: { invoiceId: invoice.id, companyId, reversedAt: null },
+                        _sum: { amount: true },
+                    });
+                    const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
+                    const updatedInvoice = await tx.invoice.update({
+                        where: { id: invoice.id },
+                        data: { amountPaid: totalPaid, status: newStatus },
+                    });
+                    // Event: payment.recorded (document-level)
+                    const paymentEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: paymentEventId,
+                            eventType: 'payment.recorded',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'Payment',
+                            aggregateId: String(payment.id),
+                            type: 'PaymentRecorded',
+                            payload: {
+                                paymentId: payment.id,
+                                invoiceId: invoice.id,
+                                journalEntryId: journalEntry.id,
+                                amount: amount.toString(),
+                                bankAccountId: bankAccount.id,
+                            },
+                        },
+                    });
+                    return { updatedInvoice, payment, journalEntry, paymentEventId };
+                }, { timeout: 10_000 });
+                return {
+                    invoiceId: txResult.updatedInvoice.id,
+                    invoiceStatus: txResult.updatedInvoice.status,
+                    paymentId: txResult.payment.id,
+                    journalEntryId: txResult.payment.journalEntryId,
+                    _paymentEventId: txResult.paymentEventId,
+                    _correlationId: correlationId,
+                    _occurredAt: occurredAt,
+                };
+            }, redis));
+            if (!replay) {
+                const publishPaymentOk = await publishDomainEvent({
+                    eventId: result._paymentEventId,
+                    eventType: 'payment.recorded',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'Payment',
+                    aggregateId: String(result.paymentId),
+                    source: 'cashflow-api',
+                    payload: {
+                        paymentId: result.paymentId,
+                        invoiceId,
+                        journalEntryId: result.journalEntryId,
+                        amount: (body.amount ?? 0).toFixed(2),
+                        bankAccountId: body.bankAccountId,
+                    },
+                });
+                if (publishPaymentOk)
+                    await markEventPublished(result._paymentEventId);
+            }
+            return {
+                invoiceId: result.invoiceId,
+                invoiceStatus: result.invoiceStatus,
+                paymentId: result.paymentId,
+                journalEntryId: result.journalEntryId,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Reverse a payment (immutable): creates a reversing journal entry and updates invoice totals.
+    // POST /companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse
+    fastify.post('/companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const invoiceId = Number(request.params?.invoiceId);
+        const paymentId = Number(request.params?.paymentId);
+        if (!companyId || Number.isNaN(invoiceId) || Number.isNaN(paymentId)) {
+            reply.status(400);
+            return { error: 'invalid companyId, invoiceId, or paymentId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        const reversalDate = body.date ? new Date(body.date) : new Date();
+        if (body.date && isNaN(reversalDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid date (must be ISO string)' };
+        }
+        const occurredAt = isoNow();
+        const correlationId = randomUUID();
+        try {
+            const lockKey = `lock:payment:reverse:${companyId}:${paymentId}`;
+            const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const payment = await tx.payment.findFirst({
+                        where: { id: paymentId, companyId, invoiceId },
+                        include: {
+                            invoice: { select: { id: true, total: true, amountPaid: true, status: true, invoiceNumber: true } },
+                            journalEntry: { include: { lines: true } },
+                        },
+                    });
+                    if (!payment) {
+                        throw Object.assign(new Error('payment not found'), { statusCode: 404 });
+                    }
+                    if (!payment.journalEntry) {
+                        throw Object.assign(new Error('payment has no journal entry to reverse'), { statusCode: 400 });
+                    }
+                    if (payment.reversedAt) {
+                        throw Object.assign(new Error('payment already reversed'), { statusCode: 400 });
+                    }
+                    const originalJeId = payment.journalEntry.id;
+                    const existingReversal = await tx.journalEntry.findFirst({
+                        where: { companyId, reversalOfJournalEntryId: originalJeId },
+                        select: { id: true },
+                    });
+                    if (existingReversal) {
+                        throw Object.assign(new Error('payment journal entry already reversed'), { statusCode: 400 });
+                    }
+                    const reversalLines = payment.journalEntry.lines.map((l) => ({
+                        accountId: l.accountId,
+                        debit: new Prisma.Decimal(l.credit).toDecimalPlaces(2),
+                        credit: new Prisma.Decimal(l.debit).toDecimalPlaces(2),
+                    }));
+                    const reversalEntry = await postJournalEntry(tx, {
+                        companyId,
+                        date: reversalDate,
+                        description: `REVERSAL of Payment ${payment.id} (Invoice ${payment.invoice.invoiceNumber})`,
+                        createdByUserId: request.user?.userId ?? null,
+                        reversalOfJournalEntryId: originalJeId,
+                        reversalReason: body.reason ?? null,
+                        skipAccountValidation: true,
+                        lines: reversalLines,
+                    });
+                    // Recompute paid-after-refund from Payments table (source of truth) to avoid negative drift.
+                    // We exclude the payment being reversed and any payments already reversed.
+                    const sumAfter = await tx.payment.aggregate({
+                        where: {
+                            companyId,
+                            invoiceId,
+                            reversedAt: null,
+                            id: { not: payment.id },
+                        },
+                        _sum: { amount: true },
+                    });
+                    const newPaid = (sumAfter._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const newStatus = newPaid.equals(0)
+                        ? 'POSTED'
+                        : newPaid.greaterThanOrEqualTo(payment.invoice.total)
+                            ? 'PAID'
+                            : 'PARTIAL';
+                    const updatedInvoice = await tx.invoice.update({
+                        where: { id: invoiceId },
+                        data: { amountPaid: newPaid, status: newStatus },
+                    });
+                    // Mark payment as reversed (document audit)
+                    await tx.payment.update({
+                        where: { id: payment.id },
+                        data: {
+                            reversedAt: new Date(occurredAt),
+                            reversalReason: body.reason ?? null,
+                            reversalJournalEntryId: reversalEntry.id,
+                            reversedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    // Outbox events (ledger consistency + document semantics)
+                    const createdEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: createdEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversalEntry.id),
+                            type: 'JournalEntryCreated',
+                            payload: {
+                                journalEntryId: reversalEntry.id,
+                                companyId,
+                                reversalOfJournalEntryId: originalJeId,
+                            },
+                        },
+                    });
+                    const reversedEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: reversedEventId,
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(originalJeId),
+                            type: 'JournalEntryReversed',
+                            payload: {
+                                originalJournalEntryId: originalJeId,
+                                reversalJournalEntryId: reversalEntry.id,
+                                companyId,
+                                reason: body.reason ?? null,
+                            },
+                        },
+                    });
+                    const paymentReversedEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: paymentReversedEventId,
+                            eventType: 'payment.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'Payment',
+                            aggregateId: String(payment.id),
+                            type: 'PaymentReversed',
+                            payload: {
+                                paymentId: payment.id,
+                                invoiceId,
+                                originalJournalEntryId: originalJeId,
+                                reversalJournalEntryId: reversalEntry.id,
+                                amount: payment.amount.toString(),
+                                reason: body.reason ?? null,
+                            },
+                        },
+                    });
+                    return {
+                        paymentId: payment.id,
+                        invoiceId,
+                        invoiceStatus: updatedInvoice.status,
+                        originalJournalEntryId: originalJeId,
+                        reversalJournalEntryId: reversalEntry.id,
+                        _createdEventId: createdEventId,
+                        _reversedEventId: reversedEventId,
+                        _paymentReversedEventId: paymentReversedEventId,
+                        _correlationId: correlationId,
+                        _occurredAt: occurredAt,
+                    };
+                }, { timeout: 10_000 });
+                return txResult;
+            }, redis));
+            if (!replay) {
+                const createdOk = await publishDomainEvent({
+                    eventId: result._createdEventId,
+                    eventType: 'journal.entry.created',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(result.reversalJournalEntryId),
+                    source: 'cashflow-api',
+                    payload: {
+                        journalEntryId: result.reversalJournalEntryId,
+                        companyId,
+                        reversalOfJournalEntryId: result.originalJournalEntryId,
+                    },
+                });
+                if (createdOk)
+                    await markEventPublished(result._createdEventId);
+                const reversedOk = await publishDomainEvent({
+                    eventId: result._reversedEventId,
+                    eventType: 'journal.entry.reversed',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(result.originalJournalEntryId),
+                    source: 'cashflow-api',
+                    payload: {
+                        companyId,
+                        originalJournalEntryId: result.originalJournalEntryId,
+                        reversalJournalEntryId: result.reversalJournalEntryId,
+                    },
+                });
+                if (reversedOk)
+                    await markEventPublished(result._reversedEventId);
+                const paymentRevOk = await publishDomainEvent({
+                    eventId: result._paymentReversedEventId,
+                    eventType: 'payment.reversed',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'Payment',
+                    aggregateId: String(result.paymentId),
+                    source: 'cashflow-api',
+                    payload: {
+                        paymentId: result.paymentId,
+                        invoiceId: result.invoiceId,
+                        reversalJournalEntryId: result.reversalJournalEntryId,
+                    },
+                });
+                if (paymentRevOk)
+                    await markEventPublished(result._paymentReversedEventId);
+            }
+            return {
+                paymentId: result.paymentId,
+                invoiceId: result.invoiceId,
+                invoiceStatus: result.invoiceStatus,
+                reversalJournalEntryId: result.reversalJournalEntryId,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+}
+//# sourceMappingURL=books.routes.js.map

@@ -3,3 +3,11 @@ node_modules
 .env
 
 /generated/prisma
+
+# OS / editor
+.DS_Store
+
+# Next.js build output (should never be committed)
+frontend/.next/
+frontend/node_modules/
+frontend/.env.local

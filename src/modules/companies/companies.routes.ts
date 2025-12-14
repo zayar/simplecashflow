@@ -2,7 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import { AccountType, BankingAccountKind } from '@prisma/client';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
-import { enforceCompanyScope, getAuthCompanyId, requireCompanyIdParam } from '../../utils/tenant.js';
+import {
+  enforceCompanyScope,
+  forbidClientProvidedCompanyId,
+  getAuthCompanyId,
+  requireCompanyIdParam,
+} from '../../utils/tenant.js';
 
 export async function companiesRoutes(fastify: FastifyInstance) {
   // Company endpoints are tenant scoped; require JWT.
@@ -120,13 +125,12 @@ export async function companiesRoutes(fastify: FastifyInstance) {
   // --- Account APIs ---
   // List accounts for a company
   fastify.get('/companies/:companyId/accounts', async (request, reply) => {
-    const { companyId } = request.params as { companyId: string };
+    const companyId = requireCompanyIdParam(request, reply);
     const query = request.query as { type?: AccountType };
-    enforceCompanyScope(request, reply, Number(companyId));
 
     const accounts = await prisma.account.findMany({
       where: {
-        companyId: Number(companyId),
+        companyId,
         ...(query.type ? { type: query.type } : {}),
       },
       orderBy: { code: 'asc' },
@@ -135,7 +139,34 @@ export async function companiesRoutes(fastify: FastifyInstance) {
     return accounts;
   });
 
-  // Create an account
+  // Create an account (preferred tenant-scoped endpoint)
+  fastify.post('/companies/:companyId/accounts', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const body = request.body as {
+      code?: string;
+      name?: string;
+      type?: AccountType;
+    };
+
+    if (!body.code || !body.name || !body.type) {
+      reply.status(400);
+      return { error: 'code, name, type are required' };
+    }
+
+    const account = await prisma.account.create({
+      data: {
+        companyId,
+        code: body.code,
+        name: body.name,
+        type: body.type,
+      },
+    });
+
+    return account;
+  });
+
+  // Create an account (legacy endpoint; kept for backward compatibility)
+  // IMPORTANT: companyId is derived from JWT; client-provided companyId is forbidden.
   fastify.post('/accounts', async (request, reply) => {
     const body = request.body as {
       companyId?: number;
@@ -144,15 +175,15 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       type?: AccountType;
     };
 
-    if (!body.companyId || !body.code || !body.name || !body.type) {
+    const companyId = forbidClientProvidedCompanyId(request, reply, body.companyId);
+    if (!body.code || !body.name || !body.type) {
       reply.status(400);
-      return { error: 'companyId, code, name, type are required' };
+      return { error: 'code, name, type are required' };
     }
-    enforceCompanyScope(request, reply, body.companyId);
 
     const account = await prisma.account.create({
       data: {
-        companyId: body.companyId,
+        companyId,
         code: body.code,
         name: body.name,
         type: body.type,

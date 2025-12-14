@@ -1,11 +1,8 @@
 import Fastify from 'fastify';
-import { PrismaClient } from '@prisma/client';
-import { PubSub } from '@google-cloud/pubsub';
 import { randomUUID } from 'node:crypto';
+import { prisma } from './infrastructure/db.js';
+import { publishDomainEvent } from './infrastructure/pubsub.js';
 const fastify = Fastify({ logger: true });
-const prisma = new PrismaClient();
-const pubsub = new PubSub();
-const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || 'cashflow-events';
 const PUBLISH_BATCH_SIZE = Number(process.env.PUBLISH_BATCH_SIZE) || 50;
 const PUBLISH_INTERVAL_MS = Number(process.env.PUBLISH_INTERVAL_MS) || 1000;
 const LOCK_TIMEOUT_MS = Number(process.env.LOCK_TIMEOUT_MS) || 60_000;
@@ -37,23 +34,6 @@ function buildEnvelopeFromEventRow(e) {
         source: e.source ?? 'cashflow-api',
         payload,
     };
-}
-async function publishEnvelope(envelope) {
-    const dataBuffer = Buffer.from(JSON.stringify(envelope));
-    const attributes = {
-        eventId: envelope.eventId,
-        eventType: envelope.eventType,
-        companyId: String(envelope.companyId),
-        schemaVersion: envelope.schemaVersion,
-        correlationId: envelope.correlationId,
-        aggregateType: envelope.aggregateType,
-        aggregateId: envelope.aggregateId,
-    };
-    await pubsub.topic(PUBSUB_TOPIC).publishMessage({
-        data: dataBuffer,
-        attributes,
-        orderingKey: envelope.partitionKey,
-    });
 }
 async function claimBatch(lockId, now) {
     const staleBefore = new Date(now.getTime() - LOCK_TIMEOUT_MS);
@@ -133,7 +113,11 @@ async function tick() {
         for (const e of batch) {
             try {
                 const envelope = buildEnvelopeFromEventRow(e);
-                await publishEnvelope(envelope);
+                // Use the shared publishDomainEvent which wraps the PubSub logic
+                const ok = await publishDomainEvent(envelope);
+                if (!ok) {
+                    throw new Error('Pub/Sub publish failed (publishDomainEvent returned false)');
+                }
                 await markPublishedAndUnlock(e.eventId);
             }
             catch (err) {

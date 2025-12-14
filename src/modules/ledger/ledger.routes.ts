@@ -9,10 +9,13 @@ import { postJournalEntry } from './posting.service.js';
 import { parseCompanyId } from '../../utils/request.js';
 import { enforceCompanyScope, forbidClientProvidedCompanyId, requireCompanyIdParam } from '../../utils/tenant.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
+import { getRedis } from '../../infrastructure/redis.js';
+import { withLockBestEffort } from '../../infrastructure/locks.js';
 
 export async function ledgerRoutes(fastify: FastifyInstance) {
   // All ledger endpoints are tenant-scoped and must be authenticated.
   fastify.addHook('preHandler', fastify.authenticate);
+  const redis = getRedis();
 
   // --- Journal Entries list (for UI) ---
   // GET /companies/:companyId/journal-entries?from=YYYY-MM-DD&to=YYYY-MM-DD&take=50
@@ -136,81 +139,99 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     const schemaVersion = 'v1' as const;
     const source = 'cashflow-api';
 
-    // Wrap in a transaction so entry + event are consistent
-    const result = await prisma.$transaction(async (tx: any) => {
-      const entry = await postJournalEntry(tx, {
-        companyId,
-        date,
-        description: body.description ?? '',
-        createdByUserId: (request as any).user?.userId ?? null,
-        lines: (body.lines ?? []).map((line) => ({
-          accountId: line.accountId!,
-          debit: new Prisma.Decimal((line.debit ?? 0).toFixed(2)),
-          credit: new Prisma.Decimal((line.credit ?? 0).toFixed(2)),
-        })),
-      });
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
 
-      // Compute totals from normalized lines (Decimal-safe)
-      const totalDebit = entry.lines.reduce(
-        (sum: Prisma.Decimal, l: any) => sum.add(new Prisma.Decimal(l.debit)),
-        new Prisma.Decimal(0)
-      );
-      const totalCredit = entry.lines.reduce(
-        (sum: Prisma.Decimal, l: any) => sum.add(new Prisma.Decimal(l.credit)),
-        new Prisma.Decimal(0)
-      );
+    // Wrap in idempotency so retries can't duplicate journal entries.
+    const { replay, response } = await runIdempotentRequest(
+      prisma,
+      companyId,
+      idempotencyKey,
+      async () => {
+        const entry = await prisma.$transaction(async (tx: any) => {
+          const created = await postJournalEntry(tx, {
+            companyId,
+            date,
+            description: body.description ?? '',
+            createdByUserId: (request as any).user?.userId ?? null,
+            lines: (body.lines ?? []).map((line) => ({
+              accountId: line.accountId!,
+              debit: new Prisma.Decimal((line.debit ?? 0).toFixed(2)),
+              credit: new Prisma.Decimal((line.credit ?? 0).toFixed(2)),
+            })),
+          });
 
-      await tx.event.create({
-        data: {
-          companyId,
+          // Compute totals from normalized lines (Decimal-safe)
+          const totalDebit = created.lines.reduce(
+            (sum: Prisma.Decimal, l: any) => sum.add(new Prisma.Decimal(l.debit)),
+            new Prisma.Decimal(0)
+          );
+          const totalCredit = created.lines.reduce(
+            (sum: Prisma.Decimal, l: any) => sum.add(new Prisma.Decimal(l.credit)),
+            new Prisma.Decimal(0)
+          );
+
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId,
+              eventType,
+              schemaVersion,
+              occurredAt: new Date(occurredAt),
+              source,
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(created.id),
+              type: 'JournalEntryCreated', // Legacy field, keeping for now
+              payload: {
+                journalEntryId: created.id,
+                companyId,
+                totalDebit: Number(totalDebit),
+                totalCredit: Number(totalCredit),
+              },
+            },
+          });
+
+          return created;
+        });
+
+        const envelope: DomainEventEnvelopeV1 = {
           eventId,
           eventType,
           schemaVersion,
-          occurredAt: new Date(occurredAt),
-          source,
+          occurredAt,
+          companyId,
           partitionKey: String(companyId),
           correlationId,
           aggregateType: 'JournalEntry',
           aggregateId: String(entry.id),
-          type: 'JournalEntryCreated', // Legacy field, keeping for now
+          source,
           payload: {
             journalEntryId: entry.id,
             companyId,
-            totalDebit: Number(totalDebit),
-            totalCredit: Number(totalCredit),
+            // Informational totals; consumers should trust stored JournalLines.
+            totalDebit: entry.lines.reduce((sum: number, l: any) => sum + Number(l.debit), 0),
+            totalCredit: entry.lines.reduce((sum: number, l: any) => sum + Number(l.credit), 0),
           },
-        },
-      });
+        };
 
-      return entry;
-    });
-
-    const envelope: DomainEventEnvelopeV1 = {
-      eventId,
-      eventType,
-      schemaVersion,
-      occurredAt,
-      companyId,
-      partitionKey: String(companyId),
-      correlationId,
-      aggregateType: 'JournalEntry',
-      aggregateId: String(result.id),
-      source,
-      payload: {
-        journalEntryId: result.id,
-        companyId,
-        // These totals are informational; consumers should trust the stored JournalLines.
-        totalDebit: result.lines.reduce((sum: number, l: any) => sum + Number(l.debit), 0),
-        totalCredit: result.lines.reduce((sum: number, l: any) => sum + Number(l.credit), 0),
+        return { entry, envelope };
       },
-    };
+      redis
+    );
 
-    const published = await publishDomainEvent(envelope);
-    if (published) {
-      await markEventPublished(eventId);
+    if (!replay) {
+      const published = await publishDomainEvent((response as any).envelope);
+      if (published) {
+        await markEventPublished(eventId);
+      }
     }
 
-    return result;
+    return (response as any).entry;
   });
 
   // --- Reverse a posted journal entry (immutable ledger) ---
@@ -243,12 +264,19 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       const occurredAt = new Date().toISOString();
 
       try {
-        const { replay, response: result } = await runIdempotentRequest(
-          prisma,
-          companyId,
-          idempotencyKey,
-          async () => {
-            const txResult = await prisma.$transaction(async (tx: any) => {
+        const lockKey = `lock:journal-entry:reverse:${companyId}:${journalEntryId}`;
+
+        const { replay, response: result } = await withLockBestEffort(
+          redis,
+          lockKey,
+          30_000,
+          async () =>
+            await runIdempotentRequest(
+              prisma,
+              companyId,
+              idempotencyKey,
+              async () => {
+                const txResult = await prisma.$transaction(async (tx: any) => {
               const original = await tx.journalEntry.findFirst({
                 where: { id: journalEntryId, companyId },
                 include: { lines: true },
@@ -344,7 +372,9 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
               _correlationId: correlationId,
               _occurredAt: occurredAt,
             };
-          }
+              },
+              redis
+            )
         );
 
         if (!replay) {
