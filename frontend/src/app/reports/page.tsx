@@ -39,20 +39,29 @@ const reports = [
 
 export default function ReportsPage() {
   return (
-    <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-      {reports.map((report) => (
-        <Link key={report.href} href={report.href}>
-          <Card className="h-full transition-all hover:bg-slate-50">
-            <CardHeader>
-              <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
-                <report.icon className="h-6 w-6" />
-              </div>
-              <CardTitle>{report.title}</CardTitle>
-              <CardDescription>{report.description}</CardDescription>
-            </CardHeader>
-          </Card>
-        </Link>
-      ))}
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">Reports</h1>
+        <p className="text-sm text-muted-foreground">
+          Financial statements and closing tools.
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {reports.map((report) => (
+          <Link key={report.href} href={report.href}>
+            <Card className="h-full shadow-sm transition-colors hover:bg-muted/30">
+              <CardHeader>
+                <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-lg border bg-background text-muted-foreground">
+                  <report.icon className="h-5 w-5" />
+                </div>
+                <CardTitle className="text-lg">{report.title}</CardTitle>
+                <CardDescription>{report.description}</CardDescription>
+              </CardHeader>
+            </Card>
+          </Link>
+        ))}
+      </div>
     </div>
   );
 }

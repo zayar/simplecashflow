@@ -10,6 +10,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { ArrowLeft, DollarSign, Calendar, User, FileText } from 'lucide-react';
 import Link from 'next/link';
+import { SelectNative } from '@/components/ui/select-native';
+import { Badge } from '@/components/ui/badge';
 
 export default function RecordPaymentPage() {
   const { user } = useAuth();
@@ -123,9 +125,12 @@ export default function RecordPaymentPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Record Payment</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Record payment</h1>
+            <p className="text-sm text-muted-foreground">Loading invoice details…</p>
+          </div>
         </div>
-        <Card>
+        <Card className="shadow-sm">
           <CardContent className="pt-6">
             <p className="text-center text-muted-foreground">Loading invoice details...</p>
           </CardContent>
@@ -151,12 +156,15 @@ export default function RecordPaymentPage() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
-        <h1 className="text-3xl font-bold tracking-tight">Record Payment</h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Record payment</h1>
+          <p className="text-sm text-muted-foreground">{invoice.invoiceNumber}</p>
+        </div>
       </div>
 
       <div className="grid gap-6 md:grid-cols-2">
         {/* Invoice Details */}
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <FileText className="h-5 w-5" />
@@ -216,20 +224,13 @@ export default function RecordPaymentPage() {
             </div>
 
             <div className="pt-2">
-              <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                invoice.status === 'POSTED' ? 'bg-green-100 text-green-800' :
-                invoice.status === 'PAID' ? 'bg-blue-100 text-blue-800' :
-                invoice.status === 'PARTIAL' ? 'bg-yellow-100 text-yellow-800' :
-                'bg-gray-100 text-gray-800'
-              }`}>
-                {invoice.status}
-              </span>
+              <Badge variant="outline">{invoice.status}</Badge>
             </div>
           </CardContent>
         </Card>
 
         {/* Payment Form */}
-        <Card>
+        <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <DollarSign className="h-5 w-5" />
@@ -274,9 +275,8 @@ export default function RecordPaymentPage() {
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="grid gap-2">
                 <Label htmlFor="paymentMode">Payment Mode</Label>
-                <select
+                <SelectNative
                   id="paymentMode"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   disabled={!canPay || isFullyPaid}
                   value={formData.paymentMode}
                   onChange={(e) =>
@@ -290,7 +290,7 @@ export default function RecordPaymentPage() {
                   <option value="CASH">Cash</option>
                   <option value="BANK">Bank</option>
                   <option value="E_WALLET">E‑wallet</option>
-                </select>
+                </SelectNative>
               </div>
 
               <div className="grid gap-2">
@@ -328,9 +328,8 @@ export default function RecordPaymentPage() {
 
               <div className="grid gap-2">
                 <Label htmlFor="bankAccount">Deposit To*</Label>
-                <select
+                <SelectNative
                   id="bankAccount"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   required
                   disabled={!canPay || isFullyPaid}
                   value={formData.bankAccountId}
@@ -342,7 +341,7 @@ export default function RecordPaymentPage() {
                       {row.account.code} - {row.account.name}
                     </option>
                   ))}
-                </select>
+                </SelectNative>
                 <p className="text-xs text-muted-foreground">
                   Only accounts created under <b>Banking</b> can be used here (fintech safety).
                 </p>

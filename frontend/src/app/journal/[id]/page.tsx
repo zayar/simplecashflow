@@ -7,7 +7,10 @@ import { fetchApi } from '@/lib/api';
 import { useParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { ArrowLeft, BookOpen } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -51,11 +54,16 @@ export default function JournalEntryDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Journal Entry</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Journal entry</h1>
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          </div>
         </div>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">Loading...</p>
+        <Card className="shadow-sm">
+          <CardContent className="pt-6 space-y-3">
+            <Skeleton className="h-7 w-72" />
+            <Skeleton className="h-5 w-56" />
+            <Skeleton className="h-64 w-full" />
           </CardContent>
         </Card>
       </div>
@@ -71,9 +79,12 @@ export default function JournalEntryDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Journal Entry</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Journal entry</h1>
+            <p className="text-sm text-muted-foreground">Not found</p>
+          </div>
         </div>
-        <Card>
+        <Card className="shadow-sm">
           <CardContent className="pt-6">
             <p className="text-center text-muted-foreground">Journal entry not found.</p>
           </CardContent>
@@ -90,60 +101,55 @@ export default function JournalEntryDetailPage() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
-        <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-          <BookOpen className="h-6 w-6" /> Journal Entry #{entry.id}
-        </h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Journal entry #{entry.id}</h1>
+          <p className="text-sm text-muted-foreground">{new Date(entry.date).toLocaleDateString()}</p>
+        </div>
       </div>
 
-      <Card>
+      <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle>{entry.description}</CardTitle>
+          <CardTitle className="text-lg">{entry.description}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="text-sm text-muted-foreground">
-            Date: <span className="text-slate-900">{new Date(entry.date).toLocaleDateString()}</span>
-          </div>
-
-          <div className="relative w-full overflow-auto">
-            <table className="w-full text-sm">
-              <thead className="[&_tr]:border-b">
-                <tr>
-                  <th className="h-10 px-2 text-left font-medium text-muted-foreground">Account</th>
-                  <th className="h-10 px-2 text-right font-medium text-muted-foreground">Debit</th>
-                  <th className="h-10 px-2 text-right font-medium text-muted-foreground">Credit</th>
-                </tr>
-              </thead>
-              <tbody className="[&_tr]:border-b">
+          <div className="rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Account</TableHead>
+                  <TableHead className="text-right w-[160px]">Debit</TableHead>
+                  <TableHead className="text-right w-[160px]">Credit</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {(entry.lines ?? []).map((l: any) => (
-                  <tr key={l.id}>
-                    <td className="px-2 py-2">
+                  <TableRow key={l.id}>
+                    <TableCell>
                       <div className="font-medium">
                         {l.account?.code ? `${l.account.code} ` : ''}
                         {l.account?.name ?? '—'}
                       </div>
                       <div className="text-xs text-muted-foreground">{l.account?.type ?? ''}</div>
-                    </td>
-                    <td className="px-2 py-2 text-right">{formatMoney(l.debit)}</td>
-                    <td className="px-2 py-2 text-right">{formatMoney(l.credit)}</td>
-                  </tr>
+                    </TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">{formatMoney(l.debit)}</TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">{formatMoney(l.credit)}</TableCell>
+                  </TableRow>
                 ))}
-                <tr className="border-b-0">
-                  <td className="px-2 py-2 text-right font-semibold">Total</td>
-                  <td className="px-2 py-2 text-right font-semibold">{formatMoney(totals.debit)}</td>
-                  <td className="px-2 py-2 text-right font-semibold">{formatMoney(totals.credit)}</td>
-                </tr>
-              </tbody>
-            </table>
+                <TableRow className="bg-muted/40">
+                  <TableCell className="text-right font-medium">Total</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatMoney(totals.debit)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatMoney(totals.credit)}</TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
           </div>
 
           <div>
-            <span
-              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                entry.balanced ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-              }`}
-            >
-              {entry.balanced ? 'BALANCED' : 'UNBALANCED'}
-            </span>
+            {entry.balanced ? (
+              <Badge variant="secondary">Balanced</Badge>
+            ) : (
+              <Badge variant="destructive">Unbalanced</Badge>
+            )}
           </div>
         </CardContent>
       </Card>

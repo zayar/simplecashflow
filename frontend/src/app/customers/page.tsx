@@ -1,12 +1,21 @@
-'use client';
+"use client"
 
-import { useEffect, useState } from 'react';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import Link from 'next/link';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Plus } from 'lucide-react';
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import { Plus } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 export default function CustomersPage() {
   const { user } = useAuth();
@@ -23,7 +32,12 @@ export default function CustomersPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold tracking-tight">Customers</h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Customers</h1>
+          <p className="text-sm text-muted-foreground">
+            People and businesses you invoice.
+          </p>
+        </div>
         <Link href="/customers/new">
           <Button className="gap-2">
             <Plus className="h-4 w-4" /> New Customer
@@ -31,40 +45,38 @@ export default function CustomersPage() {
         </Link>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>All Customers</CardTitle>
+      <Card className="shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-lg">All customers</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="relative w-full overflow-auto">
-            <table className="w-full caption-bottom text-sm text-left">
-              <thead className="[&_tr]:border-b">
-                <tr className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Name</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Email</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Phone</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Currency</th>
-                </tr>
-              </thead>
-              <tbody className="[&_tr:last-child]:border-0">
-                {customers.map((c) => (
-                  <tr key={c.id} className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                    <td className="p-4 align-middle font-medium">{c.name}</td>
-                    <td className="p-4 align-middle">{c.email || '-'}</td>
-                    <td className="p-4 align-middle">{c.phone || '-'}</td>
-                    <td className="p-4 align-middle">{c.currency || '-'}</td>
-                  </tr>
-                ))}
-                {customers.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="p-4 text-center text-muted-foreground">
-                      No customers found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+        <CardContent className="pt-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Email</TableHead>
+                <TableHead>Phone</TableHead>
+                <TableHead className="w-[140px]">Currency</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {customers.map((c) => (
+                <TableRow key={c.id}>
+                  <TableCell className="font-medium">{c.name}</TableCell>
+                  <TableCell className="text-muted-foreground">{c.email || "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">{c.phone || "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">{c.currency || "—"}</TableCell>
+                </TableRow>
+              ))}
+              {customers.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                    No customers yet.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

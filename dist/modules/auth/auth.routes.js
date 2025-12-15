@@ -1,7 +1,7 @@
 import { prisma } from '../../infrastructure/db.js';
 import bcrypt from 'bcryptjs';
 import { DEFAULT_ACCOUNTS } from '../companies/company.constants.js';
-import { AccountType, BankingAccountKind } from '@prisma/client';
+import { AccountType, BankingAccountKind, CashflowActivity, NormalBalance, } from '@prisma/client';
 export async function authRoutes(fastify) {
     fastify.post('/register', async (request, reply) => {
         const body = request.body;
@@ -26,6 +26,9 @@ export async function authRoutes(fastify) {
                             code: acc.code,
                             name: acc.name,
                             type: acc.type,
+                            normalBalance: normalBalanceForType(acc.type),
+                            reportGroup: acc.reportGroup ?? null,
+                            cashflowActivity: acc.cashflowActivity ?? null,
                         })),
                     },
                 },
@@ -37,6 +40,14 @@ export async function authRoutes(fastify) {
                 await tx.company.update({
                     where: { id: company.id },
                     data: { accountsReceivableAccountId: arAccount.id }
+                });
+            }
+            // Find and link Accounts Payable (for Bills/AP flow)
+            const apAccount = company.accounts.find((a) => a.code === '2000' || a.name === 'Accounts Payable');
+            if (apAccount) {
+                await tx.company.update({
+                    where: { id: company.id },
+                    data: { accountsPayableAccountId: apAccount.id },
                 });
             }
             // Create default BankingAccount for Cash (so "Deposit To" can be restricted safely).
@@ -101,5 +112,18 @@ export async function authRoutes(fastify) {
         });
         return { token, user: { id: user.id, email: user.email, name: user.name, companyId: user.companyId } };
     });
+    function normalBalanceForType(type) {
+        switch (type) {
+            case AccountType.ASSET:
+            case AccountType.EXPENSE:
+                return NormalBalance.DEBIT;
+            case AccountType.LIABILITY:
+            case AccountType.EQUITY:
+            case AccountType.INCOME:
+                return NormalBalance.CREDIT;
+            default:
+                return NormalBalance.DEBIT;
+        }
+    }
 }
 //# sourceMappingURL=auth.routes.js.map

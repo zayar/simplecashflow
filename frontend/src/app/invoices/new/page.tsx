@@ -9,6 +9,8 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Trash2, Plus } from 'lucide-react';
+import { SelectNative } from '@/components/ui/select-native';
+import { Separator } from '@/components/ui/separator';
 
 export default function NewInvoicePage() {
   const { user } = useAuth();
@@ -96,7 +98,10 @@ export default function NewInvoicePage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">New Invoice</h1>
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">New Invoice</h1>
+        <p className="text-sm text-muted-foreground">Create a draft invoice.</p>
+      </div>
       
       <form onSubmit={handleSubmit}>
         <div className="grid gap-6">
@@ -108,9 +113,8 @@ export default function NewInvoicePage() {
             <CardContent className="grid gap-4 md:grid-cols-3">
               <div className="grid gap-2">
                 <Label htmlFor="customer">Customer *</Label>
-                <select
+                <SelectNative
                   id="customer"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   required
                   value={formData.customerId}
                   onChange={(e) => setFormData({ ...formData, customerId: e.target.value })}
@@ -119,7 +123,7 @@ export default function NewInvoicePage() {
                   {customers.map((c) => (
                     <option key={c.id} value={c.id}>{c.name}</option>
                   ))}
-                </select>
+                </SelectNative>
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="invoiceDate">Invoice Date</Label>
@@ -160,8 +164,7 @@ export default function NewInvoicePage() {
               {lines.map((line, index) => (
                 <div key={index} className="grid grid-cols-12 gap-4 items-center">
                   <div className="col-span-4">
-                    <select
-                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    <SelectNative
                       required
                       value={line.itemId}
                       onChange={(e) => handleItemChange(index, e.target.value)}
@@ -170,7 +173,7 @@ export default function NewInvoicePage() {
                       {items.map((i) => (
                         <option key={i.id} value={i.id}>{i.name}</option>
                       ))}
-                    </select>
+                    </SelectNative>
                   </div>
                   <div className="col-span-4">
                     <Input
@@ -215,8 +218,9 @@ export default function NewInvoicePage() {
                 <Plus className="h-4 w-4 mr-2" /> Add Line
               </Button>
 
-              <div className="flex justify-end pt-4 border-t mt-4">
-                <div className="text-xl font-bold">
+              <Separator />
+              <div className="flex justify-end">
+                <div className="text-lg font-semibold tabular-nums">
                   Total: {calculateTotal().toLocaleString()}
                 </div>
               </div>

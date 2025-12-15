@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
+import { SelectNative } from '@/components/ui/select-native';
 
 export default function NewCustomerPage() {
   const { user } = useAuth();
@@ -42,11 +43,16 @@ export default function NewCustomerPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">New Customer</h1>
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">New Customer</h1>
+        <p className="text-sm text-muted-foreground">
+          Add a customer so you can invoice them.
+        </p>
+      </div>
       
-      <Card className="max-w-2xl">
+      <Card className="max-w-2xl shadow-sm">
         <CardHeader>
-          <CardTitle>Customer Details</CardTitle>
+          <CardTitle className="text-lg">Customer details</CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
@@ -82,9 +88,8 @@ export default function NewCustomerPage() {
 
             <div className="grid gap-2">
               <Label htmlFor="currency">Currency</Label>
-              <select
+              <SelectNative
                 id="currency"
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                 value={formData.currency}
                 onChange={(e) => setFormData({ ...formData, currency: e.target.value })}
               >
@@ -92,7 +97,7 @@ export default function NewCustomerPage() {
                 <option value="MMK">MMK</option>
                 <option value="SGD">SGD</option>
                 <option value="EUR">EUR</option>
-              </select>
+              </SelectNative>
             </div>
 
             <div className="flex justify-end gap-4 pt-4">

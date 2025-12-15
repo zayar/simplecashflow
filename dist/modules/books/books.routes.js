@@ -17,6 +17,11 @@ function generateInvoiceNumber() {
     // Later we can make this per-company sequential numbers (INV-0001).
     return `INV-${Date.now()}`;
 }
+function generateExpenseNumber() {
+    // Beginner-friendly and “good enough” for now.
+    // Later we can make this per-company sequential numbers (BILL-0001).
+    return `BILL-${Date.now()}`;
+}
 export async function booksRoutes(fastify) {
     // All Books endpoints are tenant-scoped and must be authenticated.
     fastify.addHook('preHandler', fastify.authenticate);
@@ -47,6 +52,30 @@ export async function booksRoutes(fastify) {
             },
         });
         return customer;
+    });
+    // --- Books: Vendors (for Accounts Payable / Bills) ---
+    fastify.get('/companies/:companyId/vendors', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        return await prisma.vendor.findMany({
+            where: { companyId },
+            orderBy: { createdAt: 'desc' },
+        });
+    });
+    fastify.post('/companies/:companyId/vendors', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        if (!body.name) {
+            reply.status(400);
+            return { error: 'name is required' };
+        }
+        return await prisma.vendor.create({
+            data: {
+                companyId,
+                name: body.name,
+                email: body.email ?? null,
+                phone: body.phone ?? null,
+            },
+        });
     });
     // --- Books: Items ---
     fastify.get('/companies/:companyId/items', async (request, reply) => {
@@ -617,6 +646,27 @@ export async function booksRoutes(fastify) {
                         where: { id: invoice.id },
                         data: { amountPaid: totalPaid, status: newStatus },
                     });
+                    // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(journalEntry.id),
+                            type: 'JournalEntryCreated',
+                            payload: {
+                                journalEntryId: journalEntry.id,
+                                companyId,
+                            },
+                        },
+                    });
                     // Event: payment.recorded (document-level)
                     const paymentEventId = randomUUID();
                     await tx.event.create({
@@ -641,19 +691,38 @@ export async function booksRoutes(fastify) {
                             },
                         },
                     });
-                    return { updatedInvoice, payment, journalEntry, paymentEventId };
+                    return { updatedInvoice, payment, journalEntry, jeEventId, paymentEventId };
                 }, { timeout: 10_000 });
                 return {
                     invoiceId: txResult.updatedInvoice.id,
                     invoiceStatus: txResult.updatedInvoice.status,
                     paymentId: txResult.payment.id,
                     journalEntryId: txResult.payment.journalEntryId,
+                    _jeEventId: txResult.jeEventId,
                     _paymentEventId: txResult.paymentEventId,
                     _correlationId: correlationId,
                     _occurredAt: occurredAt,
                 };
             }, redis));
             if (!replay) {
+                const publishJeOk = await publishDomainEvent({
+                    eventId: result._jeEventId,
+                    eventType: 'journal.entry.created',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(result.journalEntryId),
+                    source: 'cashflow-api',
+                    payload: {
+                        journalEntryId: result.journalEntryId,
+                        companyId,
+                    },
+                });
+                if (publishJeOk)
+                    await markEventPublished(result._jeEventId);
                 const publishPaymentOk = await publishDomainEvent({
                     eventId: result._paymentEventId,
                     eventType: 'payment.recorded',
@@ -936,6 +1005,524 @@ export async function booksRoutes(fastify) {
                 invoiceStatus: result.invoiceStatus,
                 reversalJournalEntryId: result.reversalJournalEntryId,
             };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // --- Books: Bills / Expenses (Accounts Payable flow) ---
+    // List bills
+    fastify.get('/companies/:companyId/expenses', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const bills = await prisma.expense.findMany({
+            where: { companyId },
+            orderBy: { expenseDate: 'desc' },
+            include: { vendor: true },
+        });
+        return bills.map((b) => ({
+            id: b.id,
+            expenseNumber: b.expenseNumber,
+            vendorName: b.vendor?.name ?? null,
+            status: b.status,
+            amount: b.amount,
+            amountPaid: b.amountPaid ?? 0,
+            expenseDate: b.expenseDate,
+            dueDate: b.dueDate ?? null,
+            createdAt: b.createdAt,
+        }));
+    });
+    // Get single bill with payments and journal entries (similar to invoice detail)
+    fastify.get('/companies/:companyId/expenses/:expenseId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const expenseId = Number(request.params?.expenseId);
+        if (Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid expenseId' };
+        }
+        const expense = await prisma.expense.findFirst({
+            where: { id: expenseId, companyId },
+            include: {
+                vendor: true,
+                expenseAccount: true,
+                journalEntry: {
+                    include: {
+                        lines: {
+                            include: {
+                                account: { select: { id: true, code: true, name: true, type: true } },
+                            },
+                        },
+                    },
+                },
+                payments: {
+                    include: {
+                        bankAccount: true,
+                        journalEntry: {
+                            include: {
+                                lines: {
+                                    include: {
+                                        account: { select: { id: true, code: true, name: true, type: true } },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    orderBy: { paymentDate: 'desc' },
+                },
+            },
+        });
+        if (!expense) {
+            reply.status(404);
+            return { error: 'expense not found' };
+        }
+        const totalPaid = (expense.payments ?? [])
+            .filter((p) => !p.reversedAt)
+            .reduce((sum, p) => sum + Number(p.amount), 0);
+        const journalEntries = [];
+        if (expense.status !== 'DRAFT' && expense.journalEntry) {
+            journalEntries.push({
+                kind: 'BILL_POSTED',
+                journalEntryId: expense.journalEntry.id,
+                date: expense.journalEntry.date,
+                description: expense.journalEntry.description,
+                lines: expense.journalEntry.lines.map((l) => ({
+                    account: l.account,
+                    debit: l.debit.toString(),
+                    credit: l.credit.toString(),
+                })),
+            });
+        }
+        for (const p of expense.payments ?? []) {
+            if (p.journalEntry) {
+                journalEntries.push({
+                    kind: 'BILL_PAYMENT_RECORDED',
+                    paymentId: p.id,
+                    journalEntryId: p.journalEntry.id,
+                    date: p.journalEntry.date,
+                    description: p.journalEntry.description,
+                    lines: p.journalEntry.lines.map((l) => ({
+                        account: l.account,
+                        debit: l.debit.toString(),
+                        credit: l.credit.toString(),
+                    })),
+                });
+            }
+        }
+        return {
+            id: expense.id,
+            expenseNumber: expense.expenseNumber,
+            vendor: expense.vendor,
+            status: expense.status,
+            expenseDate: expense.expenseDate,
+            dueDate: expense.dueDate ?? null,
+            amount: expense.amount,
+            currency: expense.currency,
+            description: expense.description,
+            expenseAccount: expense.expenseAccount
+                ? {
+                    id: expense.expenseAccount.id,
+                    code: expense.expenseAccount.code,
+                    name: expense.expenseAccount.name,
+                    type: expense.expenseAccount.type,
+                }
+                : null,
+            payments: (expense.payments ?? []).map((p) => ({
+                id: p.id,
+                paymentDate: p.paymentDate,
+                amount: p.amount,
+                bankAccount: {
+                    id: p.bankAccount.id,
+                    code: p.bankAccount.code,
+                    name: p.bankAccount.name,
+                },
+                journalEntryId: p.journalEntry?.id ?? null,
+                reversedAt: p.reversedAt ?? null,
+                reversalReason: p.reversalReason ?? null,
+                reversalJournalEntryId: p.reversalJournalEntryId ?? null,
+            })),
+            totalPaid,
+            remainingBalance: Number(expense.amount) - totalPaid,
+            journalEntries,
+        };
+    });
+    // Create bill (DRAFT)
+    fastify.post('/companies/:companyId/expenses', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        if (!body.description || !body.amount || body.amount <= 0) {
+            reply.status(400);
+            return { error: 'description and amount (>0) are required' };
+        }
+        if (body.vendorId) {
+            const vendor = await prisma.vendor.findFirst({ where: { id: body.vendorId, companyId } });
+            if (!vendor) {
+                reply.status(400);
+                return { error: 'vendorId not found in this company' };
+            }
+        }
+        if (body.expenseAccountId) {
+            const expAcc = await prisma.account.findFirst({
+                where: { id: body.expenseAccountId, companyId, type: AccountType.EXPENSE },
+            });
+            if (!expAcc) {
+                reply.status(400);
+                return { error: 'expenseAccountId must be an EXPENSE account in this company' };
+            }
+        }
+        const expenseDate = body.expenseDate ? new Date(body.expenseDate) : new Date();
+        const dueDate = body.dueDate ? new Date(body.dueDate) : null;
+        if (body.expenseDate && isNaN(expenseDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid expenseDate' };
+        }
+        if (body.dueDate && dueDate && isNaN(dueDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid dueDate' };
+        }
+        const bill = await prisma.expense.create({
+            data: {
+                companyId,
+                vendorId: body.vendorId ?? null,
+                expenseNumber: generateExpenseNumber(),
+                status: 'DRAFT',
+                expenseDate,
+                dueDate: dueDate ?? null,
+                description: body.description,
+                amount: toMoneyDecimal(body.amount),
+                amountPaid: new Prisma.Decimal(0),
+                currency: body.currency ?? null,
+                expenseAccountId: body.expenseAccountId ?? null,
+            },
+            include: { vendor: true, expenseAccount: true },
+        });
+        return bill;
+    });
+    // Post bill: DRAFT -> POSTED (creates JE: Dr Expense / Cr Accounts Payable)
+    fastify.post('/companies/:companyId/expenses/:expenseId/post', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const expenseId = Number(request.params?.expenseId);
+        if (!companyId || Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or expenseId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const occurredAt = isoNow();
+        const correlationId = randomUUID();
+        const lockKey = `lock:bill:post:${companyId}:${expenseId}`;
+        try {
+            const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const bill = await tx.expense.findFirst({
+                        where: { id: expenseId, companyId },
+                        include: { company: true, vendor: true },
+                    });
+                    if (!bill)
+                        throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+                    if (bill.status !== 'DRAFT') {
+                        throw Object.assign(new Error('only DRAFT bills can be posted'), { statusCode: 400 });
+                    }
+                    if (!bill.expenseAccountId) {
+                        throw Object.assign(new Error('expenseAccountId is required to post a bill'), { statusCode: 400 });
+                    }
+                    const expAcc = await tx.account.findFirst({
+                        where: { id: bill.expenseAccountId, companyId, type: AccountType.EXPENSE },
+                    });
+                    if (!expAcc) {
+                        throw Object.assign(new Error('expenseAccountId must be an EXPENSE account in this company'), {
+                            statusCode: 400,
+                        });
+                    }
+                    const apId = bill.company.accountsPayableAccountId;
+                    if (!apId) {
+                        throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
+                    }
+                    const apAcc = await tx.account.findFirst({
+                        where: { id: apId, companyId, type: AccountType.LIABILITY },
+                    });
+                    if (!apAcc) {
+                        throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), {
+                            statusCode: 400,
+                        });
+                    }
+                    const amount = new Prisma.Decimal(bill.amount).toDecimalPlaces(2);
+                    const je = await postJournalEntry(tx, {
+                        companyId,
+                        date: bill.expenseDate,
+                        description: `Bill ${bill.expenseNumber}${bill.vendor ? ` for ${bill.vendor.name}` : ''}: ${bill.description}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        lines: [
+                            { accountId: expAcc.id, debit: amount, credit: new Prisma.Decimal(0) },
+                            { accountId: apAcc.id, debit: new Prisma.Decimal(0), credit: amount },
+                        ],
+                    });
+                    const updated = await tx.expense.update({
+                        where: { id: bill.id },
+                        data: { status: 'POSTED', journalEntryId: je.id },
+                    });
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(je.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: je.id, companyId },
+                        },
+                    });
+                    const billPostedEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: billPostedEventId,
+                            eventType: 'bill.posted',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'Expense',
+                            aggregateId: String(bill.id),
+                            type: 'BillPosted',
+                            payload: { expenseId: bill.id, journalEntryId: je.id, amount: amount.toString() },
+                        },
+                    });
+                    return { updated, je, jeEventId, billPostedEventId };
+                });
+                return {
+                    expenseId: txResult.updated.id,
+                    status: txResult.updated.status,
+                    journalEntryId: txResult.je.id,
+                    _jeEventId: txResult.jeEventId,
+                    _billPostedEventId: txResult.billPostedEventId,
+                    _correlationId: correlationId,
+                    _occurredAt: occurredAt,
+                };
+            }, redis));
+            if (!replay) {
+                const jeOk = await publishDomainEvent({
+                    eventId: result._jeEventId,
+                    eventType: 'journal.entry.created',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(result.journalEntryId),
+                    source: 'cashflow-api',
+                    payload: { journalEntryId: result.journalEntryId, companyId },
+                });
+                if (jeOk)
+                    await markEventPublished(result._jeEventId);
+                const billOk = await publishDomainEvent({
+                    eventId: result._billPostedEventId,
+                    eventType: 'bill.posted',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'Expense',
+                    aggregateId: String(result.expenseId),
+                    source: 'cashflow-api',
+                    payload: { expenseId: result.expenseId, journalEntryId: result.journalEntryId },
+                });
+                if (billOk)
+                    await markEventPublished(result._billPostedEventId);
+            }
+            return { expenseId: result.expenseId, status: result.status, journalEntryId: result.journalEntryId };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Record bill payment: Dr AP / Cr Cash-Bank
+    fastify.post('/companies/:companyId/expenses/:expenseId/payments', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const expenseId = Number(request.params?.expenseId);
+        if (!companyId || Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or expenseId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = request.body;
+        if (!body.amount || body.amount <= 0 || !body.bankAccountId) {
+            reply.status(400);
+            return { error: 'amount (>0) and bankAccountId are required' };
+        }
+        const amountNumber = body.amount;
+        const occurredAt = isoNow();
+        const correlationId = randomUUID();
+        const lockKey = `lock:bill:payment:${companyId}:${expenseId}`;
+        try {
+            const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const bill = await tx.expense.findFirst({
+                        where: { id: expenseId, companyId },
+                        include: { company: true },
+                    });
+                    if (!bill)
+                        throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+                    if (bill.status !== 'POSTED' && bill.status !== 'PARTIAL') {
+                        throw Object.assign(new Error('payments allowed only for POSTED or PARTIAL bills'), { statusCode: 400 });
+                    }
+                    const apId = bill.company.accountsPayableAccountId;
+                    if (!apId)
+                        throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
+                    const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } });
+                    if (!apAcc)
+                        throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), { statusCode: 400 });
+                    const bankAccount = await tx.account.findFirst({
+                        where: { id: body.bankAccountId, companyId, type: AccountType.ASSET },
+                    });
+                    if (!bankAccount)
+                        throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), { statusCode: 400 });
+                    const banking = await tx.bankingAccount.findFirst({
+                        where: { companyId, accountId: bankAccount.id },
+                        select: { kind: true },
+                    });
+                    if (!banking) {
+                        throw Object.assign(new Error('Pay From must be a banking account (create it under Banking first)'), {
+                            statusCode: 400,
+                        });
+                    }
+                    if (banking.kind === BankingAccountKind.CREDIT_CARD) {
+                        throw Object.assign(new Error('cannot pay from a credit card account'), { statusCode: 400 });
+                    }
+                    const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+                    const amount = toMoneyDecimal(amountNumber);
+                    const je = await postJournalEntry(tx, {
+                        companyId,
+                        date: paymentDate,
+                        description: `Payment for Bill ${bill.expenseNumber}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        skipAccountValidation: true,
+                        lines: [
+                            { accountId: apAcc.id, debit: amount, credit: new Prisma.Decimal(0) },
+                            { accountId: bankAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+                        ],
+                    });
+                    const pay = await tx.expensePayment.create({
+                        data: {
+                            companyId,
+                            expenseId: bill.id,
+                            paymentDate,
+                            amount,
+                            bankAccountId: bankAccount.id,
+                            journalEntryId: je.id,
+                        },
+                    });
+                    const sumAgg = await tx.expensePayment.aggregate({
+                        where: { expenseId: bill.id, companyId, reversedAt: null },
+                        _sum: { amount: true },
+                    });
+                    const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const newStatus = totalPaid.greaterThanOrEqualTo(bill.amount) ? 'PAID' : 'PARTIAL';
+                    await tx.expense.update({
+                        where: { id: bill.id },
+                        data: { amountPaid: totalPaid, status: newStatus },
+                    });
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(je.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: je.id, companyId },
+                        },
+                    });
+                    const paymentEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: paymentEventId,
+                            eventType: 'bill.payment.recorded',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'ExpensePayment',
+                            aggregateId: String(pay.id),
+                            type: 'BillPaymentRecorded',
+                            payload: { expensePaymentId: pay.id, expenseId: bill.id, journalEntryId: je.id, amount: amount.toString() },
+                        },
+                    });
+                    return { pay, je, jeEventId, paymentEventId };
+                });
+                return {
+                    expenseId,
+                    expensePaymentId: txResult.pay.id,
+                    journalEntryId: txResult.je.id,
+                    _jeEventId: txResult.jeEventId,
+                    _paymentEventId: txResult.paymentEventId,
+                    _correlationId: correlationId,
+                    _occurredAt: occurredAt,
+                };
+            }, redis));
+            if (!replay) {
+                const jeOk = await publishDomainEvent({
+                    eventId: result._jeEventId,
+                    eventType: 'journal.entry.created',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(result.journalEntryId),
+                    source: 'cashflow-api',
+                    payload: { journalEntryId: result.journalEntryId, companyId },
+                });
+                if (jeOk)
+                    await markEventPublished(result._jeEventId);
+                const payOk = await publishDomainEvent({
+                    eventId: result._paymentEventId,
+                    eventType: 'bill.payment.recorded',
+                    schemaVersion: 'v1',
+                    occurredAt: result._occurredAt,
+                    companyId,
+                    partitionKey: String(companyId),
+                    correlationId: result._correlationId,
+                    aggregateType: 'ExpensePayment',
+                    aggregateId: String(result.expensePaymentId),
+                    source: 'cashflow-api',
+                    payload: { expensePaymentId: result.expensePaymentId, expenseId: result.expenseId, journalEntryId: result.journalEntryId },
+                });
+                if (payOk)
+                    await markEventPublished(result._paymentEventId);
+            }
+            return { expenseId: result.expenseId, expensePaymentId: result.expensePaymentId, journalEntryId: result.journalEntryId };
         }
         catch (err) {
             if (err?.statusCode) {

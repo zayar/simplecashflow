@@ -5,6 +5,7 @@ import { prisma } from './infrastructure/db.js';
 import { runIdempotent } from './infrastructure/idempotency.js';
 import { getRedis } from './infrastructure/redis.js';
 import { normalizeToDay } from './utils/date.js';
+import { Prisma } from '@prisma/client';
 
 const fastify = Fastify({ logger: true });
 const redis = getRedis();
@@ -147,7 +148,7 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
     return;
   }
 
-  await runIdempotent(prisma, companyId, eventId, async (tx) => {
+  await runIdempotent(prisma, companyId, eventId, async (tx: Prisma.TransactionClient) => {
     // 2) Load the journal entry with its lines and accounts, scoped to tenant
     const entry = await tx.journalEntry.findFirst({
       where: { id: journalEntryId, companyId },
@@ -197,39 +198,80 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
         { journalEntryId, incomeDelta, expenseDelta },
         'No income/expense impact, skipping summary update'
       );
-      return;
     }
 
     const day = normalizeToDay(entry.date);
 
-    // 4) Upsert into DailySummary for that company + date
-    fastify.log.info(
-      { companyId, day, incomeDelta, expenseDelta },
-      'Updating DailySummary'
-    );
+    // 4) Upsert into DailySummary (income/expense only)
+    if (incomeDelta !== 0 || expenseDelta !== 0) {
+      fastify.log.info(
+        { companyId, day, incomeDelta, expenseDelta },
+        'Updating DailySummary'
+      );
 
-    await tx.dailySummary.upsert({
-      where: {
-        companyId_date: {
+      await tx.dailySummary.upsert({
+        where: {
+          companyId_date: {
+            companyId,
+            date: day,
+          },
+        },
+        update: {
+          totalIncome: {
+            increment: incomeDelta,
+          },
+          totalExpense: {
+            increment: expenseDelta,
+          },
+        },
+        create: {
           companyId,
           date: day,
+          totalIncome: incomeDelta,
+          totalExpense: expenseDelta,
         },
-      },
-      update: {
-        totalIncome: {
-          increment: incomeDelta,
+      });
+    }
+
+    // 5) Upsert AccountBalance per account (daily increments)
+    const byAccount = new Map<number, { debit: Prisma.Decimal; credit: Prisma.Decimal }>();
+    for (const line of entry.lines) {
+      const accountId = line.accountId;
+      const debit = new Prisma.Decimal(line.debit);
+      const credit = new Prisma.Decimal(line.credit);
+
+      const prev = byAccount.get(accountId) ?? {
+        debit: new Prisma.Decimal(0),
+        credit: new Prisma.Decimal(0),
+      };
+      byAccount.set(accountId, {
+        debit: prev.debit.add(debit),
+        credit: prev.credit.add(credit),
+      });
+    }
+
+    for (const [accountId, totals] of byAccount.entries()) {
+      await (tx as any).accountBalance.upsert({
+        where: {
+          companyId_accountId_date: {
+            companyId,
+            accountId,
+            date: day,
+          },
         },
-        totalExpense: {
-          increment: expenseDelta,
+        update: {
+          debitTotal: { increment: totals.debit.toDecimalPlaces(2) },
+          creditTotal: { increment: totals.credit.toDecimalPlaces(2) },
         },
-      },
-      create: {
-        companyId,
-        date: day,
-        totalIncome: incomeDelta,
-        totalExpense: expenseDelta,
-      },
-    });
+        create: {
+          companyId,
+          accountId,
+          date: day,
+          debitTotal: totals.debit.toDecimalPlaces(2),
+          creditTotal: totals.credit.toDecimalPlaces(2),
+        },
+      });
+    }
   }, redis);
 }
 

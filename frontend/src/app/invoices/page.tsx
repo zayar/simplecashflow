@@ -1,12 +1,44 @@
-'use client';
+"use client"
 
-import { useEffect, useState } from 'react';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import Link from 'next/link';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Plus, CheckCircle, DollarSign, Eye } from 'lucide-react';
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import { CheckCircle, DollarSign, Eye, MoreHorizontal, Plus } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+
+function statusBadge(status: string) {
+  switch (status) {
+    case "PAID":
+      return <Badge variant="secondary">Paid</Badge>
+    case "POSTED":
+      return <Badge variant="outline">Posted</Badge>
+    case "PARTIAL":
+      return <Badge variant="outline">Partial</Badge>
+    case "DRAFT":
+      return <Badge variant="outline">Draft</Badge>
+    default:
+      return <Badge variant="outline">{status}</Badge>
+  }
+}
 
 export default function InvoicesPage() {
   const { user } = useAuth();
@@ -51,7 +83,12 @@ export default function InvoicesPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold tracking-tight">Invoices</h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Invoices</h1>
+          <p className="text-sm text-muted-foreground">
+            Create, post, and record payments.
+          </p>
+        </div>
         <Link href="/invoices/new">
           <Button className="gap-2">
             <Plus className="h-4 w-4" /> New Invoice
@@ -59,71 +96,85 @@ export default function InvoicesPage() {
         </Link>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>All Invoices</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="relative w-full overflow-auto">
-            <table className="w-full caption-bottom text-sm text-left">
-              <thead className="[&_tr]:border-b">
-                <tr className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Date</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Number</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Customer</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Status</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Total</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="[&_tr:last-child]:border-0">
-                {invoices.map((inv) => (
-                  <tr key={inv.id} className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                    <td className="p-4 align-middle">{new Date(inv.invoiceDate).toLocaleDateString()}</td>
-                    <td className="p-4 align-middle font-medium">{inv.invoiceNumber}</td>
-                    <td className="p-4 align-middle">{inv.customerName}</td>
-                    <td className="p-4 align-middle">
-                      <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 ${
-                        inv.status === 'POSTED' ? 'bg-green-100 text-green-800' :
-                        inv.status === 'PAID' ? 'bg-blue-100 text-blue-800' :
-                        inv.status === 'DRAFT' ? 'bg-yellow-100 text-yellow-800' :
-                        'bg-gray-100 text-gray-800'
-                      }`}>
-                        {inv.status}
-                      </span>
-                    </td>
-                    <td className="p-4 align-middle text-right font-medium">{Number(inv.total).toLocaleString()}</td>
-                    <td className="p-4 align-middle text-right flex justify-end gap-2">
-                      <Link href={`/invoices/${inv.id}`}>
-                        <Button variant="ghost" size="sm">
-                          <Eye className="mr-2 h-4 w-4" /> View
-                        </Button>
-                      </Link>
-                      {inv.status === 'DRAFT' && (
-                        <Button variant="ghost" size="sm" onClick={() => handlePost(inv.id)}>
-                          <CheckCircle className="mr-2 h-4 w-4" /> Post
-                        </Button>
-                      )}
-                      {(inv.status === 'POSTED' || inv.status === 'PARTIAL') && (
-                        <Link href={`/invoices/${inv.id}/payment`}>
-                          <Button variant="ghost" size="sm">
-                            <DollarSign className="mr-2 h-4 w-4" /> Pay
-                          </Button>
-                        </Link>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {invoices.length === 0 && (
-                  <tr>
-                    <td colSpan={6} className="p-4 text-center text-muted-foreground">
-                      No invoices found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+      <Card className="shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <div className="space-y-1">
+            <CardTitle className="text-lg">All invoices</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              Keep actions lightweight; details live on the invoice page.
+            </p>
           </div>
+        </CardHeader>
+        <CardContent className="pt-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[140px]">Date</TableHead>
+                <TableHead className="w-[140px]">Number</TableHead>
+                <TableHead>Customer</TableHead>
+                <TableHead className="w-[120px]">Status</TableHead>
+                <TableHead className="text-right">Total</TableHead>
+                <TableHead className="w-[64px]" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {invoices.map((inv) => (
+                <TableRow key={inv.id}>
+                  <TableCell className="text-muted-foreground">
+                    {new Date(inv.invoiceDate).toLocaleDateString()}
+                  </TableCell>
+                  <TableCell className="font-medium">{inv.invoiceNumber}</TableCell>
+                  <TableCell>{inv.customerName}</TableCell>
+                  <TableCell>{statusBadge(inv.status)}</TableCell>
+                  <TableCell className="text-right font-medium tabular-nums">
+                    {Number(inv.total ?? 0).toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon" aria-label="Row actions">
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem asChild>
+                          <Link href={`/invoices/${inv.id}`}>
+                            <Eye className="mr-2 h-4 w-4" />
+                            View
+                          </Link>
+                        </DropdownMenuItem>
+                        {inv.status === "DRAFT" && (
+                          <DropdownMenuItem onClick={() => handlePost(inv.id)}>
+                            <CheckCircle className="mr-2 h-4 w-4" />
+                            Post
+                          </DropdownMenuItem>
+                        )}
+                        {(inv.status === "POSTED" || inv.status === "PARTIAL") && (
+                          <DropdownMenuItem asChild>
+                            <Link href={`/invoices/${inv.id}/payment`}>
+                              <DollarSign className="mr-2 h-4 w-4" />
+                              Record payment
+                            </Link>
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem asChild>
+                          <Link href={`/invoices/${inv.id}`}>Open</Link>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {invoices.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
+                    No invoices yet. Create your first invoice to start tracking revenue.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

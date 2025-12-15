@@ -1,8 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import type { Redis } from 'ioredis';
 
 // Helper type to represent the transaction client
-type PrismaTx = Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends">;
+type PrismaTx = Prisma.TransactionClient;
 
 export async function runIdempotent(
   prisma: PrismaClient,

@@ -1,21 +1,14 @@
-'use client';
+"use client"
 
-import { useEffect, useState } from 'react';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { useRouter } from 'next/navigation';
+import { useEffect, useState } from "react"
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
 
 export default function Dashboard() {
-  const { user, isLoading } = useAuth();
-  const router = useRouter();
+  const { user, isLoading } = useAuth()
   const [pnl, setPnl] = useState<any>(null);
-
-  useEffect(() => {
-    if (!isLoading && !user) {
-      router.push('/login');
-    }
-  }, [user, isLoading, router]);
 
   useEffect(() => {
     if (user?.companyId) {
@@ -36,40 +29,54 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">Dashboard</h1>
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
+        <p className="text-sm text-muted-foreground">
+          This month’s performance snapshot.
+        </p>
+      </div>
       
       <div className="grid gap-4 md:grid-cols-3">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Income</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Total income</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-green-600">
-              {pnl?.totalIncome?.toLocaleString() || '0'}
+            <div className="text-2xl font-semibold tabular-nums">
+              {Number(pnl?.totalIncome ?? 0).toLocaleString()}
             </div>
-            <p className="text-xs text-muted-foreground">This Month</p>
+            <div className="mt-2 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">This month</p>
+              <Badge variant="outline">Income</Badge>
+            </div>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Expense</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Total expense</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-red-600">
-              {pnl?.totalExpense?.toLocaleString() || '0'}
+            <div className="text-2xl font-semibold tabular-nums">
+              {Number(pnl?.totalExpense ?? 0).toLocaleString()}
             </div>
-            <p className="text-xs text-muted-foreground">This Month</p>
+            <div className="mt-2 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">This month</p>
+              <Badge variant="outline">Expense</Badge>
+            </div>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Net Profit</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Net profit</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              {pnl?.netProfit?.toLocaleString() || '0'}
+            <div className="text-2xl font-semibold tabular-nums">
+              {Number(pnl?.netProfit ?? 0).toLocaleString()}
             </div>
-            <p className="text-xs text-muted-foreground">This Month</p>
+            <div className="mt-2 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">This month</p>
+              <Badge variant="secondary">Net</Badge>
+            </div>
           </CardContent>
         </Card>
       </div>

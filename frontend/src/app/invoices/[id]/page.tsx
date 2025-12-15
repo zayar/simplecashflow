@@ -1,99 +1,137 @@
-'use client';
+"use client"
 
-import { useEffect, useMemo, useState } from 'react';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import { useParams } from 'next/navigation';
-import Link from 'next/link';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { ArrowLeft, FileText, Calendar, User, BookOpen } from 'lucide-react';
+import { useEffect, useMemo, useState } from "react"
+import Link from "next/link"
+import { useParams } from "next/navigation"
+import { ArrowLeft, ChevronDown } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { Textarea } from "@/components/ui/textarea"
 
 function formatMoney(n: any) {
-  const num = Number(n ?? 0);
-  if (Number.isNaN(num)) return String(n ?? '');
-  return num.toLocaleString();
+  const num = Number(n ?? 0)
+  if (Number.isNaN(num)) return String(n ?? "")
+  return num.toLocaleString(undefined, { maximumFractionDigits: 2 })
 }
 
-function StatusPill({ status }: { status: 'Paid' | 'Reversed' }) {
-  const cls =
-    status === 'Paid'
-      ? 'bg-green-100 text-green-800'
-      : 'bg-slate-100 text-slate-800';
-  return (
-    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${cls}`}>
-      {status}
-    </span>
-  );
+function statusBadge(status: string) {
+  switch (status) {
+    case "PAID":
+      return <Badge variant="secondary">Paid</Badge>
+    case "POSTED":
+      return <Badge variant="outline">Posted</Badge>
+    case "PARTIAL":
+      return <Badge variant="outline">Partial</Badge>
+    case "DRAFT":
+      return <Badge variant="outline">Draft</Badge>
+    default:
+      return <Badge variant="outline">{status}</Badge>
+  }
 }
 
 export default function InvoiceDetailPage() {
-  const { user } = useAuth();
-  const params = useParams();
-  const invoiceId = params.id;
+  const { user } = useAuth()
+  const params = useParams()
+  const invoiceId = params.id
 
-  const [invoice, setInvoice] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [reversingPaymentId, setReversingPaymentId] = useState<number | null>(null);
-  const [refundModalOpen, setRefundModalOpen] = useState(false);
-  const [refundPayment, setRefundPayment] = useState<any>(null);
-  const [refundReason, setRefundReason] = useState('');
+  const [invoice, setInvoice] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const [reversingPaymentId, setReversingPaymentId] = useState<number | null>(
+    null
+  )
+
+  const [refundModalOpen, setRefundModalOpen] = useState(false)
+  const [refundPayment, setRefundPayment] = useState<any>(null)
+  const [refundReason, setRefundReason] = useState("")
 
   const makeIdempotencyKey = () => {
-    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    return typeof crypto !== "undefined" && "randomUUID" in crypto
       ? (crypto as any).randomUUID()
-      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  };
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`
+  }
 
   const loadInvoice = async () => {
-    if (!user?.companyId || !invoiceId) return;
-    setLoading(true);
+    if (!user?.companyId || !invoiceId) return
+    setLoading(true)
     try {
-      const inv = await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`);
-      setInvoice(inv);
+      const inv = await fetchApi(
+        `/companies/${user.companyId}/invoices/${invoiceId}`
+      )
+      setInvoice(inv)
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  };
+  }
 
   useEffect(() => {
-    loadInvoice();
-  }, [user?.companyId, invoiceId]);
+    loadInvoice()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, invoiceId])
 
   const reversePayment = async (paymentId: number, reason?: string) => {
-    if (!user?.companyId || !invoiceId) return;
-    setReversingPaymentId(paymentId);
+    if (!user?.companyId || !invoiceId) return
+    setReversingPaymentId(paymentId)
     try {
-      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/payments/${paymentId}/reverse`, {
-        method: 'POST',
-        headers: { 'Idempotency-Key': makeIdempotencyKey() },
-        body: JSON.stringify({ reason: reason || undefined }),
-      });
-      await loadInvoice();
+      await fetchApi(
+        `/companies/${user.companyId}/invoices/${invoiceId}/payments/${paymentId}/reverse`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": makeIdempotencyKey() },
+          body: JSON.stringify({ reason: reason || undefined }),
+        }
+      )
+      await loadInvoice()
     } catch (err: any) {
-      console.error(err);
-      alert(err.message || 'Failed to reverse payment');
+      console.error(err)
+      alert(err.message || "Failed to reverse payment")
     } finally {
-      setReversingPaymentId(null);
+      setReversingPaymentId(null)
     }
-  };
+  }
 
-  const openRefundModal = (p: any) => {
-    setRefundPayment(p);
-    setRefundReason('');
-    setRefundModalOpen(true);
-  };
+  const openRefundDialog = (p: any) => {
+    setRefundPayment(p)
+    setRefundReason("")
+    setRefundModalOpen(true)
+  }
 
   const confirmRefund = async () => {
-    if (!refundPayment) return;
-    await reversePayment(refundPayment.id, refundReason.trim() || undefined);
-    setRefundModalOpen(false);
-    setRefundPayment(null);
-    setRefundReason('');
-  };
+    if (!refundPayment) return
+    await reversePayment(refundPayment.id, refundReason.trim() || undefined)
+    setRefundModalOpen(false)
+    setRefundPayment(null)
+    setRefundReason("")
+  }
 
-  const journals = useMemo(() => (invoice?.journalEntries ?? []) as any[], [invoice]);
-  const showJournal = invoice?.status && invoice.status !== 'DRAFT';
+  const journals = useMemo(() => (invoice?.journalEntries ?? []) as any[], [invoice])
+  const showJournal = invoice?.status && invoice.status !== "DRAFT"
 
   if (loading) {
     return (
@@ -104,15 +142,29 @@ export default function InvoiceDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Invoice</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Invoice</h1>
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          </div>
         </div>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">Loading...</p>
-          </CardContent>
-        </Card>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <Card className="shadow-sm">
+            <CardContent className="pt-6 space-y-3">
+              <Skeleton className="h-6 w-40" />
+              <Skeleton className="h-9 w-64" />
+              <Skeleton className="h-24 w-full" />
+            </CardContent>
+          </Card>
+          <Card className="shadow-sm">
+            <CardContent className="pt-6 space-y-3">
+              <Skeleton className="h-6 w-40" />
+              <Skeleton className="h-40 w-full" />
+            </CardContent>
+          </Card>
+        </div>
       </div>
-    );
+    )
   }
 
   if (!invoice) {
@@ -124,341 +176,301 @@ export default function InvoiceDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Invoice</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Invoice</h1>
+            <p className="text-sm text-muted-foreground">Not found</p>
+          </div>
         </div>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">Invoice not found.</p>
+        <Card className="shadow-sm">
+          <CardContent className="py-10 text-center text-sm text-muted-foreground">
+            Invoice not found.
           </CardContent>
         </Card>
       </div>
-    );
+    )
   }
+
+  const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-start gap-4">
           <Link href="/invoices">
             <Button variant="ghost" size="icon">
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">Invoice</h1>
-            <div className="text-sm text-muted-foreground">{invoice.invoiceNumber}</div>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Invoice</h1>
+            <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+              <span className="font-medium text-foreground">{invoice.invoiceNumber}</span>
+              <span>•</span>
+              <span>{invoice.customer?.name ?? "—"}</span>
+              <span>•</span>
+              {statusBadge(invoice.status)}
+            </div>
           </div>
         </div>
-        {(invoice.status === 'POSTED' || invoice.status === 'PARTIAL') && (
+
+        {canReceivePayment && (
           <Link href={`/invoices/${invoice.id}/payment`}>
-            <Button>Record Payment</Button>
+            <Button>Record payment</Button>
           </Link>
         )}
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2">
-        <Card>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card className="shadow-sm">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <FileText className="h-5 w-5" />
-              Details
-            </CardTitle>
+            <CardTitle className="text-lg">Details</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <User className="h-4 w-4" /> Customer
+          <CardContent className="space-y-4 text-sm">
+            <div className="grid gap-1">
+              <div className="text-muted-foreground">Invoice date</div>
+              <div className="font-medium">
+                {new Date(invoice.invoiceDate).toLocaleDateString()}
+              </div>
             </div>
-            <div className="font-medium">{invoice.customer?.name ?? '—'}</div>
+            {invoice.dueDate ? (
+              <div className="grid gap-1">
+                <div className="text-muted-foreground">Due date</div>
+                <div className="font-medium">{new Date(invoice.dueDate).toLocaleDateString()}</div>
+              </div>
+            ) : null}
 
-            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-              <Calendar className="h-4 w-4" /> Invoice Date
-            </div>
-            <div>{new Date(invoice.invoiceDate).toLocaleDateString()}</div>
-
-            {invoice.dueDate && (
-              <>
-                <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-                  <Calendar className="h-4 w-4" /> Due Date
-                </div>
-                <div>{new Date(invoice.dueDate).toLocaleDateString()}</div>
-              </>
-            )}
-
-            <div className="mt-6 border-t pt-4 space-y-2">
-              <div className="flex justify-between">
+            <div className="rounded-md border bg-muted/20 p-4">
+              <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Total</span>
-                <span className="font-semibold">{formatMoney(invoice.total)}</span>
+                <span className="font-semibold tabular-nums">{formatMoney(invoice.total)}</span>
               </div>
-              <div className="flex justify-between">
+              <div className="mt-2 flex items-center justify-between">
                 <span className="text-muted-foreground">Paid</span>
-                <span className="font-semibold text-green-700">{formatMoney(invoice.totalPaid)}</span>
+                <span className="font-semibold tabular-nums">{formatMoney(invoice.totalPaid)}</span>
               </div>
-              <div className="flex justify-between">
+              <div className="mt-2 flex items-center justify-between">
                 <span className="text-muted-foreground">Remaining</span>
-                <span className="font-semibold">{formatMoney(invoice.remainingBalance)}</span>
+                <span className="font-semibold tabular-nums">{formatMoney(invoice.remainingBalance)}</span>
               </div>
-            </div>
-
-            <div className="pt-2">
-              <span
-                className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                  invoice.status === 'POSTED'
-                    ? 'bg-green-100 text-green-800'
-                    : invoice.status === 'PAID'
-                      ? 'bg-blue-100 text-blue-800'
-                      : invoice.status === 'DRAFT'
-                        ? 'bg-yellow-100 text-yellow-800'
-                        : 'bg-gray-100 text-gray-800'
-                }`}
-              >
-                {invoice.status}
-              </span>
             </div>
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <BookOpen className="h-5 w-5" />
-              Journal
-            </CardTitle>
+        <Card className="shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+            <CardTitle className="text-lg">Payments</CardTitle>
+            <Badge variant="secondary">{(invoice.payments ?? []).length}</Badge>
           </CardHeader>
-          <CardContent className="space-y-4">
-            {!showJournal && (
-              <div className="rounded-md border bg-white p-4 text-sm text-muted-foreground">
-                This invoice is <b>DRAFT</b>. No journal entry yet. Post the invoice first.
+          <CardContent className="pt-0">
+            {(invoice.payments ?? []).length === 0 ? (
+              <div className="py-10 text-center text-sm text-muted-foreground">
+                No payments yet.
               </div>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[140px]">Date</TableHead>
+                    <TableHead className="w-[110px]">Ref</TableHead>
+                    <TableHead>Deposit to</TableHead>
+                    <TableHead className="text-right w-[140px]">Amount</TableHead>
+                    <TableHead className="w-[60px]" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(invoice.payments ?? []).map((p: any) => {
+                    const isReversed = !!p.reversedAt
+                    const isWorking = reversingPaymentId === p.id
+                    return (
+                      <TableRow key={p.id}>
+                        <TableCell className="text-muted-foreground">
+                          {new Date(p.paymentDate).toLocaleDateString()}
+                        </TableCell>
+                        <TableCell className="font-medium tabular-nums">
+                          {p.id}
+                        </TableCell>
+                        <TableCell>
+                          <div className="font-medium">{p.bankAccount?.name ?? "—"}</div>
+                          <div className="mt-1">
+                            {isReversed ? (
+                              <Badge variant="destructive">Reversed</Badge>
+                            ) : (
+                              <Badge variant="secondary">Paid</Badge>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right font-medium tabular-nums">
+                          {formatMoney(p.amount)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="outline" size="sm" className="gap-2">
+                                Actions <ChevronDown className="h-4 w-4 opacity-60" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem
+                                disabled={isReversed || isWorking}
+                                onClick={() => openRefundDialog(p)}
+                                className="text-destructive focus:text-destructive"
+                              >
+                                {isWorking ? "Refunding..." : "Refund (reverse)"}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
             )}
-
-            {showJournal && journals.length === 0 && (
-              <div className="rounded-md border bg-white p-4 text-sm text-muted-foreground">
-                No journal entries found yet.
-              </div>
-            )}
-
-            {showJournal &&
-              journals.map((je) => {
-                const totalDebit = (je.lines ?? []).reduce(
-                  (sum: number, l: any) => sum + Number(l.debit ?? 0),
-                  0
-                );
-                const totalCredit = (je.lines ?? []).reduce(
-                  (sum: number, l: any) => sum + Number(l.credit ?? 0),
-                  0
-                );
-
-                return (
-                  <div key={`${je.kind}-${je.journalEntryId}`} className="rounded-lg border bg-white">
-                    <div className="flex items-center justify-between border-b px-4 py-3">
-                      <div className="text-sm">
-                        <div className="font-semibold">{je.kind === 'INVOICE_POSTED' ? 'Invoice Posted' : 'Payment'}</div>
-                        <div className="text-muted-foreground">
-                          {new Date(je.date).toLocaleDateString()} • JE #{je.journalEntryId}
-                        </div>
-                      </div>
-                      <Link href={`/journal/${je.journalEntryId}`}>
-                        <Button variant="ghost" size="sm">
-                          View
-                        </Button>
-                      </Link>
-                    </div>
-                    <div className="p-4">
-                      <div className="relative w-full overflow-auto">
-                        <table className="w-full text-sm">
-                          <thead className="[&_tr]:border-b">
-                            <tr>
-                              <th className="h-10 px-2 text-left font-medium text-muted-foreground">Account</th>
-                              <th className="h-10 px-2 text-right font-medium text-muted-foreground">Debit</th>
-                              <th className="h-10 px-2 text-right font-medium text-muted-foreground">Credit</th>
-                            </tr>
-                          </thead>
-                          <tbody className="[&_tr]:border-b">
-                            {(je.lines ?? []).map((l: any, idx: number) => (
-                              <tr key={idx}>
-                                <td className="px-2 py-2">
-                                  <div className="font-medium">
-                                    {l.account?.code ? `${l.account.code} ` : ''}
-                                    {l.account?.name ?? '—'}
-                                  </div>
-                                </td>
-                                <td className="px-2 py-2 text-right">{formatMoney(l.debit)}</td>
-                                <td className="px-2 py-2 text-right">{formatMoney(l.credit)}</td>
-                              </tr>
-                            ))}
-                            <tr className="border-b-0">
-                              <td className="px-2 py-2 text-right font-semibold">Total</td>
-                              <td className="px-2 py-2 text-right font-semibold">{formatMoney(totalDebit)}</td>
-                              <td className="px-2 py-2 text-right font-semibold">{formatMoney(totalCredit)}</td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
           </CardContent>
         </Card>
       </div>
 
-      <Card>
+      <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            Payments Received
-            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-100 px-1.5 text-xs font-semibold text-blue-800">
-              {(invoice.payments ?? []).length}
-            </span>
-          </CardTitle>
+          <CardTitle className="text-lg">Journal entries</CardTitle>
         </CardHeader>
-        <CardContent>
-          {(invoice.payments ?? []).length === 0 && (
-            <div className="text-sm text-muted-foreground">No payments yet.</div>
-          )}
-
-          {(invoice.payments ?? []).length > 0 && (
-            <div className="relative w-full overflow-auto">
-              <table className="w-full caption-bottom text-sm text-left">
-                <thead className="[&_tr]:border-b">
-                  <tr>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Date</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Payment #</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Status</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Payment Mode</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Amount</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="[&_tr:last-child]:border-0">
-                  {invoice.payments.map((p: any) => {
-                    const isReversed = !!p.reversedAt;
-                    const statusLabel: 'Paid' | 'Reversed' = isReversed ? 'Reversed' : 'Paid';
-                    return (
-                      <tr key={p.id} className="border-b transition-colors hover:bg-muted/50">
-                        <td className="p-4 align-middle">{new Date(p.paymentDate).toLocaleDateString()}</td>
-                        <td className="p-4 align-middle font-medium text-blue-700">{p.id}</td>
-                        <td className="p-4 align-middle">
-                          <StatusPill status={statusLabel} />
-                        </td>
-                        <td className="p-4 align-middle">
-                          <div className="font-medium">{p.bankAccount?.name ?? '—'}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {p.journalEntryId ? `JE #${p.journalEntryId}` : 'No journal'}
-                            {p.reversalJournalEntryId ? ` • Reversal JE #${p.reversalJournalEntryId}` : ''}
-                          </div>
-                        </td>
-                        <td className="p-4 align-middle text-right font-medium">{formatMoney(p.amount)}</td>
-                        <td className="p-4 align-middle text-right">
-                          <details className="relative inline-block text-left">
-                            <summary className="list-none cursor-pointer select-none text-blue-700 hover:underline">
-                              Actions <span className="text-xs">▼</span>
-                            </summary>
-                            <div className="absolute right-0 z-20 mt-2 w-40 rounded-md border bg-white shadow-lg">
-                              <button
-                                type="button"
-                                className="block w-full px-3 py-2 text-left text-sm text-slate-400 cursor-not-allowed"
-                                disabled
-                              >
-                                Edit
-                              </button>
-                              <Link
-                                href={p.journalEntryId ? `/journal/${p.journalEntryId}` : '#'}
-                                className={`block w-full px-3 py-2 text-left text-sm ${
-                                  p.journalEntryId ? 'text-slate-900 hover:bg-slate-50' : 'text-slate-400 cursor-not-allowed'
-                                }`}
-                                onClick={(e) => {
-                                  if (!p.journalEntryId) e.preventDefault();
-                                }}
-                              >
-                                View Journal
-                              </Link>
-                              <Link
-                                href={p.reversalJournalEntryId ? `/journal/${p.reversalJournalEntryId}` : '#'}
-                                className={`block w-full px-3 py-2 text-left text-sm ${
-                                  p.reversalJournalEntryId
-                                    ? 'text-slate-900 hover:bg-slate-50'
-                                    : 'text-slate-400 cursor-not-allowed'
-                                }`}
-                                onClick={(e) => {
-                                  if (!p.reversalJournalEntryId) e.preventDefault();
-                                }}
-                              >
-                                View Refund Journal
-                              </Link>
-                              <button
-                                type="button"
-                                className={`block w-full px-3 py-2 text-left text-sm ${
-                                  isReversed ? 'text-slate-400 cursor-not-allowed' : 'text-red-600 hover:bg-slate-50'
-                                }`}
-                                disabled={isReversed || reversingPaymentId === p.id}
-                                onClick={() => openRefundModal(p)}
-                              >
-                                {reversingPaymentId === p.id ? 'Refunding...' : 'Refund'}
-                              </button>
-                            </div>
-                          </details>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              {(invoice.payments ?? []).some((p: any) => p.reversedAt && p.reversalReason) && (
-                <div className="mt-3 text-xs text-muted-foreground">
-                  Tip: click a payment’s JE number to trace the ledger entry; refunds are recorded as reversing journal entries.
-                </div>
-              )}
+        <CardContent className="space-y-8">
+          {!showJournal ? (
+            <div className="text-sm text-muted-foreground">
+              This invoice is <b>DRAFT</b>. Post it before accounting entries are created.
             </div>
-          )}
+          ) : null}
+
+          {showJournal && journals.length === 0 ? (
+            <div className="text-sm text-muted-foreground">No journal entries found yet.</div>
+          ) : null}
+
+          {showJournal &&
+            journals.map((je) => {
+              const totalDebit = (je.lines ?? []).reduce(
+                (sum: number, l: any) => sum + Number(l.debit ?? 0),
+                0
+              )
+              const totalCredit = (je.lines ?? []).reduce(
+                (sum: number, l: any) => sum + Number(l.credit ?? 0),
+                0
+              )
+
+              const typeLabel =
+                je.kind === "INVOICE_POSTED"
+                  ? "Invoice posted"
+                  : je.kind === "PAYMENT"
+                    ? "Payment received"
+                    : je.kind === "PAYMENT_REVERSAL"
+                      ? "Payment reversal"
+                      : "Journal entry"
+
+              return (
+                <div key={`${je.kind}-${je.journalEntryId}`} className="space-y-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-medium">{typeLabel}</div>
+                      <div className="text-xs text-muted-foreground">
+                        JE #{je.journalEntryId} • {new Date(je.date).toLocaleDateString()}
+                      </div>
+                    </div>
+                    <Badge variant="outline">Balanced</Badge>
+                  </div>
+
+                  <div className="rounded-lg border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Account</TableHead>
+                          <TableHead className="w-[140px]">Branch</TableHead>
+                          <TableHead className="text-right w-[140px]">Debit</TableHead>
+                          <TableHead className="text-right w-[140px]">Credit</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {(je.lines ?? []).map((l: any, idx: number) => (
+                          <TableRow key={idx}>
+                            <TableCell>
+                              <div className="font-medium">{l.account?.name ?? "—"}</div>
+                              <div className="text-xs text-muted-foreground">{l.account?.code ?? ""}</div>
+                            </TableCell>
+                            <TableCell className="text-muted-foreground">Head Office</TableCell>
+                            <TableCell className="text-right font-medium tabular-nums">
+                              {Number(l.debit) > 0 ? formatMoney(l.debit) : "0.00"}
+                            </TableCell>
+                            <TableCell className="text-right font-medium tabular-nums">
+                              {Number(l.credit) > 0 ? formatMoney(l.credit) : "0.00"}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                        <TableRow className="bg-muted/40">
+                          <TableCell colSpan={2} className="text-right font-medium">
+                            Totals
+                          </TableCell>
+                          <TableCell className="text-right font-semibold tabular-nums">
+                            {formatMoney(totalDebit)}
+                          </TableCell>
+                          <TableCell className="text-right font-semibold tabular-nums">
+                            {formatMoney(totalCredit)}
+                          </TableCell>
+                        </TableRow>
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              )
+            })}
         </CardContent>
       </Card>
 
-      {refundModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-lg bg-white shadow-lg">
-            <div className="border-b px-4 py-3">
-              <div className="text-lg font-semibold">Refund payment</div>
-              <div className="text-sm text-muted-foreground">
-                Payment #{refundPayment?.id} • Amount {formatMoney(refundPayment?.amount)}
-              </div>
-            </div>
-            <div className="px-4 py-4 space-y-3">
-              <label className="text-sm font-medium">Reason (optional)</label>
-              <textarea
-                className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                value={refundReason}
-                onChange={(e) => setRefundReason(e.target.value)}
-                placeholder="e.g. Customer returned goods / Payment recorded to wrong account"
-              />
-              <div className="text-xs text-muted-foreground">
-                This will create an immutable reversing journal entry. Nothing will be deleted.
-              </div>
-            </div>
-            <div className="flex justify-end gap-3 border-t px-4 py-3">
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setRefundModalOpen(false);
-                  setRefundPayment(null);
-                  setRefundReason('');
-                }}
-                disabled={reversingPaymentId === refundPayment?.id}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={confirmRefund}
-                disabled={!refundPayment || reversingPaymentId === refundPayment?.id}
-              >
-                {reversingPaymentId === refundPayment?.id ? 'Refunding...' : 'Confirm Refund'}
-              </Button>
+      <Dialog open={refundModalOpen} onOpenChange={setRefundModalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Refund payment</DialogTitle>
+            <DialogDescription>
+              Payment #{refundPayment?.id} • Amount {formatMoney(refundPayment?.amount)}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Reason (optional)</div>
+            <Textarea
+              value={refundReason}
+              onChange={(e) => setRefundReason(e.target.value)}
+              placeholder="e.g. Payment recorded to wrong account"
+              className="min-h-24"
+            />
+            <div className="text-xs text-muted-foreground">
+              This creates a reversing journal entry. Nothing is deleted.
             </div>
           </div>
-        </div>
-      )}
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setRefundModalOpen(false)
+                setRefundPayment(null)
+                setRefundReason("")
+              }}
+              disabled={reversingPaymentId === refundPayment?.id}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={confirmRefund}
+              disabled={!refundPayment || reversingPaymentId === refundPayment?.id}
+            >
+              {reversingPaymentId === refundPayment?.id ? "Refunding..." : "Confirm refund"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
-  );
+  )
 }
 
 

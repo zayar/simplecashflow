@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 export async function runIdempotent(prisma, companyId, eventId, work, redis, redisTtlMs = 10 * 60 * 1000 // 10 minutes
 ) {
     // Safety rail: never throw for malformed ids in background processing.

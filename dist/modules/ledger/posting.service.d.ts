@@ -39,9 +39,9 @@ export declare function postJournalEntry(tx: PrismaTx, input: PostJournalEntryIn
     createdAt: Date;
     updatedAt: Date;
     id: number;
+    date: Date;
     reversalReason: string | null;
     description: string;
-    date: Date;
     createdByUserId: number | null;
     postedAt: Date;
     reversalOfJournalEntryId: number | null;

@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
+import { SelectNative } from '@/components/ui/select-native';
 
 export default function NewItemPage() {
   const { user } = useAuth();
@@ -57,11 +58,16 @@ export default function NewItemPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold tracking-tight">New Item</h1>
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">New Item</h1>
+        <p className="text-sm text-muted-foreground">
+          Create a product or service for invoicing.
+        </p>
+      </div>
       
-      <Card className="max-w-2xl">
+      <Card className="max-w-2xl shadow-sm">
         <CardHeader>
-          <CardTitle>Item Details</CardTitle>
+          <CardTitle className="text-lg">Item details</CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
@@ -86,15 +92,14 @@ export default function NewItemPage() {
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="type">Type</Label>
-                <select
+                <SelectNative
                   id="type"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   value={formData.type}
                   onChange={(e) => setFormData({ ...formData, type: e.target.value })}
                 >
                   <option value="GOODS">Goods</option>
                   <option value="SERVICE">Service</option>
-                </select>
+                </SelectNative>
               </div>
             </div>
 
@@ -112,9 +117,8 @@ export default function NewItemPage() {
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="incomeAccount">Income Account *</Label>
-                <select
+                <SelectNative
                   id="incomeAccount"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   required
                   value={formData.incomeAccountId}
                   onChange={(e) => setFormData({ ...formData, incomeAccountId: e.target.value })}
@@ -125,7 +129,7 @@ export default function NewItemPage() {
                       {acc.code} - {acc.name}
                     </option>
                   ))}
-                </select>
+                </SelectNative>
               </div>
             </div>
 

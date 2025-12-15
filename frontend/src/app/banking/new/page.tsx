@@ -10,6 +10,8 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { ArrowLeft } from 'lucide-react';
+import { SelectNative } from '@/components/ui/select-native';
+import { Separator } from '@/components/ui/separator';
 
 type Kind = 'CASH' | 'BANK' | 'E_WALLET' | 'CREDIT_CARD';
 
@@ -68,20 +70,24 @@ export default function NewBankingAccountPage() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
-        <h1 className="text-3xl font-bold tracking-tight">New Banking Account</h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">New Banking Account</h1>
+          <p className="text-sm text-muted-foreground">
+            Creates a deposit account + an ASSET account in your chart of accounts.
+          </p>
+        </div>
       </div>
 
-      <Card className="max-w-xl">
+      <Card className="max-w-xl shadow-sm">
         <CardHeader>
-          <CardTitle>Create Deposit Account</CardTitle>
+          <CardTitle className="text-lg">Details</CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="grid gap-2">
               <Label htmlFor="kind">Account Kind</Label>
-              <select
+              <SelectNative
                 id="kind"
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 value={form.kind}
                 onChange={(e) => setForm({ ...form, kind: e.target.value as Kind })}
               >
@@ -89,10 +95,7 @@ export default function NewBankingAccountPage() {
                 <option value="CASH">Cash</option>
                 <option value="E_WALLET">E‑wallet</option>
                 <option value="CREDIT_CARD">Credit Card (future)</option>
-              </select>
-              <p className="text-xs text-muted-foreground">
-                This creates both a Banking account and a Chart of Accounts entry (ASSET).
-              </p>
+              </SelectNative>
             </div>
 
             <div className="grid gap-2">
@@ -120,6 +123,7 @@ export default function NewBankingAccountPage() {
               </p>
             </div>
 
+            {showBankFields && <Separator />}
             {showBankFields && (
               <>
                 <div className="grid gap-2">
@@ -174,7 +178,7 @@ export default function NewBankingAccountPage() {
               />
             </div>
 
-            <label className="flex items-center gap-2 text-sm">
+            <label className="flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm">
               <input
                 type="checkbox"
                 checked={form.isPrimary}

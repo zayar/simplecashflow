@@ -1,12 +1,22 @@
-'use client';
+"use client"
 
-import { useEffect, useState } from 'react';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import Link from 'next/link';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Plus } from 'lucide-react';
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import { Plus } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 export default function ItemsPage() {
   const { user } = useAuth();
@@ -23,7 +33,12 @@ export default function ItemsPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold tracking-tight">Items</h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Items</h1>
+          <p className="text-sm text-muted-foreground">
+            Products and services you sell.
+          </p>
+        </div>
         <Link href="/items/new">
           <Button className="gap-2">
             <Plus className="h-4 w-4" /> New Item
@@ -31,40 +46,42 @@ export default function ItemsPage() {
         </Link>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>All Items</CardTitle>
+      <Card className="shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-lg">All items</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="relative w-full overflow-auto">
-            <table className="w-full caption-bottom text-sm text-left">
-              <thead className="[&_tr]:border-b">
-                <tr className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Name</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">SKU</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Type</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Price</th>
-                </tr>
-              </thead>
-              <tbody className="[&_tr:last-child]:border-0">
-                {items.map((item) => (
-                  <tr key={item.id} className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
-                    <td className="p-4 align-middle font-medium">{item.name}</td>
-                    <td className="p-4 align-middle">{item.sku || '-'}</td>
-                    <td className="p-4 align-middle">{item.type}</td>
-                    <td className="p-4 align-middle text-right">{Number(item.sellingPrice).toLocaleString()}</td>
-                  </tr>
-                ))}
-                {items.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="p-4 text-center text-muted-foreground">
-                      No items found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+        <CardContent className="pt-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead className="w-[160px]">SKU</TableHead>
+                <TableHead className="w-[140px]">Type</TableHead>
+                <TableHead className="text-right w-[160px]">Price</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell className="font-medium">{item.name}</TableCell>
+                  <TableCell className="text-muted-foreground">{item.sku || "—"}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline">{item.type}</Badge>
+                  </TableCell>
+                  <TableCell className="text-right font-medium tabular-nums">
+                    {Number(item.sellingPrice ?? 0).toLocaleString()}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {items.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                    No items yet.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

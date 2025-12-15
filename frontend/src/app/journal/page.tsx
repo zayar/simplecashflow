@@ -1,12 +1,23 @@
-'use client';
+"use client"
 
-import { useEffect, useState } from 'react';
-import Link from 'next/link';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { BookOpen, ArrowRight } from 'lucide-react';
+import { useEffect, useState } from "react"
+import Link from "next/link"
+import { ArrowRight } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -30,65 +41,79 @@ export default function JournalPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-          <BookOpen className="h-6 w-6" /> Journal
-        </h1>
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Journal</h1>
+          <p className="text-sm text-muted-foreground">
+            Recent journal entries (last 100).
+          </p>
+        </div>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Journal Entries</CardTitle>
+      <Card className="shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-lg">Entries</CardTitle>
         </CardHeader>
-        <CardContent>
-          {loading && <div className="text-sm text-muted-foreground">Loading...</div>}
+        <CardContent className="pt-0">
+          {loading && (
+            <div className="space-y-3 py-4">
+              <Skeleton className="h-10 w-full" />
+              <Skeleton className="h-10 w-full" />
+              <Skeleton className="h-10 w-full" />
+            </div>
+          )}
+
           {!loading && entries.length === 0 && (
-            <div className="text-sm text-muted-foreground">No journal entries yet.</div>
+            <div className="py-10 text-center text-sm text-muted-foreground">
+              No journal entries yet.
+            </div>
           )}
 
           {!loading && entries.length > 0 && (
-            <div className="relative w-full overflow-auto">
-              <table className="w-full caption-bottom text-sm text-left">
-                <thead className="[&_tr]:border-b">
-                  <tr>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Date</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Description</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Debit</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Credit</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Status</th>
-                    <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right"></th>
-                  </tr>
-                </thead>
-                <tbody className="[&_tr:last-child]:border-0">
-                  {entries.map((e) => (
-                    <tr key={e.id} className="border-b transition-colors hover:bg-muted/50">
-                      <td className="p-4 align-middle">{new Date(e.date).toLocaleDateString()}</td>
-                      <td className="p-4 align-middle">
-                        <div className="font-medium">JE #{e.id}</div>
-                        <div className="text-muted-foreground text-xs">{e.description}</div>
-                      </td>
-                      <td className="p-4 align-middle text-right font-medium">{formatMoney(e.totalDebit)}</td>
-                      <td className="p-4 align-middle text-right font-medium">{formatMoney(e.totalCredit)}</td>
-                      <td className="p-4 align-middle text-right">
-                        <span
-                          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                            e.balanced ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                          }`}
-                        >
-                          {e.balanced ? 'BALANCED' : 'UNBALANCED'}
-                        </span>
-                      </td>
-                      <td className="p-4 align-middle text-right">
-                        <Link href={`/journal/${e.id}`}>
-                          <Button variant="ghost" size="sm" className="gap-2">
-                            View <ArrowRight className="h-4 w-4" />
-                          </Button>
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[140px]">Date</TableHead>
+                  <TableHead>Description</TableHead>
+                  <TableHead className="text-right w-[140px]">Debit</TableHead>
+                  <TableHead className="text-right w-[140px]">Credit</TableHead>
+                  <TableHead className="text-right w-[140px]">Status</TableHead>
+                  <TableHead className="w-[120px]" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {entries.map((e) => (
+                  <TableRow key={e.id}>
+                    <TableCell className="text-muted-foreground">
+                      {new Date(e.date).toLocaleDateString()}
+                    </TableCell>
+                    <TableCell>
+                      <div className="font-medium">JE #{e.id}</div>
+                      <div className="text-xs text-muted-foreground">{e.description}</div>
+                    </TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">
+                      {formatMoney(e.totalDebit)}
+                    </TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">
+                      {formatMoney(e.totalCredit)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {e.balanced ? (
+                        <Badge variant="secondary">Balanced</Badge>
+                      ) : (
+                        <Badge variant="destructive">Unbalanced</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Link href={`/journal/${e.id}`}>
+                        <Button variant="ghost" size="sm" className="gap-2">
+                          View <ArrowRight className="h-4 w-4" />
+                        </Button>
+                      </Link>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
           )}
         </CardContent>
       </Card>

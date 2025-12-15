@@ -1,13 +1,24 @@
-'use client';
+"use client"
 
-import { useEffect, useMemo, useState } from 'react';
-import Link from 'next/link';
-import { useParams } from 'next/navigation';
-import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { ArrowLeft, Landmark } from 'lucide-react';
+import { useEffect, useMemo, useState } from "react"
+import Link from "next/link"
+import { useParams } from "next/navigation"
+import { ArrowLeft } from "lucide-react"
+
+import { useAuth } from "@/contexts/auth-context"
+import { fetchApi } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -47,11 +58,16 @@ export default function BankingAccountDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Banking</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Banking</h1>
+            <p className="text-sm text-muted-foreground">Account details</p>
+          </div>
         </div>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">Loading...</p>
+        <Card className="shadow-sm">
+          <CardContent className="pt-6 space-y-3">
+            <Skeleton className="h-10 w-2/3" />
+            <Skeleton className="h-5 w-1/2" />
+            <Skeleton className="h-64 w-full" />
           </CardContent>
         </Card>
       </div>
@@ -67,9 +83,12 @@ export default function BankingAccountDetailPage() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <h1 className="text-3xl font-bold tracking-tight">Banking</h1>
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Banking</h1>
+            <p className="text-sm text-muted-foreground">Account details</p>
+          </div>
         </div>
-        <Card>
+        <Card className="shadow-sm">
           <CardContent className="pt-6">
             <p className="text-center text-muted-foreground">Account not found.</p>
           </CardContent>
@@ -86,64 +105,101 @@ export default function BankingAccountDetailPage() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
-        <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-          <Landmark className="h-6 w-6" /> {data.account?.name}
-        </h1>
+        <div className="min-w-0 space-y-1">
+          <h1 className="truncate text-2xl font-semibold tracking-tight">
+            {data.account?.name}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {data.kind} • COA {data.account?.code} • {data.bankName ?? "—"}
+          </p>
+        </div>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Closing Balance</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-4xl font-bold tracking-tight">{balanceLabel}</div>
-          <div className="text-sm text-muted-foreground mt-2">
-            {data.kind} • COA {data.account?.code} • {data.bankName ?? '—'}
-          </div>
-        </CardContent>
-      </Card>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card className="shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Closing balance
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold tracking-tight tabular-nums">
+              {balanceLabel}
+            </div>
+            <div className="mt-2">
+              {data.isPrimary ? (
+                <Badge variant="secondary">Primary</Badge>
+              ) : (
+                <Badge variant="outline">Not primary</Badge>
+              )}
+            </div>
+          </CardContent>
+        </Card>
 
-      <Card>
+        <Card className="shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Account
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1 text-sm">
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-muted-foreground">Code</span>
+              <span className="font-medium tabular-nums">{data.account?.code ?? "—"}</span>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-muted-foreground">Provider</span>
+              <span className="font-medium">{data.bankName ?? "—"}</span>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle>Recent Transactions</CardTitle>
+          <CardTitle className="text-lg">Recent transactions</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="relative w-full overflow-auto">
-            <table className="w-full caption-bottom text-sm text-left">
-              <thead className="[&_tr]:border-b">
-                <tr>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Date</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Transaction Details</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground">Type</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Debit</th>
-                  <th className="h-12 px-4 align-middle font-medium text-muted-foreground text-right">Credit</th>
-                </tr>
-              </thead>
-              <tbody className="[&_tr:last-child]:border-0">
-                {(data.transactions ?? []).map((t: any, idx: number) => (
-                  <tr key={idx} className="border-b transition-colors hover:bg-muted/50">
-                    <td className="p-4 align-middle">{t.date ? new Date(t.date).toLocaleDateString() : '—'}</td>
-                    <td className="p-4 align-middle">
-                      <div className="font-medium">{t.details}</div>
-                      <div className="text-xs text-muted-foreground">
-                        JE #{t.journalEntryId}
-                      </div>
-                    </td>
-                    <td className="p-4 align-middle">{t.type}</td>
-                    <td className="p-4 align-middle text-right font-medium">{formatMoney(t.debit)}</td>
-                    <td className="p-4 align-middle text-right font-medium">{formatMoney(t.credit)}</td>
-                  </tr>
-                ))}
-                {(data.transactions ?? []).length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="p-4 text-center text-muted-foreground">
-                      No transactions yet.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+        <CardContent className="pt-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[140px]">Date</TableHead>
+                <TableHead>Details</TableHead>
+                <TableHead className="w-[140px]">Type</TableHead>
+                <TableHead className="text-right w-[140px]">Debit</TableHead>
+                <TableHead className="text-right w-[140px]">Credit</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(data.transactions ?? []).map((t: any, idx: number) => (
+                <TableRow key={idx}>
+                  <TableCell className="text-muted-foreground">
+                    {t.date ? new Date(t.date).toLocaleDateString() : "—"}
+                  </TableCell>
+                  <TableCell>
+                    <div className="font-medium">{t.details}</div>
+                    <div className="text-xs text-muted-foreground">JE #{t.journalEntryId}</div>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline">{t.type}</Badge>
+                  </TableCell>
+                  <TableCell className="text-right font-medium tabular-nums">
+                    {formatMoney(t.debit)}
+                  </TableCell>
+                  <TableCell className="text-right font-medium tabular-nums">
+                    {formatMoney(t.credit)}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {(data.transactions ?? []).length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={5} className="py-10 text-center text-muted-foreground">
+                    No transactions yet.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

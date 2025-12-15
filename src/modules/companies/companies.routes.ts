@@ -1,6 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
-import { AccountType, BankingAccountKind } from '@prisma/client';
+import {
+  AccountReportGroup,
+  AccountType,
+  BankingAccountKind,
+  CashflowActivity,
+  NormalBalance,
+} from '@prisma/client';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
 import {
   enforceCompanyScope,
@@ -39,6 +45,7 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       where: { id: companyId },
       include: {
         accountsReceivableAccount: true,
+        accountsPayableAccount: true,
       },
     });
 
@@ -59,6 +66,15 @@ export async function companiesRoutes(fastify: FastifyInstance) {
             type: company.accountsReceivableAccount.type,
           }
         : null,
+      accountsPayableAccountId: (company as any).accountsPayableAccountId ?? null,
+      accountsPayableAccount: (company as any).accountsPayableAccount
+        ? {
+            id: (company as any).accountsPayableAccount.id,
+            code: (company as any).accountsPayableAccount.code,
+            name: (company as any).accountsPayableAccount.name,
+            type: (company as any).accountsPayableAccount.type,
+          }
+        : null,
     };
   });
 
@@ -67,11 +83,12 @@ export async function companiesRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       accountsReceivableAccountId?: number | null;
+      accountsPayableAccountId?: number | null;
     };
 
-    if (!('accountsReceivableAccountId' in body)) {
+    if (!('accountsReceivableAccountId' in body) && !('accountsPayableAccountId' in body)) {
       reply.status(400);
-      return { error: 'accountsReceivableAccountId is required (number or null)' };
+      return { error: 'accountsReceivableAccountId and/or accountsPayableAccountId is required (number or null)' };
     }
 
     const company = await prisma.company.findUnique({ where: { id: companyId } });
@@ -97,13 +114,36 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       }
     }
 
+    if (body.accountsPayableAccountId !== undefined && body.accountsPayableAccountId !== null) {
+      const apId = body.accountsPayableAccountId;
+      if (!apId || Number.isNaN(Number(apId))) {
+        reply.status(400);
+        return { error: 'accountsPayableAccountId must be a valid number or null' };
+      }
+
+      const apAccount = await prisma.account.findFirst({
+        where: { id: apId, companyId, type: AccountType.LIABILITY },
+      });
+
+      if (!apAccount) {
+        reply.status(400);
+        return { error: 'accountsPayableAccountId must be a LIABILITY account in this company' };
+      }
+    }
+
     const updated = await prisma.company.update({
       where: { id: companyId },
       data: {
-        accountsReceivableAccountId: body.accountsReceivableAccountId,
+        ...(body.accountsReceivableAccountId !== undefined
+          ? { accountsReceivableAccountId: body.accountsReceivableAccountId }
+          : {}),
+        ...(body.accountsPayableAccountId !== undefined
+          ? { accountsPayableAccountId: body.accountsPayableAccountId }
+          : {}),
       },
       include: {
         accountsReceivableAccount: true,
+        accountsPayableAccount: true,
       },
     });
 
@@ -117,6 +157,15 @@ export async function companiesRoutes(fastify: FastifyInstance) {
             code: updated.accountsReceivableAccount.code,
             name: updated.accountsReceivableAccount.name,
             type: updated.accountsReceivableAccount.type,
+          }
+        : null,
+      accountsPayableAccountId: (updated as any).accountsPayableAccountId ?? null,
+      accountsPayableAccount: (updated as any).accountsPayableAccount
+        ? {
+            id: (updated as any).accountsPayableAccount.id,
+            code: (updated as any).accountsPayableAccount.code,
+            name: (updated as any).accountsPayableAccount.name,
+            type: (updated as any).accountsPayableAccount.type,
           }
         : null,
     };
@@ -146,6 +195,8 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       code?: string;
       name?: string;
       type?: AccountType;
+      reportGroup?: AccountReportGroup;
+      cashflowActivity?: CashflowActivity;
     };
 
     if (!body.code || !body.name || !body.type) {
@@ -159,6 +210,9 @@ export async function companiesRoutes(fastify: FastifyInstance) {
         code: body.code,
         name: body.name,
         type: body.type,
+        normalBalance: normalBalanceForType(body.type),
+        reportGroup: body.reportGroup ?? null,
+        cashflowActivity: body.cashflowActivity ?? null,
       },
     });
 
@@ -173,6 +227,8 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       code?: string;
       name?: string;
       type?: AccountType;
+      reportGroup?: AccountReportGroup;
+      cashflowActivity?: CashflowActivity;
     };
 
     const companyId = forbidClientProvidedCompanyId(request, reply, body.companyId);
@@ -187,6 +243,9 @@ export async function companiesRoutes(fastify: FastifyInstance) {
         code: body.code,
         name: body.name,
         type: body.type,
+        normalBalance: normalBalanceForType(body.type),
+        reportGroup: body.reportGroup ?? null,
+        cashflowActivity: body.cashflowActivity ?? null,
       },
     });
 
@@ -366,6 +425,9 @@ export async function companiesRoutes(fastify: FastifyInstance) {
           code: body.accountCode!,
           name: body.accountName!,
           type: AccountType.ASSET,
+          normalBalance: NormalBalance.DEBIT,
+          reportGroup: AccountReportGroup.CASH_AND_CASH_EQUIVALENTS,
+          cashflowActivity: CashflowActivity.OPERATING,
         },
       });
 
@@ -414,5 +476,19 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       },
     };
   });
+
+  function normalBalanceForType(type: AccountType): NormalBalance {
+    switch (type) {
+      case AccountType.ASSET:
+      case AccountType.EXPENSE:
+        return NormalBalance.DEBIT;
+      case AccountType.LIABILITY:
+      case AccountType.EQUITY:
+      case AccountType.INCOME:
+        return NormalBalance.CREDIT;
+      default:
+        return NormalBalance.DEBIT;
+    }
+  }
 }
 

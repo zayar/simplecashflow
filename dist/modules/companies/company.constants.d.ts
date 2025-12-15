@@ -1,22 +1,10 @@
-export declare const DEFAULT_ACCOUNTS: ({
+import { AccountReportGroup, AccountType, CashflowActivity } from '@prisma/client';
+export type DefaultAccountSeed = {
     code: string;
     name: string;
-    type: "ASSET";
-} | {
-    code: string;
-    name: string;
-    type: "LIABILITY";
-} | {
-    code: string;
-    name: string;
-    type: "EQUITY";
-} | {
-    code: string;
-    name: string;
-    type: "INCOME";
-} | {
-    code: string;
-    name: string;
-    type: "EXPENSE";
-})[];
+    type: AccountType;
+    reportGroup?: AccountReportGroup;
+    cashflowActivity?: CashflowActivity;
+};
+export declare const DEFAULT_ACCOUNTS: DefaultAccountSeed[];
 //# sourceMappingURL=company.constants.d.ts.map

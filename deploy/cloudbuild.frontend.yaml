@@ -1,0 +1,20 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'NEXT_PUBLIC_API_URL=$_NEXT_PUBLIC_API_URL'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/cashflow-frontend'
+      - './frontend'
+  
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/cashflow-frontend']
+
+images:
+  - 'gcr.io/$PROJECT_ID/cashflow-frontend'
+
+substitutions:
+  _NEXT_PUBLIC_API_URL: 'https://cashflow-api-291129507535.asia-southeast1.run.app' # Default fallback
