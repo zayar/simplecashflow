@@ -2,6 +2,31 @@ import Cookies from 'js-cookie';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
+async function readResponseBody(res: Response): Promise<any> {
+  // 204 No Content is valid for many write endpoints.
+  if (res.status === 204) return null;
+
+  const contentType = res.headers.get('content-type') ?? '';
+  const isJson = contentType.includes('application/json');
+
+  if (isJson) {
+    try {
+      return await res.json();
+    } catch {
+      // Empty/invalid JSON payload
+      return null;
+    }
+  }
+
+  // Fallback for non-JSON (rare in this app, but safer than throwing).
+  try {
+    const text = await res.text();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchApi(endpoint: string, options: RequestInit = {}) {
   const token = Cookies.get('token');
   
@@ -21,7 +46,9 @@ export async function fetchApi(endpoint: string, options: RequestInit = {}) {
     headers['Idempotency-Key'] = key;
   }
 
-  if (options.body) {
+  // Only set JSON content type for string bodies (we use JSON.stringify in this app).
+  // Avoid clobbering FormData or explicit caller-provided content types.
+  if (options.body && typeof options.body === 'string' && !headers['Content-Type'] && !headers['content-type']) {
     headers['Content-Type'] = 'application/json';
   }
 
@@ -35,11 +62,17 @@ export async function fetchApi(endpoint: string, options: RequestInit = {}) {
   });
 
   if (!res.ok) {
-    const error = await res.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.message || error.error || `Request failed with status ${res.status}`);
+    const payload = await readResponseBody(res);
+    const message =
+      (payload && typeof payload === 'object' && ('message' in payload || 'error' in payload)
+        ? ((payload as any).message || (payload as any).error)
+        : null) ??
+      (typeof payload === 'string' ? payload : null) ??
+      `Request failed with status ${res.status}`;
+    throw new Error(message);
   }
 
-  return res.json();
+  return await readResponseBody(res);
 }
 
 // Report types based on our backend response

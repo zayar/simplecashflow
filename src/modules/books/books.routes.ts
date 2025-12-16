@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
-import { parseCompanyId } from '../../utils/request.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow } from '../../utils/date.js';
 import { publishDomainEvent } from '../../infrastructure/pubsub.js';
@@ -12,7 +11,9 @@ import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { BankingAccountKind } from '@prisma/client';
 import { getRedis } from '../../infrastructure/redis.js';
-import { withLockBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { applyStockMoveWac } from '../inventory/stock.service.js';
+import { ensureInventoryCompanyDefaults } from '../inventory/stock.service.js';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -112,6 +113,31 @@ export async function booksRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // Item detail (for UI)
+  fastify.get('/companies/:companyId/items/:itemId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const itemId = Number((request.params as any)?.itemId);
+    if (Number.isNaN(itemId)) {
+      reply.status(400);
+      return { error: 'invalid itemId' };
+    }
+
+    const item = await prisma.item.findFirst({
+      where: { id: itemId, companyId },
+      include: {
+        incomeAccount: { select: { id: true, code: true, name: true, type: true } },
+        expenseAccount: { select: { id: true, code: true, name: true, type: true } },
+        defaultWarehouse: { select: { id: true, name: true, isDefault: true } },
+      },
+    });
+    if (!item) {
+      reply.status(404);
+      return { error: 'item not found' };
+    }
+
+    return item;
+  });
+
   fastify.post('/companies/:companyId/items', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
 
@@ -123,6 +149,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       costPrice?: number;
       incomeAccountId?: number;
       expenseAccountId?: number;
+      trackInventory?: boolean;
+      defaultWarehouseId?: number | null;
     };
 
     if (!body.name || !body.type || body.sellingPrice === undefined || !body.incomeAccountId) {
@@ -149,6 +177,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
     }
 
+    if (body.trackInventory && body.type !== ItemType.GOODS) {
+      reply.status(400);
+      return { error: 'trackInventory can only be enabled for GOODS' };
+    }
+
+    if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
+      const wh = await prisma.warehouse.findFirst({
+        where: { id: body.defaultWarehouseId, companyId },
+        select: { id: true },
+      });
+      if (!wh) {
+        reply.status(400);
+        return { error: 'defaultWarehouseId must be a warehouse in this company' };
+      }
+    }
+
     const item = await prisma.item.create({
       data: {
         companyId,
@@ -159,6 +203,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
         costPrice: body.costPrice === undefined ? null : toMoneyDecimal(body.costPrice),
         incomeAccountId: body.incomeAccountId,
         expenseAccountId: body.expenseAccountId ?? null,
+        trackInventory: body.trackInventory ?? false,
+        defaultWarehouseId: body.defaultWarehouseId ?? null,
       },
       include: {
         incomeAccount: true,
@@ -411,12 +457,51 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
     const lockKey = `lock:invoice:post:${companyId}:${invoiceId}`;
 
-    const { replay, response: result } = await withLockBestEffort(
-      redis,
-      lockKey,
-      30_000,
-      async () =>
-        await runIdempotentRequest(
+    // Pre-read to compute stock lock keys (avoid concurrent oversell across invoices).
+    const pre = await prisma.invoice.findFirst({
+      where: { id: invoiceId, companyId },
+      select: {
+        id: true,
+        company: { select: { defaultWarehouseId: true } },
+        lines: {
+          select: {
+            itemId: true,
+            item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+          },
+        },
+      },
+    });
+    if (!pre) {
+      reply.status(404);
+      return { error: 'invoice not found' };
+    }
+
+    let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
+    if (!fallbackWarehouseId) {
+      const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+      fallbackWarehouseId = wh?.id ?? null;
+    }
+
+    const trackedLines = pre.lines.filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
+    if (trackedLines.length > 0) {
+      const missingWh = trackedLines.some((l) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+      if (missingWh) {
+        reply.status(400);
+        return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+      }
+    }
+
+    const stockLockKeys =
+      trackedLines.length === 0
+        ? []
+        : trackedLines.map((l) => {
+            const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId) as number;
+            return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+          });
+
+    const { replay, response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () =>
+      withLockBestEffort(redis, lockKey, 30_000, async () =>
+        runIdempotentRequest(
           prisma,
           companyId,
           idempotencyKey,
@@ -476,6 +561,41 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
           total = total.toDecimalPlaces(2);
 
+          // Inventory V1: deduct stock + compute COGS (WAC) at invoice post time
+          const tracked = invoice.lines.filter((l) => l.item.type === 'GOODS' && (l.item as any).trackInventory);
+          let totalCogs = new Prisma.Decimal(0);
+
+          // Resolve default warehouse for this company (required if any tracked items exist).
+          let defaultWarehouseId: number | null = (invoice.company as any).defaultWarehouseId ?? null;
+
+          if (tracked.length > 0) {
+            const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
+            defaultWarehouseId = defaultWarehouseId ?? cfg.defaultWarehouseId;
+
+            for (const line of tracked) {
+              const wid = (line.item as any).defaultWarehouseId ?? defaultWarehouseId;
+              const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
+              const applied = await applyStockMoveWac(tx as any, {
+                companyId,
+                warehouseId: wid,
+                itemId: line.itemId,
+                date: invoice.invoiceDate,
+                type: 'SALE_ISSUE',
+                direction: 'OUT',
+                quantity: qty,
+                unitCostApplied: new Prisma.Decimal(0),
+                referenceType: 'Invoice',
+                referenceId: String(invoice.id),
+                correlationId,
+                createdByUserId: (request as any).user?.userId ?? null,
+                journalEntryId: null,
+              });
+              totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
+            }
+
+            totalCogs = totalCogs.toDecimalPlaces(2);
+          }
+
           const journalEntry = await postJournalEntry(tx, {
             companyId,
             date: invoice.invoiceDate,
@@ -488,8 +608,30 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 debit: new Prisma.Decimal(0),
                 credit: amount.toDecimalPlaces(2),
               })),
+              ...(totalCogs.greaterThan(0)
+                ? [
+                    {
+                      accountId: ((invoice.company as any).cogsAccountId ?? (await ensureInventoryCompanyDefaults(tx as any, companyId)).cogsAccountId)!,
+                      debit: totalCogs,
+                      credit: new Prisma.Decimal(0),
+                    },
+                    {
+                      accountId: ((invoice.company as any).inventoryAssetAccountId ?? (await ensureInventoryCompanyDefaults(tx as any, companyId)).inventoryAssetAccountId)!,
+                      debit: new Prisma.Decimal(0),
+                      credit: totalCogs,
+                    },
+                  ]
+                : []),
             ],
           });
+
+          // Link inventory moves to the invoice posting JournalEntry (best-effort)
+          if (totalCogs.greaterThan(0)) {
+            await (tx as any).stockMove.updateMany({
+              where: { companyId, correlationId, journalEntryId: null },
+              data: { journalEntryId: journalEntry.id },
+            });
+          }
 
           // Update invoice to POSTED and link journal entry.
           const updatedInvoice = await tx.invoice.update({
@@ -567,6 +709,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
           },
           redis
         )
+      )
     );
 
     // First execution: attempt publish now (still safe if it fails; outbox publisher will deliver later).

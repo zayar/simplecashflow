@@ -6,7 +6,6 @@ import { markEventPublished } from '../../infrastructure/events.js';
 import type { DomainEventEnvelopeV1 } from '../../events/domainEvent.js';
 import { Prisma } from '@prisma/client';
 import { postJournalEntry } from './posting.service.js';
-import { parseCompanyId } from '../../utils/request.js';
 import { enforceCompanyScope, forbidClientProvidedCompanyId, requireCompanyIdParam } from '../../utils/tenant.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { getRedis } from '../../infrastructure/redis.js';

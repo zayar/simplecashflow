@@ -81,6 +81,31 @@ export async function withLockBestEffort<T>(
   }
 }
 
+/**
+ * Multi-lock helper built on `withLockBestEffort`.
+ *
+ * - Locks are acquired in deterministic order (sorted unique keys).
+ * - Uses best-effort semantics: if Redis is down, runs without locks.
+ * - If Redis is up and any lock is held, throws 409 (from `withLockBestEffort`).
+ */
+export async function withLocksBestEffort<T>(
+  redis: Redis | undefined,
+  keys: string[],
+  ttlMs: number,
+  work: () => Promise<T>
+): Promise<T> {
+  const sortedUniqueKeys = Array.from(new Set(keys)).sort();
+  let run = work;
+
+  // Compose in reverse order so the first key is acquired first.
+  for (const key of sortedUniqueKeys.reverse()) {
+    const prev = run;
+    run = async () => await withLockBestEffort(redis, key, ttlMs, prev);
+  }
+
+  return await run();
+}
+
 function cryptoRandom(): string {
   return (
     Math.random().toString(16).slice(2) +
