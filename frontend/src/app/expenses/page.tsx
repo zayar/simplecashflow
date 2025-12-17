@@ -6,6 +6,7 @@ import { CheckCircle, DollarSign, Eye, MoreHorizontal, Plus } from "lucide-react
 
 import { useAuth } from "@/contexts/auth-context"
 import { fetchApi, getBills, BillListRow } from "@/lib/api"
+import { formatDateInTimeZone } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -41,9 +42,10 @@ function statusBadge(status: string) {
 }
 
 export default function BillsPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [bills, setBills] = useState<BillListRow[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const tz = companySettings?.timeZone ?? "Asia/Yangon"
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -77,14 +79,14 @@ export default function BillsPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Bills</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Expenses</h1>
           <p className="text-sm text-muted-foreground">
-            Track payables and record outgoing payments.
+            Track expenses and record outgoing payments.
           </p>
         </div>
         <Link href="/expenses/new">
           <Button className="gap-2">
-            <Plus className="h-4 w-4" /> New Bill
+            <Plus className="h-4 w-4" /> New Expense
           </Button>
         </Link>
       </div>
@@ -92,9 +94,9 @@ export default function BillsPage() {
       <Card className="shadow-sm">
         <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <div className="space-y-1">
-            <CardTitle className="text-lg">All bills</CardTitle>
+            <CardTitle className="text-lg">All expenses</CardTitle>
             <p className="text-sm text-muted-foreground">
-              Post bills to create accounting entries and track AP.
+              Post expenses to create accounting entries and track AP.
             </p>
           </div>
         </CardHeader>
@@ -114,7 +116,7 @@ export default function BillsPage() {
               {bills.map((b) => (
                 <TableRow key={b.id}>
                   <TableCell className="text-muted-foreground">
-                    {new Date(b.expenseDate).toLocaleDateString()}
+                    {formatDateInTimeZone(b.expenseDate, tz)}
                   </TableCell>
                   <TableCell className="font-medium">{b.expenseNumber}</TableCell>
                   <TableCell>{b.vendorName ?? "—"}</TableCell>
@@ -162,7 +164,7 @@ export default function BillsPage() {
               {bills.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
-                    No bills yet. Create a bill to start tracking payables.
+                    No expenses yet. Create an expense to start tracking payables.
                   </TableCell>
                 </TableRow>
               )}

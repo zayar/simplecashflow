@@ -31,11 +31,26 @@ export const DEFAULT_ACCOUNTS: DefaultAccountSeed[] = [
     cashflowActivity: CashflowActivity.OPERATING,
   },
   {
+    code: "1300",
+    name: "Inventory",
+    type: AccountType.ASSET,
+    reportGroup: AccountReportGroup.INVENTORY,
+    cashflowActivity: CashflowActivity.OPERATING,
+  },
+  {
     code: "2000",
     name: "Accounts Payable",
     type: AccountType.LIABILITY,
     reportGroup: AccountReportGroup.ACCOUNTS_PAYABLE,
     cashflowActivity: CashflowActivity.OPERATING,
+  },
+  {
+    // Used for opening balances (including opening stock). Common pattern in accounting systems.
+    code: "3050",
+    name: "Opening Balance Equity",
+    type: AccountType.EQUITY,
+    reportGroup: AccountReportGroup.EQUITY,
+    cashflowActivity: CashflowActivity.FINANCING,
   },
   {
     code: "3000",
@@ -49,6 +64,13 @@ export const DEFAULT_ACCOUNTS: DefaultAccountSeed[] = [
     name: "Sales Income",
     type: AccountType.INCOME,
     reportGroup: AccountReportGroup.SALES_REVENUE,
+    cashflowActivity: CashflowActivity.OPERATING,
+  },
+  {
+    code: "5001",
+    name: "Cost of Goods Sold",
+    type: AccountType.EXPENSE,
+    reportGroup: AccountReportGroup.COGS,
     cashflowActivity: CashflowActivity.OPERATING,
   },
   {

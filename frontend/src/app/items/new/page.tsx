@@ -15,13 +15,17 @@ export default function NewItemPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [incomeAccounts, setIncomeAccounts] = useState<any[]>([]);
+  const [warehouses, setWarehouses] = useState<any[]>([]);
   
   const [formData, setFormData] = useState({
     name: '',
     sku: '',
     type: 'GOODS',
     sellingPrice: '',
+    costPrice: '',
     incomeAccountId: '',
+    trackInventory: false,
+    defaultWarehouseId: '',
   });
 
   useEffect(() => {
@@ -29,6 +33,10 @@ export default function NewItemPage() {
       // Fetch INCOME accounts for dropdown
       fetchApi(`/companies/${user.companyId}/accounts?type=INCOME`)
         .then(setIncomeAccounts)
+        .catch(console.error);
+
+      fetchApi(`/companies/${user.companyId}/warehouses`)
+        .then(setWarehouses)
         .catch(console.error);
     }
   }, [user?.companyId]);
@@ -44,7 +52,11 @@ export default function NewItemPage() {
         body: JSON.stringify({
           ...formData,
           sellingPrice: Number(formData.sellingPrice),
+          costPrice: formData.costPrice ? Number(formData.costPrice) : undefined,
           incomeAccountId: Number(formData.incomeAccountId),
+          trackInventory: formData.type === 'GOODS' ? Boolean(formData.trackInventory) : false,
+          defaultWarehouseId:
+            formData.defaultWarehouseId ? Number(formData.defaultWarehouseId) : null,
         }),
       });
       router.push('/items');
@@ -131,6 +143,47 @@ export default function NewItemPage() {
                   ))}
                 </SelectNative>
               </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="grid gap-2">
+                <Label htmlFor="costPrice">Cost Price</Label>
+                <Input
+                  id="costPrice"
+                  type="number"
+                  step="0.01"
+                  value={formData.costPrice}
+                  onChange={(e) => setFormData({ ...formData, costPrice: e.target.value })}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="defaultWarehouse">Default Warehouse</Label>
+                <SelectNative
+                  id="defaultWarehouse"
+                  value={formData.defaultWarehouseId}
+                  onChange={(e) => setFormData({ ...formData, defaultWarehouseId: e.target.value })}
+                  disabled={formData.type !== 'GOODS'}
+                >
+                  <option value="">Company default</option>
+                  {warehouses.map((w) => (
+                    <option key={w.id} value={String(w.id)}>
+                      {w.name}
+                      {w.isDefault ? ' (Default)' : ''}
+                    </option>
+                  ))}
+                </SelectNative>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={formData.trackInventory}
+                onChange={(e) => setFormData({ ...formData, trackInventory: e.target.checked })}
+                disabled={formData.type !== 'GOODS'}
+                className="h-4 w-4"
+              />
+              <span className="text-sm">Track inventory for this item</span>
             </div>
 
             <div className="flex justify-end gap-4 pt-4">

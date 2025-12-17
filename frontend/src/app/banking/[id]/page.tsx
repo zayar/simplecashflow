@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
+import { formatDateTimeInTimeZone } from "@/lib/utils"
 import {
   Table,
   TableBody,
@@ -27,9 +28,10 @@ function formatMoney(n: any) {
 }
 
 export default function BankingAccountDetailPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const params = useParams();
   const id = params.id;
+  const tz = companySettings?.timeZone ?? "Asia/Yangon"
 
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -47,6 +49,19 @@ export default function BankingAccountDetailPage() {
     const b = Number(data.balance ?? 0);
     const suffix = b >= 0 ? 'Dr' : 'Cr';
     return `${formatMoney(Math.abs(b))} (${suffix})`;
+  }, [data]);
+
+  const transactions = useMemo(() => {
+    const rows = (data?.transactions ?? []) as any[];
+    // Sort by full timestamp (newest first). If date is missing/invalid, push to bottom.
+    return [...rows].sort((a, b) => {
+      const at = a?.date ? new Date(a.date).getTime() : Number.NEGATIVE_INFINITY;
+      const bt = b?.date ? new Date(b.date).getTime() : Number.NEGATIVE_INFINITY;
+      if (!Number.isFinite(at) && !Number.isFinite(bt)) return 0;
+      if (!Number.isFinite(at)) return 1;
+      if (!Number.isFinite(bt)) return -1;
+      return bt - at;
+    });
   }, [data]);
 
   if (loading) {
@@ -163,7 +178,7 @@ export default function BankingAccountDetailPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[140px]">Date</TableHead>
+                <TableHead className="w-[190px]">Date &amp; time</TableHead>
                 <TableHead>Details</TableHead>
                 <TableHead className="w-[140px]">Type</TableHead>
                 <TableHead className="text-right w-[140px]">Debit</TableHead>
@@ -171,10 +186,10 @@ export default function BankingAccountDetailPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {(data.transactions ?? []).map((t: any, idx: number) => (
+              {transactions.map((t: any, idx: number) => (
                 <TableRow key={idx}>
                   <TableCell className="text-muted-foreground">
-                    {t.date ? new Date(t.date).toLocaleDateString() : "—"}
+                    {formatDateTimeInTimeZone(t.date, tz)}
                   </TableCell>
                   <TableCell>
                     <div className="font-medium">{t.details}</div>
@@ -191,7 +206,7 @@ export default function BankingAccountDetailPage() {
                   </TableCell>
                 </TableRow>
               ))}
-              {(data.transactions ?? []).length === 0 && (
+              {transactions.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={5} className="py-10 text-center text-muted-foreground">
                     No transactions yet.

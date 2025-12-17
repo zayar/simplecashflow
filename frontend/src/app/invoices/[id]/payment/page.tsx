@@ -12,12 +12,15 @@ import { ArrowLeft, DollarSign, Calendar, User, FileText } from 'lucide-react';
 import Link from 'next/link';
 import { SelectNative } from '@/components/ui/select-native';
 import { Badge } from '@/components/ui/badge';
+import { todayInTimeZone } from '@/lib/utils';
+import { formatDateInTimeZone } from '@/lib/utils';
 
 export default function RecordPaymentPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const router = useRouter();
   const params = useParams();
   const invoiceId = params.id;
+  const tz = companySettings?.timeZone ?? 'Asia/Yangon';
 
   const [loading, setLoading] = useState(false);
   const [invoice, setInvoice] = useState<any>(null);
@@ -25,7 +28,7 @@ export default function RecordPaymentPage() {
   
   const [formData, setFormData] = useState({
     paymentMode: 'CASH' as 'CASH' | 'BANK' | 'E_WALLET',
-    paymentDate: new Date().toISOString().split('T')[0],
+    paymentDate: '',
     amount: '',
     bankAccountId: '',
   });
@@ -53,6 +56,14 @@ export default function RecordPaymentPage() {
         .catch(console.error);
     }
   }, [user?.companyId, invoiceId, router]);
+
+  useEffect(() => {
+    const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+    if (!formData.paymentDate) {
+      setFormData((prev) => ({ ...prev, paymentDate: todayInTimeZone(tz) }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companySettings?.timeZone]);
 
   // Auto-fill remaining balance when invoice loads
   useEffect(() => {
@@ -193,7 +204,7 @@ export default function RecordPaymentPage() {
                 <Calendar className="h-4 w-4" />
                 Invoice Date
               </div>
-              <p>{new Date(invoice.invoiceDate).toLocaleDateString()}</p>
+              <p>{formatDateInTimeZone(invoice.invoiceDate, tz)}</p>
             </div>
 
             {invoice.dueDate && (
@@ -202,7 +213,7 @@ export default function RecordPaymentPage() {
                   <Calendar className="h-4 w-4" />
                   Due Date
                 </div>
-                <p>{new Date(invoice.dueDate).toLocaleDateString()}</p>
+                <p>{formatDateInTimeZone(invoice.dueDate, tz)}</p>
               </div>
             )}
 
@@ -263,7 +274,7 @@ export default function RecordPaymentPage() {
                   {invoice.payments.map((payment: any) => (
                     <div key={payment.id} className="flex justify-between text-sm">
                       <span className="text-muted-foreground">
-                        {new Date(payment.paymentDate).toLocaleDateString()} - {payment.bankAccount?.name}
+                        {formatDateInTimeZone(payment.paymentDate, tz)} - {payment.bankAccount?.name}
                       </span>
                       <span className="font-medium">{Number(payment.amount).toLocaleString()}</span>
                     </div>

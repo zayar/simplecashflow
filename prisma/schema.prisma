@@ -77,9 +77,41 @@ enum BankingAccountKind {
   CREDIT_CARD
 }
 
+enum InventoryValuationMethod {
+  WAC
+}
+
+enum StockMoveType {
+  OPENING
+  ADJUSTMENT
+  SALE_ISSUE
+  PURCHASE_RECEIPT
+  TRANSFER_OUT
+  TRANSFER_IN
+}
+
+enum StockMoveDirection {
+  IN
+  OUT
+}
+
+enum PurchaseBillStatus {
+  DRAFT
+  POSTED
+  PARTIAL
+  PAID
+}
+
 model Company {
   id              Int              @id @default(autoincrement())
   name            String
+  // --- Company profile / reporting preferences ---
+  // Base currency for the tenant. Treat as immutable after transactions exist.
+  baseCurrency    String?          // e.g. "MMK"
+  // IANA timezone name (preferred), e.g. "Asia/Yangon"
+  timeZone        String?          // affects display + date boundaries for reporting
+  // Fiscal year start month (1-12). If null, assume January.
+  fiscalYearStartMonth Int?        @default(1)
   accounts        Account[]
   entries         JournalEntry[]
   events          Event[]
@@ -97,6 +129,12 @@ model Company {
   processedEvents ProcessedEvent[]
   invoiceLines    InvoiceLine[]
   bankingAccounts BankingAccount[]
+  warehouses      Warehouse[]
+  stockBalances   StockBalance[]
+  stockMoves      StockMove[]
+  purchaseBills   PurchaseBill[]
+  purchaseBillLines PurchaseBillLine[]
+  purchaseBillPayments PurchaseBillPayment[]
 
   // Default account settings for this company (multi-tenant safe).
   // Used when posting invoices (Debit AR).
@@ -107,10 +145,28 @@ model Company {
   accountsPayableAccountId Int?
   accountsPayableAccount   Account? @relation("Company_AP", fields: [accountsPayableAccountId], references: [id])
 
+  // --- Inventory settings (V1) ---
+  // Default Inventory asset account (ASSET, reportGroup = INVENTORY).
+  inventoryAssetAccountId Int?
+  inventoryAssetAccount   Account? @relation("Company_InventoryAsset", fields: [inventoryAssetAccountId], references: [id])
+
+  // Default COGS account (EXPENSE, reportGroup = COGS).
+  cogsAccountId Int?
+  cogsAccount   Account? @relation("Company_COGS", fields: [cogsAccountId], references: [id])
+
+  // Opening balance equity account (EQUITY). Used when setting opening stock.
+  openingBalanceEquityAccountId Int?
+  openingBalanceEquityAccount   Account? @relation("Company_OpeningEquity", fields: [openingBalanceEquityAccountId], references: [id])
+
+  // Default warehouse for inventory operations.
+  defaultWarehouseId Int?
+  defaultWarehouse   Warehouse? @relation("Company_DefaultWarehouse", fields: [defaultWarehouseId], references: [id])
+
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   idempotentRequests IdempotentRequest[]
   periodCloses       PeriodClose[]
+  documentSequences  DocumentSequence[]
 }
 
 model Account {
@@ -140,12 +196,17 @@ model Account {
   // Books layer relations
   accountsReceivableFor Company[] @relation("Company_AR")
   accountsPayableFor    Company[] @relation("Company_AP")
+  inventoryAssetFor     Company[] @relation("Company_InventoryAsset")
+  cogsFor               Company[] @relation("Company_COGS")
+  openingBalanceEquityFor Company[] @relation("Company_OpeningEquity")
   incomeItems           Item[]    @relation("Account_IncomeItems")
   expenseItems          Item[]    @relation("Account_ExpenseItems")
   bankPayments          Payment[] @relation("Payment_BankAccount")
   bankExpensePayments   ExpensePayment[] @relation("ExpensePayment_BankAccount")
   bankingAccount        BankingAccount?
   expenses              Expense[] @relation("Expense_ExpenseAccount")
+  purchaseBillLines     PurchaseBillLine[]
+  purchaseBillPayments  PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
 
   @@unique([companyId, code]) // one code per company
 }
@@ -230,6 +291,9 @@ model JournalEntry {
   expense Expense? @relation("Expense_JournalEntry")
   expensePayment ExpensePayment? @relation("ExpensePayment_JournalEntry")
   expensePaymentReversal ExpensePayment? @relation("ExpensePayment_ReversalJournalEntry")
+  purchaseBill PurchaseBill?
+  purchaseBillPayment PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
+  purchaseBillPaymentReversal PurchaseBillPayment? @relation("PurchaseBillPayment_ReversalJournalEntry")
   periodClose PeriodClose?
 }
 
@@ -340,6 +404,12 @@ model Item {
   sellingPrice Decimal  @db.Decimal(18, 2)
   costPrice    Decimal? @db.Decimal(18, 2)
 
+  // Inventory tracking (V1). Only meaningful for GOODS.
+  trackInventory   Boolean                 @default(false)
+  valuationMethod  InventoryValuationMethod @default(WAC)
+  defaultWarehouseId Int?
+  defaultWarehouse   Warehouse?            @relation(fields: [defaultWarehouseId], references: [id])
+
   // Revenue account for sales (should be INCOME)
   incomeAccountId Int
   incomeAccount   Account @relation("Account_IncomeItems", fields: [incomeAccountId], references: [id])
@@ -351,11 +421,95 @@ model Item {
   isActive     Boolean       @default(true)
   invoiceLines InvoiceLine[]
   expenses     Expense[]
+  stockBalances StockBalance[]
+  stockMoves    StockMove[]
+  purchaseBillLines PurchaseBillLine[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([companyId])
+}
+
+model Warehouse {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  name      String
+  isDefault Boolean @default(false)
+
+  items         Item[]
+  stockBalances StockBalance[]
+  stockMoves    StockMove[]
+  purchaseBills PurchaseBill[]
+  purchaseBillLines PurchaseBillLine[]
+  defaultForCompanies Company[] @relation("Company_DefaultWarehouse")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model StockBalance {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
+
+  // Accounting stock (V1): qty + weighted-average valuation
+  qtyOnHand      Decimal @db.Decimal(18, 2)
+  avgUnitCost    Decimal @db.Decimal(18, 2)
+  inventoryValue Decimal @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, warehouseId, itemId])
+  @@index([companyId, itemId])
+  @@index([companyId, warehouseId])
+}
+
+model StockMove {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
+
+  date      DateTime
+  type      StockMoveType
+  direction StockMoveDirection
+  quantity  Decimal @db.Decimal(18, 2)
+
+  // Cost applied for this move (audit).
+  unitCostApplied  Decimal @db.Decimal(18, 2)
+  totalCostApplied Decimal @db.Decimal(18, 2)
+
+  referenceType String?
+  referenceId   String?
+  correlationId String?
+  createdByUserId Int?
+
+  // Link to GL posting (optional but helpful)
+  journalEntryId Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, date])
+  @@index([companyId, itemId])
+  @@index([companyId, warehouseId])
 }
 
 model Invoice {
@@ -451,11 +605,107 @@ model Vendor {
   phone String?
 
   expenses Expense[]
+  purchaseBills PurchaseBill[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([companyId])
+}
+
+model PurchaseBill {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  vendorId Int?
+  vendor   Vendor? @relation(fields: [vendorId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  billNumber String
+  status     PurchaseBillStatus
+  billDate   DateTime
+  dueDate    DateTime?
+  currency   String?
+
+  total      Decimal @db.Decimal(18, 2)
+  amountPaid Decimal @db.Decimal(18, 2) @default(0)
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation(fields: [journalEntryId], references: [id])
+
+  lines PurchaseBillLine[]
+  payments PurchaseBillPayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, billNumber])
+  @@index([companyId, billDate])
+  @@index([companyId, status])
+}
+
+model PurchaseBillLine {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  purchaseBillId Int
+  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
+
+  // Chart of Accounts account for this line.
+  // For tracked inventory items, this should be the Inventory Asset account.
+  accountId Int?
+  account   Account? @relation(fields: [accountId], references: [id])
+
+  description String?
+  quantity    Decimal @db.Decimal(18, 2)
+  unitCost    Decimal @db.Decimal(18, 2)
+  lineTotal   Decimal @db.Decimal(18, 2)
+
+  @@index([companyId])
+  @@index([purchaseBillId])
+  @@index([companyId, itemId])
+}
+
+model PurchaseBillPayment {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  purchaseBillId Int
+  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
+
+  paymentDate DateTime
+  amount      Decimal  @db.Decimal(18, 2)
+
+  bankAccountId Int
+  bankAccount   Account @relation("PurchaseBillPayment_BankAccount", fields: [bankAccountId], references: [id])
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation("PurchaseBillPayment_JournalEntry", fields: [journalEntryId], references: [id])
+
+  // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
+  reversedAt             DateTime?
+  reversalReason         String? @db.Text
+  reversalJournalEntryId Int?    @unique
+  reversalJournalEntry   JournalEntry? @relation("PurchaseBillPayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUserId       Int?
+  reversedByUser         User? @relation(fields: [reversedByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, paymentDate])
+  @@index([purchaseBillId])
 }
 
 model Expense {
@@ -543,6 +793,7 @@ model User {
   journalEntriesCreated JournalEntry[]
   reversedPayments      Payment[] @relation("User_ReversedPayments")
   reversedExpensePayments ExpensePayment[] @relation("User_ReversedExpensePayments")
+  reversedPurchaseBillPayments PurchaseBillPayment[]
   periodClosesCreated PeriodClose[] @relation("User_PeriodClosesCreated")
 
   @@index([companyId])
@@ -584,4 +835,20 @@ model IdempotentRequest {
 
   @@unique([companyId, key])
   @@index([companyId, createdAt])
+}
+
+// Per-company sequence generator for document numbers (e.g., Purchase Bills).
+model DocumentSequence {
+  id        Int      @id @default(autoincrement())
+  companyId Int
+  company   Company  @relation(fields: [companyId], references: [id])
+
+  key        String
+  nextNumber Int      @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, key])
+  @@index([companyId])
 }

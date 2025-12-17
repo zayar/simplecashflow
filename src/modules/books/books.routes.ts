@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
-import { isoNow } from '../../utils/date.js';
+import { isoNow, parseDateInput } from '../../utils/date.js';
 import { publishDomainEvent } from '../../infrastructure/pubsub.js';
 import { markEventPublished } from '../../infrastructure/events.js';
 import { randomUUID } from 'node:crypto';
@@ -394,8 +394,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
     }
 
-    const invoiceDate = body.invoiceDate ? new Date(body.invoiceDate) : new Date();
-    const dueDate = body.dueDate ? new Date(body.dueDate) : null;
+    const invoiceDate = parseDateInput(body.invoiceDate) ?? new Date();
+    const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
 
     // Compute totals using Decimal (money-safe).
     let total = new Prisma.Decimal(0);
@@ -888,7 +888,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   }
                 }
 
-                const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+                const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
                 const amount = toMoneyDecimal(amountNumber);
 
                 const journalEntry = await postJournalEntry(tx, {
@@ -1068,7 +1068,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
     }
 
     const body = (request.body ?? {}) as { reason?: string; date?: string };
-    const reversalDate = body.date ? new Date(body.date) : new Date();
+    const reversalDate = parseDateInput(body.date) ?? new Date();
     if (body.date && isNaN(reversalDate.getTime())) {
       reply.status(400);
       return { error: 'invalid date (must be ISO string)' };
@@ -1510,8 +1510,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
     }
 
-    const expenseDate = body.expenseDate ? new Date(body.expenseDate) : new Date();
-    const dueDate = body.dueDate ? new Date(body.dueDate) : null;
+    const expenseDate = parseDateInput(body.expenseDate) ?? new Date();
+    const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
     if (body.expenseDate && isNaN(expenseDate.getTime())) {
       reply.status(400);
       return { error: 'invalid expenseDate' };
@@ -1780,7 +1780,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 throw Object.assign(new Error('cannot pay from a credit card account'), { statusCode: 400 });
               }
 
-              const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+              const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
               const amount = toMoneyDecimal(amountNumber);
 
               const je = await postJournalEntry(tx, {

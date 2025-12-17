@@ -10,14 +10,20 @@ import { Label } from '@/components/ui/label';
 import { Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { todayInTimeZone } from '@/lib/utils';
 
 export default function BalanceSheetPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [report, setReport] = useState<BalanceSheetReport | null>(null);
   const [loading, setLoading] = useState(false);
   
-  const now = new Date().toISOString().split('T')[0];
-  const [asOf, setAsOf] = useState(now);
+  const [asOf, setAsOf] = useState('');
+
+  useEffect(() => {
+    const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+    if (!asOf) setAsOf(todayInTimeZone(tz));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companySettings?.timeZone]);
 
   async function fetchReport() {
     if (!user?.companyId) return;

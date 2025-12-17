@@ -5,25 +5,29 @@ import { useAuth } from "@/contexts/auth-context"
 import { fetchApi } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { formatDateInputInTimeZone, todayInTimeZone } from "@/lib/utils"
 
 export default function Dashboard() {
-  const { user, isLoading } = useAuth()
+  const { user, isLoading, companySettings } = useAuth()
   const [pnl, setPnl] = useState<any>(null);
 
   useEffect(() => {
     if (user?.companyId) {
-      const today = new Date();
-      const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-      const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+      const tz = companySettings?.timeZone ?? "Asia/Yangon"
+      const today = todayInTimeZone(tz)
+      const parts = today.split("-").map((x) => Number(x))
+      const y = parts[0]
+      const m = parts[1] // 1-12
+      if (!y || !m) return
 
-      const from = firstDay.toISOString().split('T')[0];
-      const to = lastDay.toISOString().split('T')[0];
+      const from = formatDateInputInTimeZone(new Date(Date.UTC(y, m - 1, 1)), tz)
+      const to = formatDateInputInTimeZone(new Date(Date.UTC(y, m, 0)), tz)
 
       fetchApi(`/reports/pnl?companyId=${user.companyId}&from=${from}&to=${to}`)
         .then(setPnl)
         .catch(console.error);
     }
-  }, [user?.companyId]);
+  }, [user?.companyId, companySettings?.timeZone]);
 
   if (isLoading || !user) return null;
 

@@ -7,6 +7,15 @@ Full‑stack cashflow / bookkeeping app with:
 - **Worker** that consumes Pub/Sub push messages and updates derived read models (e.g. `DailySummary`) **idempotently**
 - **Frontend** (Next.js + Tailwind) that talks to the API using JWT
 
+## Start here (developer onboarding)
+
+- **Architecture + system flow**: `docs/ARCHITECTURE.md`
+- **API usage guide + standards**: `docs/API_GUIDE.md`
+- **How to run locally (backend + DB + frontend)**: `docs/RUN_LOCAL.md`
+- **How to extend safely (no rewrites)**: `docs/HOW_TO_EXTEND.md`
+- **Rewrite policy**: `docs/REWRITE_POLICY.md`
+- **Developer presentation (slide bullets)**: `docs/DEVELOPER_PRESENTATION.md`
+
 ## Architecture (high level)
 
 This repo follows an **Outbox + Pub/Sub** pattern:
@@ -223,5 +232,6 @@ Cloud Run IAM:
 ## License
 
 TBD
+
 
 

@@ -46,6 +46,10 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       include: {
         accountsReceivableAccount: true,
         accountsPayableAccount: true,
+        inventoryAssetAccount: true,
+        cogsAccount: true,
+        openingBalanceEquityAccount: true,
+        defaultWarehouse: true,
       },
     });
 
@@ -54,9 +58,16 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       return { error: 'company not found' };
     }
 
+    // Used for base currency immutability (fintech safety): once transactions exist, lock base currency.
+    const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
+
     return {
       companyId: company.id,
       name: company.name,
+      baseCurrency: (company as any).baseCurrency ?? null,
+      timeZone: (company as any).timeZone ?? null,
+      fiscalYearStartMonth: (company as any).fiscalYearStartMonth ?? 1,
+      baseCurrencyLocked: transactionCount > 0,
       accountsReceivableAccountId: company.accountsReceivableAccountId,
       accountsReceivableAccount: company.accountsReceivableAccount
         ? {
@@ -75,6 +86,41 @@ export async function companiesRoutes(fastify: FastifyInstance) {
             type: (company as any).accountsPayableAccount.type,
           }
         : null,
+      inventoryAssetAccountId: (company as any).inventoryAssetAccountId ?? null,
+      inventoryAssetAccount: (company as any).inventoryAssetAccount
+        ? {
+            id: (company as any).inventoryAssetAccount.id,
+            code: (company as any).inventoryAssetAccount.code,
+            name: (company as any).inventoryAssetAccount.name,
+            type: (company as any).inventoryAssetAccount.type,
+          }
+        : null,
+      cogsAccountId: (company as any).cogsAccountId ?? null,
+      cogsAccount: (company as any).cogsAccount
+        ? {
+            id: (company as any).cogsAccount.id,
+            code: (company as any).cogsAccount.code,
+            name: (company as any).cogsAccount.name,
+            type: (company as any).cogsAccount.type,
+          }
+        : null,
+      openingBalanceEquityAccountId: (company as any).openingBalanceEquityAccountId ?? null,
+      openingBalanceEquityAccount: (company as any).openingBalanceEquityAccount
+        ? {
+            id: (company as any).openingBalanceEquityAccount.id,
+            code: (company as any).openingBalanceEquityAccount.code,
+            name: (company as any).openingBalanceEquityAccount.name,
+            type: (company as any).openingBalanceEquityAccount.type,
+          }
+        : null,
+      defaultWarehouseId: (company as any).defaultWarehouseId ?? null,
+      defaultWarehouse: (company as any).defaultWarehouse
+        ? {
+            id: (company as any).defaultWarehouse.id,
+            name: (company as any).defaultWarehouse.name,
+            isDefault: (company as any).defaultWarehouse.isDefault,
+          }
+        : null,
     };
   });
 
@@ -82,13 +128,33 @@ export async function companiesRoutes(fastify: FastifyInstance) {
     const companyId = requireCompanyIdParam(request, reply);
 
     const body = request.body as {
+      baseCurrency?: string | null;
+      timeZone?: string | null;
+      fiscalYearStartMonth?: number | null;
       accountsReceivableAccountId?: number | null;
       accountsPayableAccountId?: number | null;
+      inventoryAssetAccountId?: number | null;
+      cogsAccountId?: number | null;
+      openingBalanceEquityAccountId?: number | null;
+      defaultWarehouseId?: number | null;
     };
 
-    if (!('accountsReceivableAccountId' in body) && !('accountsPayableAccountId' in body)) {
+    if (
+      !('baseCurrency' in body) &&
+      !('timeZone' in body) &&
+      !('fiscalYearStartMonth' in body) &&
+      !('accountsReceivableAccountId' in body) &&
+      !('accountsPayableAccountId' in body) &&
+      !('inventoryAssetAccountId' in body) &&
+      !('cogsAccountId' in body) &&
+      !('openingBalanceEquityAccountId' in body) &&
+      !('defaultWarehouseId' in body)
+    ) {
       reply.status(400);
-      return { error: 'accountsReceivableAccountId and/or accountsPayableAccountId is required (number or null)' };
+      return {
+        error:
+          'at least one setting field is required (baseCurrency, timeZone, fiscalYearStartMonth, accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultWarehouseId)',
+      };
     }
 
     const company = await prisma.company.findUnique({ where: { id: companyId } });
@@ -97,7 +163,51 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       return { error: 'company not found' };
     }
 
-    if (body.accountsReceivableAccountId !== null) {
+    // --- Validate and enforce company profile fields ---
+    if (body.baseCurrency !== undefined) {
+      const cur = body.baseCurrency;
+      if (cur === null) {
+        // allow clearing only if no transactions exist
+        const cnt = await prisma.journalEntry.count({ where: { companyId } });
+        if (cnt > 0) {
+          reply.status(400);
+          return { error: 'baseCurrency cannot be cleared after transactions exist' };
+        }
+      } else {
+        const normalized = String(cur).trim().toUpperCase();
+        if (!/^[A-Z]{3}$/.test(normalized)) {
+          reply.status(400);
+          return { error: 'baseCurrency must be a 3-letter currency code (e.g. MMK, USD)' };
+        }
+        // lock base currency after any journal entries exist
+        const cnt = await prisma.journalEntry.count({ where: { companyId } });
+        const existing = ((company as any).baseCurrency ?? null) as string | null;
+        if (cnt > 0 && existing && existing !== normalized) {
+          reply.status(400);
+          return { error: 'baseCurrency cannot be changed after transactions exist' };
+        }
+        // mutate request payload to normalized value (so we store clean)
+        (body as any).baseCurrency = normalized;
+      }
+    }
+
+    if (body.timeZone !== undefined && body.timeZone !== null) {
+      const tz = String(body.timeZone).trim();
+      if (tz.length < 3 || tz.length > 64) {
+        reply.status(400);
+        return { error: 'timeZone must be a valid IANA timezone name (e.g. Asia/Yangon)' };
+      }
+    }
+
+    if (body.fiscalYearStartMonth !== undefined && body.fiscalYearStartMonth !== null) {
+      const m = Number(body.fiscalYearStartMonth);
+      if (!Number.isInteger(m) || m < 1 || m > 12) {
+        reply.status(400);
+        return { error: 'fiscalYearStartMonth must be an integer between 1 and 12' };
+      }
+    }
+
+    if (body.accountsReceivableAccountId !== undefined && body.accountsReceivableAccountId !== null) {
       const arId = body.accountsReceivableAccountId;
       if (!arId || Number.isNaN(Number(arId))) {
         reply.status(400);
@@ -131,25 +241,106 @@ export async function companiesRoutes(fastify: FastifyInstance) {
       }
     }
 
+    if (body.inventoryAssetAccountId !== undefined && body.inventoryAssetAccountId !== null) {
+      const invId = body.inventoryAssetAccountId;
+      if (!invId || Number.isNaN(Number(invId))) {
+        reply.status(400);
+        return { error: 'inventoryAssetAccountId must be a valid number or null' };
+      }
+      const invAcc = await prisma.account.findFirst({
+        where: { id: invId, companyId, type: AccountType.ASSET },
+      });
+      if (!invAcc) {
+        reply.status(400);
+        return { error: 'inventoryAssetAccountId must be an ASSET account in this company' };
+      }
+    }
+
+    if (body.cogsAccountId !== undefined && body.cogsAccountId !== null) {
+      const cogsId = body.cogsAccountId;
+      if (!cogsId || Number.isNaN(Number(cogsId))) {
+        reply.status(400);
+        return { error: 'cogsAccountId must be a valid number or null' };
+      }
+      const cogsAcc = await prisma.account.findFirst({
+        where: { id: cogsId, companyId, type: AccountType.EXPENSE },
+      });
+      if (!cogsAcc) {
+        reply.status(400);
+        return { error: 'cogsAccountId must be an EXPENSE account in this company' };
+      }
+    }
+
+    if (body.openingBalanceEquityAccountId !== undefined && body.openingBalanceEquityAccountId !== null) {
+      const eqId = body.openingBalanceEquityAccountId;
+      if (!eqId || Number.isNaN(Number(eqId))) {
+        reply.status(400);
+        return { error: 'openingBalanceEquityAccountId must be a valid number or null' };
+      }
+      const eqAcc = await prisma.account.findFirst({
+        where: { id: eqId, companyId, type: AccountType.EQUITY },
+      });
+      if (!eqAcc) {
+        reply.status(400);
+        return { error: 'openingBalanceEquityAccountId must be an EQUITY account in this company' };
+      }
+    }
+
+    if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
+      const whId = body.defaultWarehouseId;
+      if (!whId || Number.isNaN(Number(whId))) {
+        reply.status(400);
+        return { error: 'defaultWarehouseId must be a valid number or null' };
+      }
+      const wh = await prisma.warehouse.findFirst({ where: { id: whId, companyId } });
+      if (!wh) {
+        reply.status(400);
+        return { error: 'defaultWarehouseId must be a warehouse in this company' };
+      }
+    }
+
     const updated = await prisma.company.update({
       where: { id: companyId },
       data: {
+        ...(body.baseCurrency !== undefined ? { baseCurrency: body.baseCurrency as any } : {}),
+        ...(body.timeZone !== undefined ? { timeZone: body.timeZone as any } : {}),
+        ...(body.fiscalYearStartMonth !== undefined
+          ? { fiscalYearStartMonth: body.fiscalYearStartMonth as any }
+          : {}),
         ...(body.accountsReceivableAccountId !== undefined
           ? { accountsReceivableAccountId: body.accountsReceivableAccountId }
           : {}),
         ...(body.accountsPayableAccountId !== undefined
           ? { accountsPayableAccountId: body.accountsPayableAccountId }
           : {}),
+        ...(body.inventoryAssetAccountId !== undefined
+          ? { inventoryAssetAccountId: body.inventoryAssetAccountId }
+          : {}),
+        ...(body.cogsAccountId !== undefined ? { cogsAccountId: body.cogsAccountId } : {}),
+        ...(body.openingBalanceEquityAccountId !== undefined
+          ? { openingBalanceEquityAccountId: body.openingBalanceEquityAccountId }
+          : {}),
+        ...(body.defaultWarehouseId !== undefined ? { defaultWarehouseId: body.defaultWarehouseId } : {}),
       },
       include: {
         accountsReceivableAccount: true,
         accountsPayableAccount: true,
+        inventoryAssetAccount: true,
+        cogsAccount: true,
+        openingBalanceEquityAccount: true,
+        defaultWarehouse: true,
       },
     });
+
+    const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
 
     return {
       companyId: updated.id,
       name: updated.name,
+      baseCurrency: (updated as any).baseCurrency ?? null,
+      timeZone: (updated as any).timeZone ?? null,
+      fiscalYearStartMonth: (updated as any).fiscalYearStartMonth ?? 1,
+      baseCurrencyLocked: transactionCount > 0,
       accountsReceivableAccountId: updated.accountsReceivableAccountId,
       accountsReceivableAccount: updated.accountsReceivableAccount
         ? {
@@ -166,6 +357,41 @@ export async function companiesRoutes(fastify: FastifyInstance) {
             code: (updated as any).accountsPayableAccount.code,
             name: (updated as any).accountsPayableAccount.name,
             type: (updated as any).accountsPayableAccount.type,
+          }
+        : null,
+      inventoryAssetAccountId: (updated as any).inventoryAssetAccountId ?? null,
+      inventoryAssetAccount: (updated as any).inventoryAssetAccount
+        ? {
+            id: (updated as any).inventoryAssetAccount.id,
+            code: (updated as any).inventoryAssetAccount.code,
+            name: (updated as any).inventoryAssetAccount.name,
+            type: (updated as any).inventoryAssetAccount.type,
+          }
+        : null,
+      cogsAccountId: (updated as any).cogsAccountId ?? null,
+      cogsAccount: (updated as any).cogsAccount
+        ? {
+            id: (updated as any).cogsAccount.id,
+            code: (updated as any).cogsAccount.code,
+            name: (updated as any).cogsAccount.name,
+            type: (updated as any).cogsAccount.type,
+          }
+        : null,
+      openingBalanceEquityAccountId: (updated as any).openingBalanceEquityAccountId ?? null,
+      openingBalanceEquityAccount: (updated as any).openingBalanceEquityAccount
+        ? {
+            id: (updated as any).openingBalanceEquityAccount.id,
+            code: (updated as any).openingBalanceEquityAccount.code,
+            name: (updated as any).openingBalanceEquityAccount.name,
+            type: (updated as any).openingBalanceEquityAccount.type,
+          }
+        : null,
+      defaultWarehouseId: (updated as any).defaultWarehouseId ?? null,
+      defaultWarehouse: (updated as any).defaultWarehouse
+        ? {
+            id: (updated as any).defaultWarehouse.id,
+            name: (updated as any).defaultWarehouse.name,
+            isDefault: (updated as any).defaultWarehouse.isDefault,
           }
         : null,
     };

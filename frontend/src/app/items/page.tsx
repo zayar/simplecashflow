@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { Plus } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -21,6 +22,7 @@ import {
 export default function ItemsPage() {
   const { user } = useAuth();
   const [items, setItems] = useState<any[]>([]);
+  const router = useRouter();
 
   useEffect(() => {
     if (user?.companyId) {
@@ -62,7 +64,11 @@ export default function ItemsPage() {
             </TableHeader>
             <TableBody>
               {items.map((item) => (
-                <TableRow key={item.id}>
+                <TableRow
+                  key={item.id}
+                  className="cursor-pointer"
+                  onClick={() => router.push(`/items/${item.id}`)}
+                >
                   <TableCell className="font-medium">{item.name}</TableCell>
                   <TableCell className="text-muted-foreground">{item.sku || "—"}</TableCell>
                   <TableCell>

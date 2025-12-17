@@ -11,17 +11,19 @@ import { Label } from '@/components/ui/label';
 import { Trash2, Plus } from 'lucide-react';
 import { SelectNative } from '@/components/ui/select-native';
 import { Separator } from '@/components/ui/separator';
+import { todayInTimeZone } from '@/lib/utils';
 
 export default function NewInvoicePage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
+  const timeZone = companySettings?.timeZone ?? 'Asia/Yangon';
   
   const [formData, setFormData] = useState({
     customerId: '',
-    invoiceDate: new Date().toISOString().split('T')[0],
+    invoiceDate: '',
     dueDate: '',
   });
 
@@ -35,6 +37,14 @@ export default function NewInvoicePage() {
       fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
     }
   }, [user?.companyId]);
+
+  useEffect(() => {
+    // Default date should follow company time zone (not UTC).
+    if (!formData.invoiceDate) {
+      setFormData((prev) => ({ ...prev, invoiceDate: todayInTimeZone(timeZone) }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeZone]);
 
   const handleItemChange = (index: number, itemId: string) => {
     const item = items.find(i => i.id.toString() === itemId);

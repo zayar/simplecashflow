@@ -6,6 +6,9 @@ import { companiesRoutes } from './modules/companies/companies.routes.js';
 import { ledgerRoutes } from './modules/ledger/ledger.routes.js';
 import { booksRoutes } from './modules/books/books.routes.js';
 import { pitiRoutes } from './modules/integrations/piti.routes.js';
+import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
+import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
+import { apAgingRoutes } from './modules/reports/apAging.routes.js';
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
 const fastify = Fastify({ logger: true });
 async function buildApp() {
@@ -34,6 +37,9 @@ async function buildApp() {
     await fastify.register(ledgerRoutes);
     await fastify.register(booksRoutes);
     await fastify.register(pitiRoutes);
+    await fastify.register(inventoryRoutes);
+    await fastify.register(purchaseBillsRoutes);
+    await fastify.register(apAgingRoutes);
     return fastify;
 }
 const start = async () => {

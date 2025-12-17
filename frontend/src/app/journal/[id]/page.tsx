@@ -11,6 +11,7 @@ import { ArrowLeft } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { formatDateInTimeZone } from '@/lib/utils';
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -19,9 +20,10 @@ function formatMoney(n: any) {
 }
 
 export default function JournalEntryDetailPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const params = useParams();
   const journalEntryId = params.id;
+  const tz = companySettings?.timeZone ?? 'Asia/Yangon';
 
   const [entry, setEntry] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -103,7 +105,7 @@ export default function JournalEntryDetailPage() {
         </Link>
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Journal entry #{entry.id}</h1>
-          <p className="text-sm text-muted-foreground">{new Date(entry.date).toLocaleDateString()}</p>
+          <p className="text-sm text-muted-foreground">{formatDateInTimeZone(entry.date, tz)}</p>
         </div>
       </div>
 

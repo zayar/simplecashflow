@@ -11,4 +11,12 @@ export declare function withLock<T>(redis: Redis, key: string, ttlMs: number, wo
  * - If Redis is up but lock is held, throws 409.
  */
 export declare function withLockBestEffort<T>(redis: Redis | undefined, key: string, ttlMs: number, work: () => Promise<T>): Promise<T>;
+/**
+ * Multi-lock helper built on `withLockBestEffort`.
+ *
+ * - Locks are acquired in deterministic order (sorted unique keys).
+ * - Uses best-effort semantics: if Redis is down, runs without locks.
+ * - If Redis is up and any lock is held, throws 409 (from `withLockBestEffort`).
+ */
+export declare function withLocksBestEffort<T>(redis: Redis | undefined, keys: string[], ttlMs: number, work: () => Promise<T>): Promise<T>;
 //# sourceMappingURL=locks.d.ts.map

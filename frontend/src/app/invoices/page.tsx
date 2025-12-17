@@ -6,6 +6,7 @@ import { CheckCircle, DollarSign, Eye, MoreHorizontal, Plus } from "lucide-react
 
 import { useAuth } from "@/contexts/auth-context"
 import { fetchApi } from "@/lib/api"
+import { formatDateInTimeZone } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -41,9 +42,10 @@ function statusBadge(status: string) {
 }
 
 export default function InvoicesPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [invoices, setInvoices] = useState<any[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const tz = companySettings?.timeZone ?? "Asia/Yangon"
 
   const makeIdempotencyKey = () => {
     // Browser-safe unique key (best effort).
@@ -121,7 +123,7 @@ export default function InvoicesPage() {
               {invoices.map((inv) => (
                 <TableRow key={inv.id}>
                   <TableCell className="text-muted-foreground">
-                    {new Date(inv.invoiceDate).toLocaleDateString()}
+                    {formatDateInTimeZone(inv.invoiceDate, tz)}
                   </TableCell>
                   <TableCell className="font-medium">{inv.invoiceNumber}</TableCell>
                   <TableCell>{inv.customerName}</TableCell>

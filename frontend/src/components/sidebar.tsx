@@ -14,6 +14,7 @@ import {
   Calculator,
   ReceiptText,
   Truck,
+  Settings,
 } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -36,7 +37,8 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     label: "Money",
     items: [
       { href: "/invoices", label: "Invoices", icon: FileText },
-      { href: "/expenses", label: "Bills", icon: ReceiptText },
+      { href: "/expenses", label: "Expenses", icon: ReceiptText },
+      { href: "/purchase-bills", label: "Purchase Bills", icon: ReceiptText },
       { href: "/banking", label: "Banking", icon: Landmark },
     ],
   },
@@ -45,11 +47,21 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     items: [
       { href: "/journal", label: "Journal", icon: BookOpen },
       { href: "/accounts", label: "Accounts", icon: Calculator },
+      { href: "/settings", label: "Company Profile", icon: Settings },
     ],
   },
   {
     label: "Reports",
     items: [{ href: "/reports", label: "Reports", icon: BarChart }],
+  },
+  {
+    label: "Inventory",
+    items: [
+      { href: "/inventory/summary", label: "Inventory Summary", icon: Package },
+      { href: "/inventory/opening-balance", label: "Opening Balance", icon: Package },
+      { href: "/inventory/adjustments", label: "Adjust Stock", icon: Package },
+      { href: "/inventory/warehouses", label: "Warehouses", icon: Package },
+    ],
   },
   {
     label: "Contacts",

@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ArrowLeft, FileText, Calendar, Building2, BookOpen, DollarSign } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { formatDateInTimeZone } from '@/lib/utils';
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -17,11 +18,12 @@ function formatMoney(n: any) {
   return num.toLocaleString();
 }
 
-export default function BillDetailPage() {
-  const { user } = useAuth();
+export default function ExpenseDetailPage() {
+  const { user, companySettings } = useAuth();
   const router = useRouter();
   const params = useParams();
   const billId = params.id;
+  const tz = companySettings?.timeZone ?? 'Asia/Yangon';
 
   const [bill, setBill] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -52,7 +54,7 @@ export default function BillDetailPage() {
             <Button variant="ghost" size="icon"><ArrowLeft className="h-4 w-4" /></Button>
           </Link>
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Bill</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Expense</h1>
             <p className="text-sm text-muted-foreground">Loading…</p>
           </div>
         </div>
@@ -69,11 +71,11 @@ export default function BillDetailPage() {
             <Button variant="ghost" size="icon"><ArrowLeft className="h-4 w-4" /></Button>
           </Link>
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Bill</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Expense</h1>
             <p className="text-sm text-muted-foreground">Not found</p>
           </div>
         </div>
-        <Card className="shadow-sm"><CardContent className="pt-6"><p className="text-center text-muted-foreground">Bill not found.</p></CardContent></Card>
+        <Card className="shadow-sm"><CardContent className="pt-6"><p className="text-center text-muted-foreground">Expense not found.</p></CardContent></Card>
       </div>
     );
   }
@@ -86,13 +88,13 @@ export default function BillDetailPage() {
             <Button variant="ghost" size="icon"><ArrowLeft className="h-4 w-4" /></Button>
           </Link>
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Bill</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Expense</h1>
             <div className="text-sm text-muted-foreground">{bill.expenseNumber}</div>
           </div>
         </div>
         {(bill.status === 'POSTED' || bill.status === 'PARTIAL') && (
           <Link href={`/expenses/${bill.id}/payment`}>
-            <Button>Pay Bill</Button>
+            <Button>Pay Expense</Button>
           </Link>
         )}
       </div>
@@ -106,13 +108,13 @@ export default function BillDetailPage() {
             <div className="flex items-center gap-2 text-sm text-muted-foreground"><Building2 className="h-4 w-4" /> Vendor</div>
             <div className="font-medium">{bill.vendor?.name ?? '—'}</div>
 
-            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground"><Calendar className="h-4 w-4" /> Bill Date</div>
-            <div>{new Date(bill.expenseDate).toLocaleDateString()}</div>
+            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground"><Calendar className="h-4 w-4" /> Expense Date</div>
+            <div>{formatDateInTimeZone(bill.expenseDate, tz)}</div>
 
             {bill.dueDate && (
               <>
                 <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground"><Calendar className="h-4 w-4" /> Due Date</div>
-                <div>{new Date(bill.dueDate).toLocaleDateString()}</div>
+                <div>{formatDateInTimeZone(bill.dueDate, tz)}</div>
               </>
             )}
 
@@ -159,7 +161,7 @@ export default function BillDetailPage() {
                   <TableBody>
                     {bill.payments.map((p: any) => (
                       <TableRow key={p.id}>
-                        <TableCell className="text-muted-foreground">{new Date(p.paymentDate).toLocaleDateString()}</TableCell>
+                        <TableCell className="text-muted-foreground">{formatDateInTimeZone(p.paymentDate, tz)}</TableCell>
                         <TableCell className="font-medium">{p.bankAccount?.name ?? '—'}</TableCell>
                         <TableCell className="text-right font-medium tabular-nums">{formatMoney(p.amount)}</TableCell>
                       </TableRow>
@@ -178,7 +180,7 @@ export default function BillDetailPage() {
         </CardHeader>
         <CardContent className="space-y-8">
           {!showJournal && (
-            <div className="text-sm text-muted-foreground">This bill is <b>DRAFT</b>. No journal entry yet. Post the bill first.</div>
+            <div className="text-sm text-muted-foreground">This expense is <b>DRAFT</b>. No journal entry yet. Post the expense first.</div>
           )}
 
           {showJournal && journals.length === 0 && (
@@ -189,13 +191,13 @@ export default function BillDetailPage() {
             const totalDebit = (je.lines ?? []).reduce((sum: number, l: any) => sum + Number(l.debit ?? 0), 0);
             const totalCredit = (je.lines ?? []).reduce((sum: number, l: any) => sum + Number(l.credit ?? 0), 0);
 
-            const label = je.kind === 'BILL_POSTED' ? 'Bill Posted' : 'Bill Payment';
+            const label = je.kind === 'BILL_POSTED' ? 'Expense Posted' : 'Expense Payment';
 
             return (
               <div key={`${je.kind}-${je.journalEntryId}`}>
                 <div className="mb-2 flex items-baseline gap-2">
                   <h3 className="text-lg font-semibold text-slate-900">{label}</h3>
-                  <span className="text-sm text-muted-foreground">JE #{je.journalEntryId} • {new Date(je.date).toLocaleDateString()}</span>
+                  <span className="text-sm text-muted-foreground">JE #{je.journalEntryId} • {formatDateInTimeZone(je.date, tz)}</span>
                 </div>
                 <div className="rounded-md border bg-white">
                   <table className="w-full text-sm">

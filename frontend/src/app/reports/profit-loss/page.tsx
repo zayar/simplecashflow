@@ -9,19 +9,30 @@ import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Loader2 } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { formatDateInputInTimeZone, todayInTimeZone } from '@/lib/utils';
 
 export default function ProfitLossPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [report, setReport] = useState<ProfitLossReport | null>(null);
   const [loading, setLoading] = useState(false);
   
-  // Default to current month
-  const now = new Date();
-  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
 
-  const [from, setFrom] = useState(firstDay);
-  const [to, setTo] = useState(lastDay);
+  useEffect(() => {
+    const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+    if (from && to) return;
+    const today = todayInTimeZone(tz);
+    const parts = today.split('-').map((x) => Number(x));
+    const y = parts[0];
+    const m = parts[1]; // 1-12
+    if (!y || !m) return;
+    const first = formatDateInputInTimeZone(new Date(Date.UTC(y, m - 1, 1)), tz);
+    const last = formatDateInputInTimeZone(new Date(Date.UTC(y, m, 0)), tz);
+    if (!from) setFrom(first);
+    if (!to) setTo(last);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companySettings?.timeZone]);
 
   async function fetchReport() {
     if (!user?.companyId) return;

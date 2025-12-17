@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
-import { BarChart, Scale, PieChart, Waves, CalendarCheck2 } from 'lucide-react';
+import { BarChart, Scale, PieChart, Waves, CalendarCheck2, Package, TrendingUp, ShoppingCart, Users } from 'lucide-react';
 
 const reports = [
   {
@@ -34,6 +34,30 @@ const reports = [
     description: 'Close income & expense into Retained Earnings (month-end / year-end).',
     href: '/reports/period-close',
     icon: CalendarCheck2,
+  },
+  {
+    title: 'Inventory Valuation (As of)',
+    description: 'Inventory quantity and value as of a specific date, based on recorded stock moves.',
+    href: '/reports/inventory-valuation',
+    icon: Package,
+  },
+  {
+    title: 'Inventory Movement',
+    description: 'In/Out quantities and values by item and location for a date range.',
+    href: '/reports/inventory-movement',
+    icon: TrendingUp,
+  },
+  {
+    title: 'COGS by Item',
+    description: 'Cost of goods sold by item from posted sales (WAC-based).',
+    href: '/reports/cogs-by-item',
+    icon: ShoppingCart,
+  },
+  {
+    title: 'AP Aging by Vendor',
+    description: 'Outstanding payables grouped by vendor and aging buckets.',
+    href: '/reports/ap-aging',
+    icon: Users,
   },
 ];
 

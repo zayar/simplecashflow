@@ -52,6 +52,15 @@ export async function authRoutes(fastify: FastifyInstance) {
         include: { accounts: true },
       });
 
+      // Create default warehouse (Inventory V1)
+      const warehouse = await tx.warehouse.create({
+        data: {
+          companyId: company.id,
+          name: 'Main Warehouse',
+          isDefault: true,
+        },
+      });
+
       // Find and link Accounts Receivable
       const arAccount = company.accounts.find(a => a.name === "Accounts Receivable");
       if (arAccount) {
@@ -69,6 +78,21 @@ export async function authRoutes(fastify: FastifyInstance) {
           data: { accountsPayableAccountId: apAccount.id },
         });
       }
+
+      // Link Inventory / COGS / Opening Balance Equity defaults (Inventory V1)
+      const inventoryAccount = company.accounts.find((a) => a.code === '1300' || a.name === 'Inventory');
+      const cogsAccount = company.accounts.find((a) => a.code === '5001' || a.name === 'Cost of Goods Sold');
+      const openingEquity = company.accounts.find((a) => a.code === '3050' || a.name === 'Opening Balance Equity');
+
+      await tx.company.update({
+        where: { id: company.id },
+        data: {
+          defaultWarehouseId: warehouse.id,
+          ...(inventoryAccount ? { inventoryAssetAccountId: inventoryAccount.id } : {}),
+          ...(cogsAccount ? { cogsAccountId: cogsAccount.id } : {}),
+          ...(openingEquity ? { openingBalanceEquityAccountId: openingEquity.id } : {}),
+        },
+      });
 
       // Create default BankingAccount for Cash (so "Deposit To" can be restricted safely).
       const cashAccount = company.accounts.find(

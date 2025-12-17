@@ -9,21 +9,30 @@ import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
+import { formatDateInputInTimeZone, todayInTimeZone } from '@/lib/utils';
 
 export default function PeriodClosePage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<PeriodCloseResult | null>(null);
 
-  const now = new Date();
-  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
-  const [from, setFrom] = useState(firstDay);
-  const [to, setTo] = useState(lastDay);
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
 
   useEffect(() => {
-    // defaulting is fine
-  }, []);
+    const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+    if (from && to) return;
+    const today = todayInTimeZone(tz);
+    const parts = today.split('-').map((x) => Number(x));
+    const y = parts[0];
+    const m = parts[1]; // 1-12
+    if (!y || !m) return;
+    const first = formatDateInputInTimeZone(new Date(Date.UTC(y, m - 1, 1)), tz);
+    const last = formatDateInputInTimeZone(new Date(Date.UTC(y, m, 0)), tz);
+    if (!from) setFrom(first);
+    if (!to) setTo(last);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companySettings?.timeZone]);
 
   async function runClose() {
     if (!user?.companyId) return;

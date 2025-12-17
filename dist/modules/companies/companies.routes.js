@@ -29,6 +29,10 @@ export async function companiesRoutes(fastify) {
             include: {
                 accountsReceivableAccount: true,
                 accountsPayableAccount: true,
+                inventoryAssetAccount: true,
+                cogsAccount: true,
+                openingBalanceEquityAccount: true,
+                defaultWarehouse: true,
             },
         });
         if (!company) {
@@ -56,14 +60,56 @@ export async function companiesRoutes(fastify) {
                     type: company.accountsPayableAccount.type,
                 }
                 : null,
+            inventoryAssetAccountId: company.inventoryAssetAccountId ?? null,
+            inventoryAssetAccount: company.inventoryAssetAccount
+                ? {
+                    id: company.inventoryAssetAccount.id,
+                    code: company.inventoryAssetAccount.code,
+                    name: company.inventoryAssetAccount.name,
+                    type: company.inventoryAssetAccount.type,
+                }
+                : null,
+            cogsAccountId: company.cogsAccountId ?? null,
+            cogsAccount: company.cogsAccount
+                ? {
+                    id: company.cogsAccount.id,
+                    code: company.cogsAccount.code,
+                    name: company.cogsAccount.name,
+                    type: company.cogsAccount.type,
+                }
+                : null,
+            openingBalanceEquityAccountId: company.openingBalanceEquityAccountId ?? null,
+            openingBalanceEquityAccount: company.openingBalanceEquityAccount
+                ? {
+                    id: company.openingBalanceEquityAccount.id,
+                    code: company.openingBalanceEquityAccount.code,
+                    name: company.openingBalanceEquityAccount.name,
+                    type: company.openingBalanceEquityAccount.type,
+                }
+                : null,
+            defaultWarehouseId: company.defaultWarehouseId ?? null,
+            defaultWarehouse: company.defaultWarehouse
+                ? {
+                    id: company.defaultWarehouse.id,
+                    name: company.defaultWarehouse.name,
+                    isDefault: company.defaultWarehouse.isDefault,
+                }
+                : null,
         };
     });
     fastify.put('/companies/:companyId/settings', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
         const body = request.body;
-        if (!('accountsReceivableAccountId' in body) && !('accountsPayableAccountId' in body)) {
+        if (!('accountsReceivableAccountId' in body) &&
+            !('accountsPayableAccountId' in body) &&
+            !('inventoryAssetAccountId' in body) &&
+            !('cogsAccountId' in body) &&
+            !('openingBalanceEquityAccountId' in body) &&
+            !('defaultWarehouseId' in body)) {
             reply.status(400);
-            return { error: 'accountsReceivableAccountId and/or accountsPayableAccountId is required (number or null)' };
+            return {
+                error: 'at least one setting field is required (accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultWarehouseId)',
+            };
         }
         const company = await prisma.company.findUnique({ where: { id: companyId } });
         if (!company) {
@@ -98,6 +144,60 @@ export async function companiesRoutes(fastify) {
                 return { error: 'accountsPayableAccountId must be a LIABILITY account in this company' };
             }
         }
+        if (body.inventoryAssetAccountId !== undefined && body.inventoryAssetAccountId !== null) {
+            const invId = body.inventoryAssetAccountId;
+            if (!invId || Number.isNaN(Number(invId))) {
+                reply.status(400);
+                return { error: 'inventoryAssetAccountId must be a valid number or null' };
+            }
+            const invAcc = await prisma.account.findFirst({
+                where: { id: invId, companyId, type: AccountType.ASSET },
+            });
+            if (!invAcc) {
+                reply.status(400);
+                return { error: 'inventoryAssetAccountId must be an ASSET account in this company' };
+            }
+        }
+        if (body.cogsAccountId !== undefined && body.cogsAccountId !== null) {
+            const cogsId = body.cogsAccountId;
+            if (!cogsId || Number.isNaN(Number(cogsId))) {
+                reply.status(400);
+                return { error: 'cogsAccountId must be a valid number or null' };
+            }
+            const cogsAcc = await prisma.account.findFirst({
+                where: { id: cogsId, companyId, type: AccountType.EXPENSE },
+            });
+            if (!cogsAcc) {
+                reply.status(400);
+                return { error: 'cogsAccountId must be an EXPENSE account in this company' };
+            }
+        }
+        if (body.openingBalanceEquityAccountId !== undefined && body.openingBalanceEquityAccountId !== null) {
+            const eqId = body.openingBalanceEquityAccountId;
+            if (!eqId || Number.isNaN(Number(eqId))) {
+                reply.status(400);
+                return { error: 'openingBalanceEquityAccountId must be a valid number or null' };
+            }
+            const eqAcc = await prisma.account.findFirst({
+                where: { id: eqId, companyId, type: AccountType.EQUITY },
+            });
+            if (!eqAcc) {
+                reply.status(400);
+                return { error: 'openingBalanceEquityAccountId must be an EQUITY account in this company' };
+            }
+        }
+        if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
+            const whId = body.defaultWarehouseId;
+            if (!whId || Number.isNaN(Number(whId))) {
+                reply.status(400);
+                return { error: 'defaultWarehouseId must be a valid number or null' };
+            }
+            const wh = await prisma.warehouse.findFirst({ where: { id: whId, companyId } });
+            if (!wh) {
+                reply.status(400);
+                return { error: 'defaultWarehouseId must be a warehouse in this company' };
+            }
+        }
         const updated = await prisma.company.update({
             where: { id: companyId },
             data: {
@@ -107,10 +207,22 @@ export async function companiesRoutes(fastify) {
                 ...(body.accountsPayableAccountId !== undefined
                     ? { accountsPayableAccountId: body.accountsPayableAccountId }
                     : {}),
+                ...(body.inventoryAssetAccountId !== undefined
+                    ? { inventoryAssetAccountId: body.inventoryAssetAccountId }
+                    : {}),
+                ...(body.cogsAccountId !== undefined ? { cogsAccountId: body.cogsAccountId } : {}),
+                ...(body.openingBalanceEquityAccountId !== undefined
+                    ? { openingBalanceEquityAccountId: body.openingBalanceEquityAccountId }
+                    : {}),
+                ...(body.defaultWarehouseId !== undefined ? { defaultWarehouseId: body.defaultWarehouseId } : {}),
             },
             include: {
                 accountsReceivableAccount: true,
                 accountsPayableAccount: true,
+                inventoryAssetAccount: true,
+                cogsAccount: true,
+                openingBalanceEquityAccount: true,
+                defaultWarehouse: true,
             },
         });
         return {
@@ -132,6 +244,41 @@ export async function companiesRoutes(fastify) {
                     code: updated.accountsPayableAccount.code,
                     name: updated.accountsPayableAccount.name,
                     type: updated.accountsPayableAccount.type,
+                }
+                : null,
+            inventoryAssetAccountId: updated.inventoryAssetAccountId ?? null,
+            inventoryAssetAccount: updated.inventoryAssetAccount
+                ? {
+                    id: updated.inventoryAssetAccount.id,
+                    code: updated.inventoryAssetAccount.code,
+                    name: updated.inventoryAssetAccount.name,
+                    type: updated.inventoryAssetAccount.type,
+                }
+                : null,
+            cogsAccountId: updated.cogsAccountId ?? null,
+            cogsAccount: updated.cogsAccount
+                ? {
+                    id: updated.cogsAccount.id,
+                    code: updated.cogsAccount.code,
+                    name: updated.cogsAccount.name,
+                    type: updated.cogsAccount.type,
+                }
+                : null,
+            openingBalanceEquityAccountId: updated.openingBalanceEquityAccountId ?? null,
+            openingBalanceEquityAccount: updated.openingBalanceEquityAccount
+                ? {
+                    id: updated.openingBalanceEquityAccount.id,
+                    code: updated.openingBalanceEquityAccount.code,
+                    name: updated.openingBalanceEquityAccount.name,
+                    type: updated.openingBalanceEquityAccount.type,
+                }
+                : null,
+            defaultWarehouseId: updated.defaultWarehouseId ?? null,
+            defaultWarehouse: updated.defaultWarehouse
+                ? {
+                    id: updated.defaultWarehouse.id,
+                    name: updated.defaultWarehouse.name,
+                    isDefault: updated.defaultWarehouse.isDefault,
                 }
                 : null,
         };

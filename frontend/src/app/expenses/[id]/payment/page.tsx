@@ -11,19 +11,22 @@ import { Label } from '@/components/ui/label';
 import { ArrowLeft, DollarSign, Calendar, FileText } from 'lucide-react';
 import Link from 'next/link';
 import { SelectNative } from '@/components/ui/select-native';
+import { todayInTimeZone } from '@/lib/utils';
+import { formatDateInTimeZone } from '@/lib/utils';
 
-export default function PayBillPage() {
-  const { user } = useAuth();
+export default function PayExpensePage() {
+  const { user, companySettings } = useAuth();
   const router = useRouter();
   const params = useParams();
   const billId = params.id;
+  const tz = companySettings?.timeZone ?? 'Asia/Yangon';
 
   const [loading, setLoading] = useState(false);
   const [bill, setBill] = useState<any>(null);
   const [depositAccounts, setDepositAccounts] = useState<any[]>([]);
 
   const [form, setForm] = useState({
-    paymentDate: new Date().toISOString().split('T')[0],
+    paymentDate: '',
     amount: '',
     bankAccountId: '',
   });
@@ -41,7 +44,7 @@ export default function PayBillPage() {
       .then(setBill)
       .catch((err) => {
         console.error(err);
-        alert('Failed to load bill details');
+        alert('Failed to load expense details');
         router.push('/expenses');
       });
 
@@ -49,6 +52,14 @@ export default function PayBillPage() {
       .then(setDepositAccounts)
       .catch(console.error);
   }, [user?.companyId, billId, router]);
+
+  useEffect(() => {
+    const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+    if (!form.paymentDate) {
+      setForm((prev) => ({ ...prev, paymentDate: todayInTimeZone(tz) }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companySettings?.timeZone]);
 
   useEffect(() => {
     if (bill && bill.remainingBalance > 0 && !form.amount) {
@@ -106,13 +117,13 @@ export default function PayBillPage() {
             </Button>
           </Link>
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Pay bill</h1>
-            <p className="text-sm text-muted-foreground">Loading bill details…</p>
+            <h1 className="text-2xl font-semibold tracking-tight">Pay expense</h1>
+            <p className="text-sm text-muted-foreground">Loading expense details…</p>
           </div>
         </div>
         <Card className="shadow-sm">
           <CardContent className="pt-6">
-            <p className="text-center text-muted-foreground">Loading bill details...</p>
+            <p className="text-center text-muted-foreground">Loading expense details...</p>
           </CardContent>
         </Card>
       </div>
@@ -131,7 +142,7 @@ export default function PayBillPage() {
           </Button>
         </Link>
         <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Pay bill</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Pay expense</h1>
           <p className="text-sm text-muted-foreground">{bill.expenseNumber}</p>
         </div>
       </div>
@@ -140,12 +151,12 @@ export default function PayBillPage() {
         <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <FileText className="h-5 w-5" /> Bill Details
+              <FileText className="h-5 w-5" /> Expense Details
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
-              <div className="text-sm text-muted-foreground">Bill Number</div>
+              <div className="text-sm text-muted-foreground">Expense Number</div>
               <div className="font-semibold">{bill.expenseNumber}</div>
             </div>
             <div>
@@ -153,8 +164,8 @@ export default function PayBillPage() {
               <div className="font-medium">{bill.vendor?.name ?? '—'}</div>
             </div>
             <div>
-              <div className="text-sm text-muted-foreground">Bill Date</div>
-              <div>{new Date(bill.expenseDate).toLocaleDateString()}</div>
+              <div className="text-sm text-muted-foreground">Expense Date</div>
+              <div>{formatDateInTimeZone(bill.expenseDate, tz)}</div>
             </div>
             <div className="pt-4 border-t space-y-2">
               <div className="flex justify-between">
@@ -185,7 +196,7 @@ export default function PayBillPage() {
             {!canPay && (
               <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-md">
                 <p className="text-sm text-yellow-800">
-                  {bill.status === 'DRAFT' ? 'Post the bill before paying.' : 'This bill cannot be paid.'}
+                  {bill.status === 'DRAFT' ? 'Post the expense before paying.' : 'This expense cannot be paid.'}
                 </p>
               </div>
             )}
@@ -242,7 +253,7 @@ export default function PayBillPage() {
                   Cancel
                 </Button>
                 <Button type="submit" disabled={loading || !canPay || isFullyPaid || !form.bankAccountId}>
-                  {loading ? 'Paying...' : 'Pay Bill'}
+                  {loading ? 'Paying...' : 'Pay Expense'}
                 </Button>
               </div>
             </form>

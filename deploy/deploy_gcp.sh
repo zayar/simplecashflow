@@ -40,6 +40,8 @@ echo "Deploying from root: $ROOT_DIR"
 cd "$ROOT_DIR"
 
 gcloud builds submit --config deploy/cloudbuild.api.yaml .
+# Frontend is a separate Cloud Run service. Build it too so UI updates are deployed.
+gcloud builds submit --config deploy/cloudbuild.frontend.yaml .
 #gcloud builds submit --config deploy/cloudbuild.worker.yaml .
 gcloud builds submit --config deploy/cloudbuild.publisher.yaml .
 # NOTE: uncomment the line above if you want to rebuild worker every run.
@@ -149,6 +151,14 @@ gcloud run deploy cashflow-publisher \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest" \
   --service-account "$RUNTIME_SA_EMAIL" \
   --no-allow-unauthenticated
+
+echo "Deploying cashflow-frontend..."
+# NOTE: Frontend bakes NEXT_PUBLIC_API_URL at build-time (see frontend/Dockerfile).
+# That value is configured in deploy/cloudbuild.frontend.yaml substitutions.
+gcloud run deploy cashflow-frontend \
+  --image "gcr.io/${PROJECT_ID}/cashflow-frontend" \
+  --region "$REGION" \
+  --allow-unauthenticated
 
 # ---- Pub/Sub ordering (Recreate to enable) ----
 echo "Configuring Pub/Sub subscription ${WORKER_SUBSCRIPTION}..."

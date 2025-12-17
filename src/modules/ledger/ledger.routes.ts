@@ -10,7 +10,7 @@ import { enforceCompanyScope, forbidClientProvidedCompanyId, requireCompanyIdPar
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { getRedis } from '../../infrastructure/redis.js';
 import { withLockBestEffort } from '../../infrastructure/locks.js';
-import { normalizeToDay } from '../../utils/date.js';
+import { normalizeToDay, parseDateInput } from '../../utils/date.js';
 
 export async function ledgerRoutes(fastify: FastifyInstance) {
   // All ledger endpoints are tenant-scoped and must be authenticated.
@@ -129,7 +129,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
 
     // Never trust companyId from client. We derive it from JWT (and forbid mismatches).
     const companyId = forbidClientProvidedCompanyId(request, reply, body.companyId);
-    const date = body.date ? new Date(body.date) : new Date();
+    const date = parseDateInput(body.date) ?? new Date();
 
     // Prepare event data
     const eventId = randomUUID();
@@ -254,7 +254,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       }
 
       const body = (request.body ?? {}) as { reason?: string; date?: string };
-      const reversalDate = body.date ? new Date(body.date) : new Date();
+      const reversalDate = parseDateInput(body.date) ?? new Date();
       if (body.date && isNaN(reversalDate.getTime())) {
         reply.status(400);
         return { error: 'invalid date (must be ISO string)' };

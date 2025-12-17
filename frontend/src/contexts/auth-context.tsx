@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState } from 'react';
 import Cookies from 'js-cookie';
 import { useRouter } from 'next/navigation';
+import { fetchApi } from '@/lib/api';
 // import { jwtDecode } from 'jwt-decode'; // Optional: to decode token client-side
 
 interface User {
@@ -12,9 +13,20 @@ interface User {
   companyId: number;
 }
 
+export type CompanySettings = {
+  companyId: number;
+  name: string;
+  baseCurrency: string | null;
+  timeZone: string | null;
+  fiscalYearStartMonth: number;
+  baseCurrencyLocked: boolean;
+};
+
 interface AuthContextType {
   user: User | null;
   token: string | null;
+  companySettings: CompanySettings | null;
+  isCompanySettingsLoading: boolean;
   login: (token: string, user: User) => void;
   logout: () => void;
   isLoading: boolean;
@@ -26,6 +38,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [companySettings, setCompanySettings] = useState<CompanySettings | null>(null);
+  const [isCompanySettingsLoading, setIsCompanySettingsLoading] = useState(false);
   const router = useRouter();
 
   useEffect(() => {
@@ -40,6 +54,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIsLoading(false);
   }, []);
 
+  useEffect(() => {
+    if (!user?.companyId || !token) {
+      setCompanySettings(null);
+      setIsCompanySettingsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsCompanySettingsLoading(true);
+    fetchApi(`/companies/${user.companyId}/settings`)
+      .then((s: CompanySettings) => {
+        if (cancelled) return;
+        setCompanySettings(s);
+      })
+      .catch((err) => {
+        console.error(err);
+        if (cancelled) return;
+        setCompanySettings(null);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setIsCompanySettingsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, token]);
+
   const login = (newToken: string, newUser: User) => {
     Cookies.set('token', newToken, { expires: 7 }); // 7 days
     Cookies.set('user', JSON.stringify(newUser), { expires: 7 });
@@ -53,11 +96,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     Cookies.remove('user');
     setToken(null);
     setUser(null);
+    setCompanySettings(null);
+    setIsCompanySettingsLoading(false);
     router.push('/login');
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, login, logout, isLoading }}>
+    <AuthContext.Provider
+      value={{ user, token, companySettings, isCompanySettingsLoading, login, logout, isLoading }}
+    >
       {children}
     </AuthContext.Provider>
   );

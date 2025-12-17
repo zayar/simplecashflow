@@ -9,7 +9,7 @@ import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { publishDomainEvent } from '../../infrastructure/pubsub.js';
 import { markEventPublished } from '../../infrastructure/events.js';
-import { isoNow } from '../../utils/date.js';
+import { isoNow, parseDateInput } from '../../utils/date.js';
 import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureWarehouse } from './stock.service.js';
 
 function d2(n: number) {
@@ -76,7 +76,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const occurredAt = isoNow();
     const correlationId = randomUUID();
-    const date = body.date ? new Date(body.date) : new Date();
+    const date = parseDateInput(body.date) ?? new Date();
     if (body.date && isNaN(date.getTime())) {
       reply.status(400);
       return { error: 'invalid date' };
@@ -239,7 +239,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const occurredAt = isoNow();
     const correlationId = randomUUID();
-    const date = body.date ? new Date(body.date) : new Date();
+    const date = parseDateInput(body.date) ?? new Date();
     if (body.date && isNaN(date.getTime())) {
       reply.status(400);
       return { error: 'invalid date' };

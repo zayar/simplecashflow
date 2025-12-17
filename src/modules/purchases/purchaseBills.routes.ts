@@ -9,7 +9,7 @@ import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { publishDomainEvent } from '../../infrastructure/pubsub.js';
 import { markEventPublished } from '../../infrastructure/events.js';
-import { isoNow } from '../../utils/date.js';
+import { isoNow, parseDateInput } from '../../utils/date.js';
 import { ensureInventoryCompanyDefaults, ensureInventoryItem } from '../inventory/stock.service.js';
 import { applyStockMoveWac } from '../inventory/stock.service.js';
 import { toMoneyDecimal } from '../../utils/money.js';
@@ -63,8 +63,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       return { error: 'lines is required' };
     }
 
-    const billDate = body.billDate ? new Date(body.billDate) : new Date();
-    const dueDate = body.dueDate ? new Date(body.dueDate) : null;
+    const billDate = parseDateInput(body.billDate) ?? new Date();
+    const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
     if (body.billDate && isNaN(billDate.getTime())) {
       reply.status(400);
       return { error: 'invalid billDate' };
@@ -524,7 +524,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               throw Object.assign(new Error('cannot pay from a credit card account'), { statusCode: 400 });
             }
 
-            const paymentDate = body.paymentDate ? new Date(body.paymentDate) : new Date();
+            const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
             if (body.paymentDate && isNaN(paymentDate.getTime())) {
               throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
             }

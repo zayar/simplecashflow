@@ -25,14 +25,17 @@ function pageTitleFromPath(pathname: string) {
   if (pathname === "/") return "Dashboard"
   const map: Record<string, string> = {
     "/invoices": "Invoices",
-    "/expenses": "Bills",
+    "/expenses": "Expenses",
     "/customers": "Customers",
     "/vendors": "Vendors",
     "/items": "Items",
     "/banking": "Banking",
     "/journal": "Journal",
     "/accounts": "Chart of Accounts",
+    "/settings": "Company Profile",
     "/reports": "Reports",
+    "/inventory": "Inventory",
+    "/purchase-bills": "Purchase Bills",
   }
   // Handle nested pages
   for (const [prefix, title] of Object.entries(map)) {

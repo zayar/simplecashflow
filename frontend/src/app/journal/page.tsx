@@ -6,6 +6,7 @@ import { ArrowRight } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
 import { fetchApi } from "@/lib/api"
+import { formatDateInTimeZone } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -26,9 +27,10 @@ function formatMoney(n: any) {
 }
 
 export default function JournalPage() {
-  const { user } = useAuth();
+  const { user, companySettings } = useAuth();
   const [entries, setEntries] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const tz = companySettings?.timeZone ?? "Asia/Yangon"
 
   useEffect(() => {
     if (!user?.companyId) return;
@@ -84,7 +86,7 @@ export default function JournalPage() {
                 {entries.map((e) => (
                   <TableRow key={e.id}>
                     <TableCell className="text-muted-foreground">
-                      {new Date(e.date).toLocaleDateString()}
+                      {formatDateInTimeZone(e.date, tz)}
                     </TableCell>
                     <TableCell>
                       <div className="font-medium">JE #{e.id}</div>

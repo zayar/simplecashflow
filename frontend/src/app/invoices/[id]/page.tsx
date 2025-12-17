@@ -34,11 +34,19 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
+import { formatDateInTimeZone } from "@/lib/utils"
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0)
   if (Number.isNaN(num)) return String(n ?? "")
   return num.toLocaleString(undefined, { maximumFractionDigits: 2 })
+}
+
+function formatMoneyWithCurrency(n: any, currency?: string) {
+  const num = Number(n ?? 0)
+  if (Number.isNaN(num)) return String(n ?? "")
+  const cur = (currency ?? "").trim()
+  return cur ? `${cur}${formatMoney(num)}` : formatMoney(num)
 }
 
 function statusBadge(status: string) {
@@ -57,9 +65,10 @@ function statusBadge(status: string) {
 }
 
 export default function InvoiceDetailPage() {
-  const { user } = useAuth()
+  const { user, companySettings } = useAuth()
   const params = useParams()
   const invoiceId = params.id
+  const tz = companySettings?.timeZone ?? "Asia/Yangon"
 
   const [invoice, setInvoice] = useState<any>(null)
   const [loading, setLoading] = useState(true)
@@ -191,6 +200,12 @@ export default function InvoiceDetailPage() {
   }
 
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
+  const invoiceLines = (invoice.lines ?? []) as any[]
+  const linesSubtotal = invoiceLines.reduce((sum: number, l: any) => {
+    const qty = Number(l.quantity ?? 0)
+    const rate = Number(l.unitPrice ?? 0)
+    return sum + qty * rate
+  }, 0)
 
   return (
     <div className="space-y-6">
@@ -229,28 +244,34 @@ export default function InvoiceDetailPage() {
             <div className="grid gap-1">
               <div className="text-muted-foreground">Invoice date</div>
               <div className="font-medium">
-                {new Date(invoice.invoiceDate).toLocaleDateString()}
+                {formatDateInTimeZone(invoice.invoiceDate, tz)}
               </div>
             </div>
             {invoice.dueDate ? (
               <div className="grid gap-1">
                 <div className="text-muted-foreground">Due date</div>
-                <div className="font-medium">{new Date(invoice.dueDate).toLocaleDateString()}</div>
+                <div className="font-medium">{formatDateInTimeZone(invoice.dueDate, tz)}</div>
               </div>
             ) : null}
 
             <div className="rounded-md border bg-muted/20 p-4">
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Total</span>
-                <span className="font-semibold tabular-nums">{formatMoney(invoice.total)}</span>
+                <span className="font-semibold tabular-nums">
+                  {formatMoneyWithCurrency(invoice.total, invoice.currency)}
+                </span>
               </div>
               <div className="mt-2 flex items-center justify-between">
                 <span className="text-muted-foreground">Paid</span>
-                <span className="font-semibold tabular-nums">{formatMoney(invoice.totalPaid)}</span>
+                <span className="font-semibold tabular-nums">
+                  {formatMoneyWithCurrency(invoice.totalPaid, invoice.currency)}
+                </span>
               </div>
               <div className="mt-2 flex items-center justify-between">
                 <span className="text-muted-foreground">Remaining</span>
-                <span className="font-semibold tabular-nums">{formatMoney(invoice.remainingBalance)}</span>
+                <span className="font-semibold tabular-nums">
+                  {formatMoneyWithCurrency(invoice.remainingBalance, invoice.currency)}
+                </span>
               </div>
             </div>
           </CardContent>
@@ -284,7 +305,7 @@ export default function InvoiceDetailPage() {
                     return (
                       <TableRow key={p.id}>
                         <TableCell className="text-muted-foreground">
-                          {new Date(p.paymentDate).toLocaleDateString()}
+                          {formatDateInTimeZone(p.paymentDate, tz)}
                         </TableCell>
                         <TableCell className="font-medium tabular-nums">
                           {p.id}
@@ -300,7 +321,7 @@ export default function InvoiceDetailPage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-right font-medium tabular-nums">
-                          {formatMoney(p.amount)}
+                          {formatMoneyWithCurrency(p.amount, invoice.currency)}
                         </TableCell>
                         <TableCell className="text-right">
                           <DropdownMenu>
@@ -331,6 +352,83 @@ export default function InvoiceDetailPage() {
       </div>
 
       <Card className="shadow-sm">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-lg">Invoice lines</CardTitle>
+          <Badge variant="secondary">{invoiceLines.length}</Badge>
+        </CardHeader>
+        <CardContent className="pt-0">
+          {invoiceLines.length === 0 ? (
+            <div className="py-10 text-center text-sm text-muted-foreground">
+              No invoice lines found.
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[60px]">#</TableHead>
+                    <TableHead>Item &amp; Description</TableHead>
+                    <TableHead className="text-right w-[120px]">Qty</TableHead>
+                    <TableHead className="text-right w-[140px]">Rate</TableHead>
+                    <TableHead className="text-right w-[160px]">Amount</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {invoiceLines.map((l: any, idx: number) => {
+                    const qty = Number(l.quantity ?? 0)
+                    const rate = Number(l.unitPrice ?? 0)
+                    const amount = qty * rate
+                    const itemName = l.item?.name ?? l.description ?? "—"
+                    const description =
+                      l.item?.name && l.description && l.description !== l.item?.name
+                        ? l.description
+                        : l.item?.description ?? null
+                    return (
+                      <TableRow key={l.id ?? idx}>
+                        <TableCell className="text-muted-foreground">{idx + 1}</TableCell>
+                        <TableCell>
+                          <div className="font-medium">{itemName}</div>
+                          {description ? (
+                            <div className="mt-1 text-sm text-muted-foreground">{description}</div>
+                          ) : null}
+                        </TableCell>
+                        <TableCell className="text-right font-medium tabular-nums">
+                          {formatMoney(qty)}
+                        </TableCell>
+                        <TableCell className="text-right font-medium tabular-nums">
+                          {formatMoneyWithCurrency(rate, invoice.currency)}
+                        </TableCell>
+                        <TableCell className="text-right font-medium tabular-nums">
+                          {formatMoneyWithCurrency(amount, invoice.currency)}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+
+              <div className="flex justify-end">
+                <div className="w-full max-w-sm space-y-2 rounded-md border bg-muted/10 p-4 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">Sub total</span>
+                    <span className="font-medium tabular-nums">
+                      {formatMoneyWithCurrency(linesSubtotal, invoice.currency)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold">Total</span>
+                    <span className="font-semibold tabular-nums">
+                      {formatMoneyWithCurrency(invoice.total, invoice.currency)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="shadow-sm">
         <CardHeader>
           <CardTitle className="text-lg">Journal entries</CardTitle>
         </CardHeader>
@@ -359,7 +457,7 @@ export default function InvoiceDetailPage() {
               const typeLabel =
                 je.kind === "INVOICE_POSTED"
                   ? "Invoice posted"
-                  : je.kind === "PAYMENT"
+                  : je.kind === "PAYMENT" || je.kind === "PAYMENT_RECORDED"
                     ? "Payment received"
                     : je.kind === "PAYMENT_REVERSAL"
                       ? "Payment reversal"
@@ -371,7 +469,7 @@ export default function InvoiceDetailPage() {
                     <div className="space-y-0.5">
                       <div className="text-sm font-medium">{typeLabel}</div>
                       <div className="text-xs text-muted-foreground">
-                        JE #{je.journalEntryId} • {new Date(je.date).toLocaleDateString()}
+                        JE #{je.journalEntryId} • {formatDateInTimeZone(je.date, tz)}
                       </div>
                     </div>
                     <Badge variant="outline">Balanced</Badge>
@@ -428,7 +526,8 @@ export default function InvoiceDetailPage() {
           <DialogHeader>
             <DialogTitle>Refund payment</DialogTitle>
             <DialogDescription>
-              Payment #{refundPayment?.id} • Amount {formatMoney(refundPayment?.amount)}
+              Payment #{refundPayment?.id} • Amount{" "}
+              {formatMoneyWithCurrency(refundPayment?.amount, invoice?.currency)}
             </DialogDescription>
           </DialogHeader>
 
