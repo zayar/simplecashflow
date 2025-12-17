@@ -10,6 +10,25 @@ import {
 } from '@prisma/client';
 
 export async function authRoutes(fastify: FastifyInstance) {
+  const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '8h';
+
+  function validatePasswordPolicy(password: string) {
+    // Minimal policy to reduce credential stuffing / weak password risk.
+    // Adjust to your org policy as needed.
+    if (password.length < 8) {
+      throw Object.assign(new Error('password must be at least 8 characters'), { statusCode: 400 });
+    }
+    const hasLower = /[a-z]/.test(password);
+    const hasUpper = /[A-Z]/.test(password);
+    const hasDigit = /\d/.test(password);
+    if (!hasLower || !hasUpper || !hasDigit) {
+      throw Object.assign(
+        new Error('password must include at least 1 uppercase letter, 1 lowercase letter, and 1 number'),
+        { statusCode: 400 }
+      );
+    }
+  }
+
   fastify.post('/register', async (request, reply) => {
     const body = request.body as {
       email?: string;
@@ -21,6 +40,13 @@ export async function authRoutes(fastify: FastifyInstance) {
     if (!body.email || !body.password || !body.companyName) {
       reply.status(400);
       return { error: 'email, password, and companyName are required' };
+    }
+
+    try {
+      validatePasswordPolicy(body.password);
+    } catch (err: any) {
+      reply.status(err?.statusCode ?? 400);
+      return { error: err?.message ?? 'invalid password' };
     }
 
     const existingUser = await prisma.user.findUnique({
@@ -133,7 +159,7 @@ export async function authRoutes(fastify: FastifyInstance) {
       userId: result.user.id,
       email: result.user.email,
       companyId: result.company.id,
-    });
+    }, { expiresIn: JWT_EXPIRES_IN });
 
     return { token, user: { id: result.user.id, email: result.user.email, name: result.user.name, companyId: result.company.id } };
   });
@@ -168,7 +194,7 @@ export async function authRoutes(fastify: FastifyInstance) {
       userId: user.id,
       email: user.email,
       companyId: user.companyId,
-    });
+    }, { expiresIn: JWT_EXPIRES_IN });
 
     return { token, user: { id: user.id, email: user.email, name: user.name, companyId: user.companyId } };
   });

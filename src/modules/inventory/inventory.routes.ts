@@ -7,8 +7,6 @@ import { getRedis } from '../../infrastructure/redis.js';
 import { withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureWarehouse } from './stock.service.js';
 
@@ -19,6 +17,20 @@ function d2(n: number) {
 export async function inventoryRoutes(fastify: FastifyInstance) {
   fastify.addHook('preHandler', fastify.authenticate);
   const redis = getRedis();
+
+  async function resolveDefaultWarehouseId(companyId: number): Promise<number | null> {
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { defaultWarehouseId: true },
+    });
+    const fromCompany = company?.defaultWarehouseId ?? null;
+    if (fromCompany) return fromCompany;
+    const wh = await prisma.warehouse.findFirst({
+      where: { companyId, isDefault: true },
+      select: { id: true },
+    });
+    return wh?.id ?? null;
+  }
 
   // --- Warehouses ---
   fastify.get('/companies/:companyId/warehouses', async (request, reply) => {
@@ -84,7 +96,25 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
 
-    const lockKeys = body.lines.map((l) => `lock:stock:${companyId}:${warehouseIdHint ?? 'default'}:${l.itemId}`);
+    const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
+    const resolvedWarehouseId =
+      warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+
+    const lockKeys = body.lines.flatMap((l) => {
+      // Always lock by resolved numeric warehouseId when available to prevent races
+      // between "default warehouse" calls and explicit warehouseId calls.
+      const keys: string[] = [];
+      if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
+        keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
+        if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+          keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+        }
+      } else {
+        // Fallback: lock on default alias (also serializes callers while defaults are being bootstrapped).
+        keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+      }
+      return keys;
+    });
 
     const { replay, response: result } = await withLocksBestEffort(redis, lockKeys, 30_000, async () =>
       runIdempotentRequest(
@@ -190,23 +220,6 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       )
     );
 
-    if (!replay) {
-      const ok = await publishDomainEvent({
-        eventId: (result as any)._jeEventId,
-        eventType: 'journal.entry.created',
-        schemaVersion: 'v1',
-        occurredAt: (result as any)._occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId: (result as any)._correlationId,
-        aggregateType: 'JournalEntry',
-        aggregateId: String((result as any).journalEntryId),
-        source: 'cashflow-api',
-        payload: { journalEntryId: (result as any).journalEntryId, companyId },
-      });
-      if (ok) await markEventPublished((result as any)._jeEventId);
-    }
-
     return {
       warehouseId: (result as any).warehouseId,
       journalEntryId: (result as any).journalEntryId,
@@ -247,7 +260,22 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
 
-    const lockKeys = body.lines.map((l) => `lock:stock:${companyId}:${warehouseIdHint ?? 'default'}:${l.itemId}`);
+    const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
+    const resolvedWarehouseId =
+      warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+
+    const lockKeys = body.lines.flatMap((l) => {
+      const keys: string[] = [];
+      if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
+        keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
+        if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+          keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+        }
+      } else {
+        keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+      }
+      return keys;
+    });
 
     const { replay, response: result } = await withLocksBestEffort(redis, lockKeys, 30_000, async () =>
       runIdempotentRequest(
@@ -413,23 +441,6 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         redis
       )
     );
-
-    if (!replay) {
-      const ok = await publishDomainEvent({
-        eventId: (result as any)._jeEventId,
-        eventType: 'journal.entry.created',
-        schemaVersion: 'v1',
-        occurredAt: (result as any)._occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId: (result as any)._correlationId,
-        aggregateType: 'JournalEntry',
-        aggregateId: String((result as any).journalEntryId),
-        source: 'cashflow-api',
-        payload: { journalEntryId: (result as any).journalEntryId, companyId },
-      });
-      if (ok) await markEventPublished((result as any)._jeEventId);
-    }
 
     return {
       warehouseId: (result as any).warehouseId,

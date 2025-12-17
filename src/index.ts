@@ -10,7 +10,16 @@ import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
 import { apAgingRoutes } from './modules/reports/apAging.routes.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
+function requireEnv(name: string): string {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return String(v);
+}
+
+const JWT_SECRET = requireEnv('JWT_SECRET');
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '8h';
 
 const fastify = Fastify({ logger: true });
 
@@ -29,6 +38,71 @@ async function buildApp() {
 
   fastify.register(jwt as any, {
     secret: JWT_SECRET,
+    sign: {
+      // Default token expiration for all fastify.jwt.sign() calls unless overridden.
+      expiresIn: JWT_EXPIRES_IN,
+    },
+  });
+
+  // Basic rate limiting (no external deps). In production this provides a minimum
+  // safety net against brute-force + abusive traffic. For multi-instance/global
+  // limits, replace with a Redis-backed or gateway-level rate limiter.
+  const isProd = (process.env.NODE_ENV ?? '').toLowerCase() === 'production';
+  const disableRateLimit =
+    !isProd && (process.env.DISABLE_RATE_LIMIT ?? '').toLowerCase() === 'true';
+
+  const authWindowMs = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS ?? 60_000);
+  const authMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10);
+  const globalWindowMs = Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS ?? 60_000);
+  const globalMax = Number(process.env.GLOBAL_RATE_LIMIT_MAX ?? 300);
+
+  type Bucket = { windowStartMs: number; count: number };
+  const buckets = new Map<string, Bucket>();
+  let seen = 0;
+
+  function hit(key: string, max: number, windowMs: number, nowMs: number): boolean {
+    const prev = buckets.get(key);
+    if (!prev || nowMs - prev.windowStartMs >= windowMs) {
+      buckets.set(key, { windowStartMs: nowMs, count: 1 });
+      return true;
+    }
+    if (prev.count >= max) return false;
+    prev.count += 1;
+    return true;
+  }
+
+  fastify.addHook('onRequest', async (request, reply) => {
+    if (disableRateLimit) return;
+
+    const nowMs = Date.now();
+    const ip = (request.ip ?? request.socket?.remoteAddress ?? 'unknown').toString();
+    const path = (request.url ?? '').split('?')[0] ?? '';
+
+    // Stricter limits for auth endpoints
+    const isAuthEndpoint =
+      request.method === 'POST' && (path === '/login' || path === '/register');
+
+    const key = `${isAuthEndpoint ? 'auth' : 'global'}:${ip}`;
+    const ok = isAuthEndpoint
+      ? hit(key, authMax, authWindowMs, nowMs)
+      : hit(key, globalMax, globalWindowMs, nowMs);
+
+    if (!ok) {
+      reply.status(429).send({ error: 'Too Many Requests' });
+      return;
+    }
+
+    // Opportunistic pruning to avoid unbounded growth.
+    // Every ~1k requests, remove buckets idle for >2 windows.
+    seen += 1;
+    if (seen % 1000 === 0) {
+      const authIdle = authWindowMs * 2;
+      const globalIdle = globalWindowMs * 2;
+      for (const [k, b] of buckets.entries()) {
+        const idleLimit = k.startsWith('auth:') ? authIdle : globalIdle;
+        if (nowMs - b.windowStartMs >= idleLimit) buckets.delete(k);
+      }
+    }
   });
 
   // Decorate fastify with authenticate

@@ -19,11 +19,22 @@ type DomainEventEnvelope = DomainEventEnvelopeV1<any>;
 //
 // Local dev: set DISABLE_PUBSUB_OIDC_AUTH=true to bypass.
 async function verifyPubSubOidc(request: any, reply: any) {
-  if ((process.env.DISABLE_PUBSUB_OIDC_AUTH ?? '').toLowerCase() === 'true') return;
+  const isProd = (process.env.NODE_ENV ?? '').toLowerCase() === 'production';
+  const disable = (process.env.DISABLE_PUBSUB_OIDC_AUTH ?? '').toLowerCase() === 'true';
+
+  // Never allow bypass in production.
+  if (disable) {
+    if (isProd) {
+      reply.status(500).send({ error: 'DISABLE_PUBSUB_OIDC_AUTH is not allowed in production' });
+      return;
+    }
+    request.log.warn('Pub/Sub OIDC auth bypass enabled (dev only)');
+    return;
+  }
 
   const audience = process.env.PUBSUB_PUSH_AUDIENCE;
   const expectedEmail = process.env.PUBSUB_PUSH_SA_EMAIL;
-  const enforce = (process.env.ENFORCE_PUBSUB_OIDC_AUTH ?? '').toLowerCase() === 'true';
+  const enforce = isProd || (process.env.ENFORCE_PUBSUB_OIDC_AUTH ?? '').toLowerCase() === 'true';
 
   // If not configured, allow in dev but fail closed when ENFORCE is enabled.
   if (!audience || !expectedEmail) {
@@ -149,6 +160,40 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
   }
 
   await runIdempotent(prisma, companyId, eventId, async (tx: Prisma.TransactionClient) => {
+    // 1) Strong authenticity guard: only process events that exist in our outbox table.
+    // This prevents crafted Pub/Sub payloads from causing cross-tenant updates even if Pub/Sub
+    // push auth is misconfigured.
+    const outbox = await tx.event.findFirst({
+      where: { eventId },
+      select: { companyId: true, eventType: true, payload: true },
+    });
+    if (!outbox) {
+      fastify.log.error({ eventId }, 'Outbox event not found; refusing to process Pub/Sub message');
+      return;
+    }
+    if (!outbox.companyId || outbox.companyId !== companyId) {
+      fastify.log.error(
+        { eventId, eventCompanyId: companyId, outboxCompanyId: outbox.companyId },
+        'Tenant mismatch: Pub/Sub companyId does not match outbox.companyId'
+      );
+      return;
+    }
+    if (outbox.eventType !== 'journal.entry.created') {
+      fastify.log.error(
+        { eventId, outboxEventType: outbox.eventType },
+        'Unexpected outbox eventType for handler; refusing to process'
+      );
+      return;
+    }
+    const outboxJeId = Number((outbox.payload as any)?.journalEntryId);
+    if (!Number.isInteger(outboxJeId) || outboxJeId !== journalEntryId) {
+      fastify.log.error(
+        { eventId, journalEntryId, outboxJeId },
+        'Outbox payload mismatch; refusing to process'
+      );
+      return;
+    }
+
     // 2) Load the journal entry with its lines and accounts, scoped to tenant
     const entry = await tx.journalEntry.findFirst({
       where: { id: journalEntryId, companyId },
@@ -173,29 +218,32 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
       return;
     }
 
-    // 3) Compute how much income and expense this entry represents
-    let incomeDelta = 0;
-    let expenseDelta = 0;
+    // 3) Compute how much income and expense this entry represents (Decimal-safe)
+    let incomeDelta = new Prisma.Decimal(0);
+    let expenseDelta = new Prisma.Decimal(0);
 
     for (const line of entry.lines) {
       const acc = line.account;
-      const debit = Number(line.debit);
-      const credit = Number(line.credit);
+      const debit = new Prisma.Decimal(line.debit).toDecimalPlaces(2);
+      const credit = new Prisma.Decimal(line.credit).toDecimalPlaces(2);
 
       if (acc.type === AccountType.INCOME) {
         // Income increases with credit
-        incomeDelta += credit - debit;
+        incomeDelta = incomeDelta.add(credit.sub(debit));
       }
 
       if (acc.type === AccountType.EXPENSE) {
         // Expense increases with debit
-        expenseDelta += debit - credit;
+        expenseDelta = expenseDelta.add(debit.sub(credit));
       }
     }
 
-    if (incomeDelta === 0 && expenseDelta === 0) {
+    incomeDelta = incomeDelta.toDecimalPlaces(2);
+    expenseDelta = expenseDelta.toDecimalPlaces(2);
+
+    if (incomeDelta.equals(0) && expenseDelta.equals(0)) {
       fastify.log.info(
-        { journalEntryId, incomeDelta, expenseDelta },
+        { journalEntryId, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
         'No income/expense impact, skipping summary update'
       );
     }
@@ -203,9 +251,9 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
     const day = normalizeToDay(entry.date);
 
     // 4) Upsert into DailySummary (income/expense only)
-    if (incomeDelta !== 0 || expenseDelta !== 0) {
+    if (!incomeDelta.equals(0) || !expenseDelta.equals(0)) {
       fastify.log.info(
-        { companyId, day, incomeDelta, expenseDelta },
+        { companyId, day, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
         'Updating DailySummary'
       );
 
