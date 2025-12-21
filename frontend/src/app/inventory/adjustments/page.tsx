@@ -156,7 +156,8 @@ export default function AdjustmentsPage() {
                   <TableCell className="text-right">
                     <Input
                       type="number"
-                      step="0.01"
+                      inputMode="numeric"
+                      step="1"
                       placeholder="e.g. 10 or -2"
                       value={l.quantityDelta}
                       onChange={(e) => updateLine(idx, { quantityDelta: e.target.value })}
@@ -165,7 +166,9 @@ export default function AdjustmentsPage() {
                   <TableCell className="text-right">
                     <Input
                       type="number"
-                      step="0.01"
+                      inputMode="numeric"
+                      step="1"
+                      min="0"
                       value={l.unitCost}
                       onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
                     />

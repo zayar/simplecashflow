@@ -1,9 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
 import { randomUUID } from 'node:crypto';
-import type { DomainEventEnvelopeV1 } from '../../events/domainEvent.js';
 import { Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { forbidClientProvidedCompanyId } from '../../utils/tenant.js';
@@ -66,7 +63,7 @@ export async function pitiRoutes(fastify: FastifyInstance) {
     const schemaVersion = 'v1' as const;
     const source = 'integration:piti';
 
-    const { replay, response } = await runIdempotentRequest(
+    const { response } = await runIdempotentRequest(
       prisma,
       companyId,
       idempotencyKey,
@@ -105,38 +102,11 @@ export async function pitiRoutes(fastify: FastifyInstance) {
 
           return journalEntry;
         });
-
-        const envelope: DomainEventEnvelopeV1 = {
-          eventId,
-          eventType,
-          schemaVersion,
-          occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(entry.id),
-          source,
-          payload: {
-            journalEntryId: entry.id,
-            amount,
-          },
-        };
-
-        return { entry, envelope };
+        return entry;
       },
       redis
     );
-
-    const entry = (response as any).entry;
-    if (!replay) {
-      const published = await publishDomainEvent((response as any).envelope);
-      if (published) {
-        await markEventPublished(eventId);
-      }
-    }
-
-    return entry;
+    return response as any;
   });
 }
 

@@ -219,8 +219,9 @@ export default function PayExpensePage() {
                 <Label>Amount</Label>
                 <Input
                   type="number"
-                  step="0.01"
-                  min="0.01"
+                  inputMode="numeric"
+                  step="1"
+                  min="1"
                   max={bill.remainingBalance}
                   disabled={!canPay || isFullyPaid}
                   value={form.amount}
@@ -249,11 +250,16 @@ export default function PayExpensePage() {
               </div>
 
               <div className="flex justify-end gap-3 pt-4">
-                <Button type="button" variant="outline" onClick={() => router.back()}>
+                <Button type="button" variant="outline" onClick={() => router.back()} disabled={loading}>
                   Cancel
                 </Button>
-                <Button type="submit" disabled={loading || !canPay || isFullyPaid || !form.bankAccountId}>
-                  {loading ? 'Paying...' : 'Pay Expense'}
+                <Button
+                  type="submit"
+                  loading={loading}
+                  loadingText="Paying..."
+                  disabled={!canPay || isFullyPaid || !form.bankAccountId}
+                >
+                  Pay Expense
                 </Button>
               </div>
             </form>

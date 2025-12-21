@@ -3,8 +3,8 @@ import 'fastify';
 
 declare module '@fastify/jwt' {
   interface FastifyJWT {
-    payload: { userId: number; email: string; companyId: number };
-    user: { userId: number; email: string; companyId: number };
+    payload: { userId: number; email: string; companyId: number; role: import('@prisma/client').UserRole };
+    user: { userId: number; email: string; companyId: number; role: import('@prisma/client').UserRole };
   }
 }
 

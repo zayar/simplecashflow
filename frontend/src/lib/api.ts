@@ -61,6 +61,36 @@ export async function fetchApi(endpoint: string, options: RequestInit = {}) {
     headers,
   });
 
+  // If the token is expired/invalid, force a clean logout and redirect.
+  // This prevents the UI from getting stuck in a loop of failing requests.
+  if (res.status === 401) {
+    const payload = await readResponseBody(res);
+    const message =
+      (payload && typeof payload === 'object' && ('message' in payload || 'error' in payload)
+        ? ((payload as any).message || (payload as any).error)
+        : null) ??
+      (typeof payload === 'string' ? payload : null) ??
+      'Unauthorized';
+
+    try {
+      Cookies.remove('token');
+      Cookies.remove('user');
+    } catch {
+      // best-effort
+    }
+
+    if (typeof window !== 'undefined') {
+      // Include reason for nicer UX on login page (optional).
+      const qp = new URLSearchParams({ reason: 'expired' }).toString();
+      // Avoid infinite redirect loops if we're already on /login.
+      if (!window.location.pathname.startsWith('/login')) {
+        window.location.assign(`/login?${qp}`);
+      }
+    }
+
+    throw new Error(message);
+  }
+
   if (!res.ok) {
     const payload = await readResponseBody(res);
     const message =
@@ -280,10 +310,14 @@ export async function createBill(
   });
 }
 
-export async function postBill(companyId: number, billId: number): Promise<any> {
+export async function postBill(
+  companyId: number,
+  billId: number,
+  data: { bankAccountId?: number } = {}
+): Promise<any> {
   return fetchApi(`/companies/${companyId}/expenses/${billId}/post`, {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(data ?? {}),
   });
 }
 
@@ -294,6 +328,25 @@ export async function payBill(
 ): Promise<any> {
   return fetchApi(`/companies/${companyId}/expenses/${billId}/payments`, {
     method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateBill(
+  companyId: number,
+  billId: number,
+  data: {
+    vendorId?: number | null;
+    expenseDate?: string;
+    dueDate?: string | null;
+    description: string;
+    amount: number;
+    currency?: string | null;
+    expenseAccountId?: number | null;
+  }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/expenses/${billId}`, {
+    method: 'PUT',
     body: JSON.stringify(data),
   });
 }

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { Landmark, Plus } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -21,6 +22,7 @@ import {
 
 export default function BankingPage() {
   const { user } = useAuth();
+  const router = useRouter();
   const [accounts, setAccounts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -76,31 +78,28 @@ export default function BankingPage() {
                   <TableHead className="w-[140px]">Kind</TableHead>
                   <TableHead className="w-[200px]">Bank</TableHead>
                   <TableHead className="w-[120px]">Primary</TableHead>
-                  <TableHead className="w-[110px]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {accounts.map((a) => (
-                  <TableRow key={`${a.id}-${a.account?.id ?? ""}`}>
+                  <TableRow
+                    key={`${a.id}-${a.account?.id ?? ""}`}
+                    className="cursor-pointer hover:bg-muted/40"
+                    role="link"
+                    tabIndex={0}
+                    onClick={() => router.push(`/banking/${a.id}`)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") router.push(`/banking/${a.id}`)
+                    }}
+                  >
                     <TableCell className="font-medium">{a.account?.code}</TableCell>
-                    <TableCell>
-                      <Link href={`/banking/${a.id}`} className="font-medium hover:underline">
-                        {a.account?.name}
-                      </Link>
-                    </TableCell>
+                    <TableCell className="font-medium">{a.account?.name}</TableCell>
                     <TableCell>
                       <Badge variant="outline">{a.kind}</Badge>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{a.bankName ?? "—"}</TableCell>
                     <TableCell className="text-muted-foreground">
                       {a.isPrimary ? "Primary" : "—"}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Link href={`/banking/${a.id}`}>
-                        <Button variant="outline" size="sm">
-                          View
-                        </Button>
-                      </Link>
                     </TableCell>
                   </TableRow>
                 ))}

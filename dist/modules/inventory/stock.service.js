@@ -175,8 +175,13 @@ export async function applyStockMoveWac(tx, input) {
     if (qty.lessThanOrEqualTo(0)) {
         throw Object.assign(new Error('quantity must be > 0'), { statusCode: 400 });
     }
-    const existing = await tx.stockBalance.findFirst({
-        where: { companyId: input.companyId, warehouseId: input.warehouseId, itemId: input.itemId },
+    // DB-level safety: lock the StockBalance row inside the current transaction so concurrent writes
+    // cannot oversell or compute WAC based on stale balances. This makes negative inventory prevention
+    // independent of Redis availability.
+    const existing = await lockAndGetStockBalanceRowForUpdate(tx, {
+        companyId: input.companyId,
+        warehouseId: input.warehouseId,
+        itemId: input.itemId,
     });
     const Q = existing ? new Prisma.Decimal(existing.qtyOnHand) : d0();
     const A = existing ? new Prisma.Decimal(existing.avgUnitCost) : d0();
@@ -295,5 +300,38 @@ export async function applyStockMoveWac(tx, input) {
         unitCostApplied: unitCost,
         totalCostApplied: inValue,
     };
+}
+async function lockAndGetStockBalanceRowForUpdate(tx, input) {
+    const { companyId, warehouseId, itemId } = input;
+    if (!Number.isInteger(companyId) || companyId <= 0)
+        return null;
+    if (!Number.isInteger(warehouseId) || warehouseId <= 0)
+        return null;
+    if (!Number.isInteger(itemId) || itemId <= 0)
+        return null;
+    // Ensure the row exists so we can reliably acquire a row lock.
+    // Uses the unique key (companyId, warehouseId, itemId).
+    await tx.$executeRaw `
+    INSERT INTO StockBalance (companyId, warehouseId, itemId, qtyOnHand, avgUnitCost, inventoryValue, createdAt, updatedAt)
+    VALUES (${companyId}, ${warehouseId}, ${itemId}, 0, 0, 0, NOW(), NOW())
+    ON DUPLICATE KEY UPDATE updatedAt = updatedAt
+  `;
+    const rows = (await tx.$queryRaw `
+    SELECT qtyOnHand, avgUnitCost, inventoryValue
+    FROM StockBalance
+    WHERE companyId = ${companyId} AND warehouseId = ${warehouseId} AND itemId = ${itemId}
+    FOR UPDATE
+  `);
+    const r = rows?.[0];
+    if (!r)
+        return null;
+    return {
+        qtyOnHand: new Prisma.Decimal(r.qtyOnHand),
+        avgUnitCost: new Prisma.Decimal(r.avgUnitCost),
+        inventoryValue: new Prisma.Decimal(r.inventoryValue),
+    };
+}
+export async function getStockBalanceForUpdate(tx, input) {
+    return await lockAndGetStockBalanceRowForUpdate(tx, input);
 }
 //# sourceMappingURL=stock.service.js.map

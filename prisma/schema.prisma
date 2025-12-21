@@ -63,6 +63,11 @@ enum InvoiceStatus {
   PARTIAL
 }
 
+enum CreditNoteStatus {
+  DRAFT
+  POSTED
+}
+
 enum ExpenseStatus {
   DRAFT
   POSTED
@@ -77,6 +82,13 @@ enum BankingAccountKind {
   CREDIT_CARD
 }
 
+enum UserRole {
+  OWNER
+  ACCOUNTANT
+  CLERK
+  VIEWER
+}
+
 enum InventoryValuationMethod {
   WAC
 }
@@ -85,6 +97,7 @@ enum StockMoveType {
   OPENING
   ADJUSTMENT
   SALE_ISSUE
+  SALE_RETURN
   PURCHASE_RECEIPT
   TRANSFER_OUT
   TRANSFER_IN
@@ -103,37 +116,40 @@ enum PurchaseBillStatus {
 }
 
 model Company {
-  id              Int              @id @default(autoincrement())
-  name            String
+  id                   Int                   @id @default(autoincrement())
+  name                 String
   // --- Company profile / reporting preferences ---
   // Base currency for the tenant. Treat as immutable after transactions exist.
-  baseCurrency    String?          // e.g. "MMK"
+  baseCurrency         String? // e.g. "MMK"
   // IANA timezone name (preferred), e.g. "Asia/Yangon"
-  timeZone        String?          // affects display + date boundaries for reporting
+  timeZone             String? // affects display + date boundaries for reporting
   // Fiscal year start month (1-12). If null, assume January.
-  fiscalYearStartMonth Int?        @default(1)
-  accounts        Account[]
-  entries         JournalEntry[]
-  events          Event[]
-  summaries       DailySummary[]
-  accountBalances AccountBalance[]
-  customers       Customer[]
-  vendors         Vendor[]
-  items           Item[]
-  invoices        Invoice[]
-  payments        Payment[]
-  expenses        Expense[]
-  expensePayments ExpensePayment[]
-  users           User[]
-  journalLines    JournalLine[]
-  processedEvents ProcessedEvent[]
-  invoiceLines    InvoiceLine[]
-  bankingAccounts BankingAccount[]
-  warehouses      Warehouse[]
-  stockBalances   StockBalance[]
-  stockMoves      StockMove[]
-  purchaseBills   PurchaseBill[]
-  purchaseBillLines PurchaseBillLine[]
+  fiscalYearStartMonth Int?                  @default(1)
+  accounts             Account[]
+  entries              JournalEntry[]
+  events               Event[]
+  summaries            DailySummary[]
+  accountBalances      AccountBalance[]
+  customers            Customer[]
+  vendors              Vendor[]
+  items                Item[]
+  invoices             Invoice[]
+  payments             Payment[]
+  creditNotes          CreditNote[]
+  expenses             Expense[]
+  expensePayments      ExpensePayment[]
+  users                User[]
+  auditLogs            AuditLog[]
+  journalLines         JournalLine[]
+  processedEvents      ProcessedEvent[]
+  invoiceLines         InvoiceLine[]
+  creditNoteLines      CreditNoteLine[]
+  bankingAccounts      BankingAccount[]
+  warehouses           Warehouse[]
+  stockBalances        StockBalance[]
+  stockMoves           StockMove[]
+  purchaseBills        PurchaseBill[]
+  purchaseBillLines    PurchaseBillLine[]
   purchaseBillPayments PurchaseBillPayment[]
 
   // Default account settings for this company (multi-tenant safe).
@@ -167,6 +183,8 @@ model Company {
   idempotentRequests IdempotentRequest[]
   periodCloses       PeriodClose[]
   documentSequences  DocumentSequence[]
+  taxRates           TaxRate[]
+  taxGroups          TaxGroup[]
 }
 
 model Account {
@@ -174,39 +192,43 @@ model Account {
   companyId Int
   company   Company @relation(fields: [companyId], references: [id])
 
-  code      String // e.g. "1000", "4100"
-  name      String // e.g. "Cash on Hand"
-  type      AccountType
+  code String // e.g. "1000", "4100"
+  name String // e.g. "Cash on Hand"
+  type AccountType
 
   // Reporting semantics:
   // - normalBalance: how the account "normally" carries a balance (used for Trial Balance presentation)
   // - reportGroup: optional classification for P&L and Cashflow statement logic
   // - cashflowActivity: optional mapping (Operating/Investing/Financing) for Cashflow statement v1+
-  normalBalance   NormalBalance @default(DEBIT)
-  reportGroup     AccountReportGroup?
+  normalBalance    NormalBalance       @default(DEBIT)
+  reportGroup      AccountReportGroup?
   cashflowActivity CashflowActivity?
 
-  isActive  Boolean     @default(true)
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  lines JournalLine[]
+  lines    JournalLine[]
   balances AccountBalance[]
 
   // Books layer relations
-  accountsReceivableFor Company[] @relation("Company_AR")
-  accountsPayableFor    Company[] @relation("Company_AP")
-  inventoryAssetFor     Company[] @relation("Company_InventoryAsset")
-  cogsFor               Company[] @relation("Company_COGS")
-  openingBalanceEquityFor Company[] @relation("Company_OpeningEquity")
-  incomeItems           Item[]    @relation("Account_IncomeItems")
-  expenseItems          Item[]    @relation("Account_ExpenseItems")
-  bankPayments          Payment[] @relation("Payment_BankAccount")
-  bankExpensePayments   ExpensePayment[] @relation("ExpensePayment_BankAccount")
-  bankingAccount        BankingAccount?
-  expenses              Expense[] @relation("Expense_ExpenseAccount")
-  purchaseBillLines     PurchaseBillLine[]
-  purchaseBillPayments  PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
+  accountsReceivableFor   Company[]             @relation("Company_AR")
+  accountsPayableFor      Company[]             @relation("Company_AP")
+  inventoryAssetFor       Company[]             @relation("Company_InventoryAsset")
+  cogsFor                 Company[]             @relation("Company_COGS")
+  openingBalanceEquityFor Company[]             @relation("Company_OpeningEquity")
+  incomeItems             Item[]                @relation("Account_IncomeItems")
+  expenseItems            Item[]                @relation("Account_ExpenseItems")
+  bankPayments            Payment[]             @relation("Payment_BankAccount")
+  bankExpensePayments     ExpensePayment[]      @relation("ExpensePayment_BankAccount")
+  bankingAccount          BankingAccount?
+  expenses                Expense[]             @relation("Expense_ExpenseAccount")
+  purchaseBillLines       PurchaseBillLine[]
+  purchaseBillPayments    PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
+
+  // Income account mapping on document lines (required opposite relations for Prisma named relations)
+  invoiceLinesIncome    InvoiceLine[]    @relation("InvoiceLine_IncomeAccount")
+  creditNoteLinesIncome CreditNoteLine[] @relation("CreditNoteLine_IncomeAccount")
 
   @@unique([companyId, code]) // one code per company
 }
@@ -264,6 +286,11 @@ model JournalEntry {
   companyId Int
   company   Company @relation(fields: [companyId], references: [id])
 
+  // Gapless, audit-friendly journal entry number (distinct from PK id).
+  // Allocated atomically inside the posting transaction using DocumentSequence
+  // (per company per year).
+  entryNumber String @db.VarChar(32)
+
   date        DateTime
   description String
   createdAt   DateTime @default(now())
@@ -276,25 +303,29 @@ model JournalEntry {
   // Immutable ledger semantics:
   // - Journal entries should never be edited after creation (use reversal/adjustment).
   // - Reversal links back to the original entry.
-  postedAt DateTime @default(now())
-  reversalOfJournalEntryId Int? @unique
+  postedAt                 DateTime      @default(now())
+  reversalOfJournalEntryId Int?          @unique
   reversalOfJournalEntry   JournalEntry? @relation("JournalEntry_Reversal", fields: [reversalOfJournalEntryId], references: [id])
   reversalEntry            JournalEntry? @relation("JournalEntry_Reversal")
-  reversalReason           String? @db.Text
+  reversalReason           String?       @db.Text
 
   lines JournalLine[]
 
   // Documents that created this journal entry (optional)
-  invoice Invoice? @relation("Invoice_JournalEntry")
-  payment Payment? @relation("Payment_JournalEntry")
-  paymentReversal Payment? @relation("Payment_ReversalJournalEntry")
-  expense Expense? @relation("Expense_JournalEntry")
-  expensePayment ExpensePayment? @relation("ExpensePayment_JournalEntry")
-  expensePaymentReversal ExpensePayment? @relation("ExpensePayment_ReversalJournalEntry")
-  purchaseBill PurchaseBill?
-  purchaseBillPayment PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
+  invoice                     Invoice?             @relation("Invoice_JournalEntry")
+  payment                     Payment?             @relation("Payment_JournalEntry")
+  paymentReversal             Payment?             @relation("Payment_ReversalJournalEntry")
+  expense                     Expense?             @relation("Expense_JournalEntry")
+  expensePayment              ExpensePayment?      @relation("ExpensePayment_JournalEntry")
+  expensePaymentReversal      ExpensePayment?      @relation("ExpensePayment_ReversalJournalEntry")
+  purchaseBill                PurchaseBill?
+  purchaseBillPayment         PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
   purchaseBillPaymentReversal PurchaseBillPayment? @relation("PurchaseBillPayment_ReversalJournalEntry")
-  periodClose PeriodClose?
+  creditNote                  CreditNote?          @relation("CreditNote_JournalEntry")
+  periodClose                 PeriodClose?
+
+  @@unique([companyId, entryNumber])
+  @@index([companyId, date])
 }
 
 model JournalLine {
@@ -385,7 +416,8 @@ model Customer {
   currency       String? // e.g. "MMK"
   openingBalance Decimal? @db.Decimal(18, 2)
 
-  invoices Invoice[]
+  invoices    Invoice[]
+  creditNotes CreditNote[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -405,10 +437,10 @@ model Item {
   costPrice    Decimal? @db.Decimal(18, 2)
 
   // Inventory tracking (V1). Only meaningful for GOODS.
-  trackInventory   Boolean                 @default(false)
-  valuationMethod  InventoryValuationMethod @default(WAC)
+  trackInventory     Boolean                  @default(false)
+  valuationMethod    InventoryValuationMethod @default(WAC)
   defaultWarehouseId Int?
-  defaultWarehouse   Warehouse?            @relation(fields: [defaultWarehouseId], references: [id])
+  defaultWarehouse   Warehouse?               @relation(fields: [defaultWarehouseId], references: [id])
 
   // Revenue account for sales (should be INCOME)
   incomeAccountId Int
@@ -418,11 +450,12 @@ model Item {
   expenseAccountId Int?
   expenseAccount   Account? @relation("Account_ExpenseItems", fields: [expenseAccountId], references: [id])
 
-  isActive     Boolean       @default(true)
-  invoiceLines InvoiceLine[]
-  expenses     Expense[]
-  stockBalances StockBalance[]
-  stockMoves    StockMove[]
+  isActive          Boolean            @default(true)
+  invoiceLines      InvoiceLine[]
+  creditNoteLines   CreditNoteLine[]
+  expenses          Expense[]
+  stockBalances     StockBalance[]
+  stockMoves        StockMove[]
   purchaseBillLines PurchaseBillLine[]
 
   createdAt DateTime @default(now())
@@ -439,12 +472,12 @@ model Warehouse {
   name      String
   isDefault Boolean @default(false)
 
-  items         Item[]
-  stockBalances StockBalance[]
-  stockMoves    StockMove[]
-  purchaseBills PurchaseBill[]
-  purchaseBillLines PurchaseBillLine[]
-  defaultForCompanies Company[] @relation("Company_DefaultWarehouse")
+  items               Item[]
+  stockBalances       StockBalance[]
+  stockMoves          StockMove[]
+  purchaseBills       PurchaseBill[]
+  purchaseBillLines   PurchaseBillLine[]
+  defaultForCompanies Company[]          @relation("Company_DefaultWarehouse")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -491,15 +524,15 @@ model StockMove {
   date      DateTime
   type      StockMoveType
   direction StockMoveDirection
-  quantity  Decimal @db.Decimal(18, 2)
+  quantity  Decimal            @db.Decimal(18, 2)
 
   // Cost applied for this move (audit).
   unitCostApplied  Decimal @db.Decimal(18, 2)
   totalCostApplied Decimal @db.Decimal(18, 2)
 
-  referenceType String?
-  referenceId   String?
-  correlationId String?
+  referenceType   String?
+  referenceId     String?
+  correlationId   String?
   createdByUserId Int?
 
   // Link to GL posting (optional but helpful)
@@ -520,20 +553,30 @@ model Invoice {
   customerId Int
   customer   Customer @relation(fields: [customerId], references: [id])
 
-  invoiceNumber String
-  status        InvoiceStatus
-  invoiceDate   DateTime
-  dueDate       DateTime?
-  currency      String?
-  total         Decimal       @db.Decimal(18, 2) // recomputed and stored when posted
+  invoiceNumber      String
+  status             InvoiceStatus
+  invoiceDate        DateTime
+  dueDate            DateTime?
+  currency           String?
+  // Amounts:
+  // - subtotal: sum of line subtotals (qty * unitPrice)
+  // - taxAmount: sum of line taxes (subtotal * taxRate)
+  // - total: subtotal + taxAmount
+  subtotal           Decimal       @default(0) @db.Decimal(18, 2)
+  taxAmount          Decimal       @default(0) @db.Decimal(18, 2)
+  total              Decimal       @db.Decimal(18, 2) // recomputed and stored when posted
+  // Free-form text blocks shown on the printed invoice (like Zoho-style Customer Notes / Terms).
+  customerNotes      String?       @db.Text
+  termsAndConditions String?       @db.Text
   // Denormalized for performance (avoid summing Payment table on every payment record).
-  amountPaid    Decimal       @db.Decimal(18, 2) @default(0)
+  amountPaid         Decimal       @default(0) @db.Decimal(18, 2)
 
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
 
-  lines    InvoiceLine[]
-  payments Payment[]
+  lines       InvoiceLine[]
+  payments    Payment[]
+  creditNotes CreditNote[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -541,6 +584,85 @@ model Invoice {
   @@unique([companyId, invoiceNumber])
   @@index([companyId, invoiceDate])
   @@index([companyId, status])
+}
+
+model CreditNote {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  // Clean returns: link to original invoice (optional for service-only credits)
+  invoiceId Int?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+
+  customerId Int
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  creditNoteNumber String
+  status           CreditNoteStatus
+  creditNoteDate   DateTime
+  currency         String?
+
+  // Amounts:
+  // - subtotal: sum of line subtotals (qty * unitPrice)
+  // - taxAmount: sum of line taxes (subtotal * taxRate)
+  // - total: subtotal + taxAmount (what AR is reduced by)
+  subtotal  Decimal @default(0) @db.Decimal(18, 2)
+  taxAmount Decimal @default(0) @db.Decimal(18, 2)
+  total     Decimal @db.Decimal(18, 2) // recomputed and stored when posted
+
+  // Free-form text blocks shown on the printed credit note.
+  customerNotes      String? @db.Text
+  termsAndConditions String? @db.Text
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation("CreditNote_JournalEntry", fields: [journalEntryId], references: [id])
+
+  lines CreditNoteLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, creditNoteNumber])
+  @@index([companyId, creditNoteDate])
+  @@index([companyId, status])
+  @@index([companyId, invoiceId])
+}
+
+model CreditNoteLine {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  creditNoteId Int
+  creditNote   CreditNote @relation(fields: [creditNoteId], references: [id])
+
+  // Clean returns: link to original invoice line when credit note is created from an invoice.
+  invoiceLineId Int?
+  invoiceLine   InvoiceLine? @relation(fields: [invoiceLineId], references: [id])
+
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
+
+  // Income account mapping for this credit line (revenue reversal).
+  // Default UX: Sales Income (code 4000). Optional for backward-compat; posting will enforce a valid income account.
+  incomeAccountId Int?
+  incomeAccount   Account? @relation("CreditNoteLine_IncomeAccount", fields: [incomeAccountId], references: [id])
+
+  description String?
+  quantity    Decimal @db.Decimal(18, 2)
+  unitPrice   Decimal @db.Decimal(18, 2)
+  lineTotal   Decimal @db.Decimal(18, 2)
+
+  // Tax per line (tax-exclusive):
+  // taxRate is stored as decimal (e.g., 0.0700 for 7%).
+  taxRate   Decimal? @db.Decimal(5, 4)
+  taxAmount Decimal  @default(0) @db.Decimal(18, 2)
+
+  @@index([companyId])
+  @@index([creditNoteId])
+  @@index([invoiceLineId])
+  @@index([incomeAccountId])
 }
 
 model InvoiceLine {
@@ -554,13 +676,23 @@ model InvoiceLine {
   itemId Int
   item   Item @relation(fields: [itemId], references: [id])
 
-  description String?
-  quantity    Decimal  @db.Decimal(18, 2)
-  unitPrice   Decimal  @db.Decimal(18, 2)
-  lineTotal   Decimal  @db.Decimal(18, 2)
-  taxRate     Decimal? @db.Decimal(5, 2)
+  // Income account mapping (UI-friendly revenue mapping).
+  // Default UX: Sales Income (code 4000). Optional for backward-compat; posting will enforce a valid income account.
+  incomeAccountId Int?
+  incomeAccount   Account? @relation("InvoiceLine_IncomeAccount", fields: [incomeAccountId], references: [id])
+
+  description     String?
+  quantity        Decimal          @db.Decimal(18, 2)
+  unitPrice       Decimal          @db.Decimal(18, 2)
+  lineTotal       Decimal          @db.Decimal(18, 2)
+  // Tax per line (tax-exclusive):
+  // taxRate is stored as decimal (e.g., 0.0700 for 7%).
+  taxRate         Decimal?         @db.Decimal(5, 4)
+  taxAmount       Decimal          @default(0) @db.Decimal(18, 2)
+  creditNoteLines CreditNoteLine[]
 
   @@index([companyId])
+  @@index([incomeAccountId])
 }
 
 model Payment {
@@ -581,12 +713,12 @@ model Payment {
   journalEntry   JournalEntry? @relation("Payment_JournalEntry", fields: [journalEntryId], references: [id])
 
   // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
-  reversedAt              DateTime?
-  reversalReason          String?   @db.Text
-  reversalJournalEntryId  Int?      @unique
-  reversalJournalEntry    JournalEntry? @relation("Payment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
-  reversedByUserId        Int?
-  reversedByUser          User? @relation("User_ReversedPayments", fields: [reversedByUserId], references: [id])
+  reversedAt             DateTime?
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
+  reversalJournalEntry   JournalEntry? @relation("Payment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUserId       Int?
+  reversedByUser         User?         @relation("User_ReversedPayments", fields: [reversedByUserId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -604,7 +736,7 @@ model Vendor {
   email String?
   phone String?
 
-  expenses Expense[]
+  expenses      Expense[]
   purchaseBills PurchaseBill[]
 
   createdAt DateTime @default(now())
@@ -631,12 +763,12 @@ model PurchaseBill {
   currency   String?
 
   total      Decimal @db.Decimal(18, 2)
-  amountPaid Decimal @db.Decimal(18, 2) @default(0)
+  amountPaid Decimal @default(0) @db.Decimal(18, 2)
 
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation(fields: [journalEntryId], references: [id])
 
-  lines PurchaseBillLine[]
+  lines    PurchaseBillLine[]
   payments PurchaseBillPayment[]
 
   createdAt DateTime @default(now())
@@ -695,11 +827,11 @@ model PurchaseBillPayment {
 
   // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
   reversedAt             DateTime?
-  reversalReason         String? @db.Text
-  reversalJournalEntryId Int?    @unique
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
   reversalJournalEntry   JournalEntry? @relation("PurchaseBillPayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
   reversedByUserId       Int?
-  reversedByUser         User? @relation(fields: [reversedByUserId], references: [id])
+  reversedByUser         User?         @relation(fields: [reversedByUserId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -723,8 +855,8 @@ model Expense {
   description   String
 
   amount     Decimal @db.Decimal(18, 2)
-  amountPaid Decimal @db.Decimal(18, 2) @default(0)
-  currency String?
+  amountPaid Decimal @default(0) @db.Decimal(18, 2)
+  currency   String?
 
   // Optional item reference for COGS tracking
   itemId Int?
@@ -757,7 +889,7 @@ model ExpensePayment {
   expense   Expense @relation(fields: [expenseId], references: [id])
 
   paymentDate DateTime
-  amount      Decimal @db.Decimal(18, 2)
+  amount      Decimal  @db.Decimal(18, 2)
 
   bankAccountId Int
   bankAccount   Account @relation("ExpensePayment_BankAccount", fields: [bankAccountId], references: [id])
@@ -767,11 +899,11 @@ model ExpensePayment {
 
   // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
   reversedAt             DateTime?
-  reversalReason         String? @db.Text
-  reversalJournalEntryId Int?    @unique
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
   reversalJournalEntry   JournalEntry? @relation("ExpensePayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
   reversedByUserId       Int?
-  reversedByUser         User? @relation("User_ReversedExpensePayments", fields: [reversedByUserId], references: [id])
+  reversedByUser         User?         @relation("User_ReversedExpensePayments", fields: [reversedByUserId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -785,18 +917,47 @@ model User {
   email     String   @unique
   password  String // hashed
   name      String?
+  role      UserRole @default(OWNER)
   companyId Int
   company   Company  @relation(fields: [companyId], references: [id])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  journalEntriesCreated JournalEntry[]
-  reversedPayments      Payment[] @relation("User_ReversedPayments")
-  reversedExpensePayments ExpensePayment[] @relation("User_ReversedExpensePayments")
+  journalEntriesCreated        JournalEntry[]
+  reversedPayments             Payment[]             @relation("User_ReversedPayments")
+  reversedExpensePayments      ExpensePayment[]      @relation("User_ReversedExpensePayments")
   reversedPurchaseBillPayments PurchaseBillPayment[]
-  periodClosesCreated PeriodClose[] @relation("User_PeriodClosesCreated")
+  periodClosesCreated          PeriodClose[]         @relation("User_PeriodClosesCreated")
+  auditLogs                    AuditLog[]
 
   @@index([companyId])
+}
+
+model AuditLog {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  userId Int?
+  user   User? @relation(fields: [userId], references: [id])
+
+  // Action semantics: stable strings like "invoice.post", "invoice.payment.create"
+  action     String
+  entityType String
+  entityId   String?
+
+  // Correlation for retries/tracing.
+  idempotencyKey String?
+  correlationId  String?
+
+  // Extra context (safe, non-sensitive): totals, dates, ids, etc.
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@index([companyId, entityType, entityId])
+  @@index([companyId, userId, createdAt])
 }
 
 // Period close (month-end/year-end) to move INCOME/EXPENSE into Retained Earnings.
@@ -809,7 +970,7 @@ model PeriodClose {
   fromDate DateTime
   toDate   DateTime
 
-  journalEntryId Int @unique
+  journalEntryId Int          @unique
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id])
 
   createdByUserId Int?
@@ -839,16 +1000,77 @@ model IdempotentRequest {
 
 // Per-company sequence generator for document numbers (e.g., Purchase Bills).
 model DocumentSequence {
-  id        Int      @id @default(autoincrement())
+  id        Int     @id @default(autoincrement())
   companyId Int
-  company   Company  @relation(fields: [companyId], references: [id])
+  company   Company @relation(fields: [companyId], references: [id])
 
   key        String
-  nextNumber Int      @default(1)
+  nextNumber Int    @default(1)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([companyId, key])
   @@index([companyId])
+}
+
+// Tax Module: Individual tax rates (e.g., VAT, Sales Tax, GST)
+model TaxRate {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  name String // e.g., "Income tax", "Commercial Tax"
+  rate Decimal @db.Decimal(5, 4) // e.g., 0.0500 for 5%
+
+  // Compound tax applies tax on top of other taxes (tax-on-tax)
+  isCompound Boolean @default(false)
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  groupMemberships TaxGroupMember[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+// Tax Module: Tax groups combine multiple tax rates (e.g., "Myanmar [7%]" = 2% Income + 5% Commercial)
+model TaxGroup {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  name String // e.g., "Myanmar", "Total Sales Tax"
+
+  // Computed total rate for display (sum of member rates)
+  totalRate Decimal @db.Decimal(5, 4) // e.g., 0.0700 for 7%
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  members TaxGroupMember[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+// Tax Module: Join table for tax groups (many-to-many)
+model TaxGroupMember {
+  id      Int      @id @default(autoincrement())
+  groupId Int
+  group   TaxGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  taxRateId Int
+  taxRate   TaxRate @relation(fields: [taxRateId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([groupId, taxRateId])
+  @@index([groupId])
+  @@index([taxRateId])
 }

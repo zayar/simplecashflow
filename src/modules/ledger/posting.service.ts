@@ -1,10 +1,8 @@
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { nextJournalEntryNumber } from '../sequence/sequence.service.js';
 
 // Transaction client type (so we can accept either prisma or tx)
-export type PrismaTx = Omit<
-  PrismaClient,
-  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
->;
+export type PrismaTx = any;
 
 export type PostingLineInput = {
   accountId: number;
@@ -53,9 +51,37 @@ export async function postJournalEntry(
   if (!companyId || Number.isNaN(Number(companyId))) {
     throw Object.assign(new Error('companyId is required'), { statusCode: 400 });
   }
+  if (!(date instanceof Date) || isNaN(date.getTime())) {
+    throw Object.assign(new Error('date is required'), { statusCode: 400 });
+  }
   if (!rawLines.length || rawLines.length < 2) {
     throw Object.assign(new Error('at least 2 lines are required'), { statusCode: 400 });
   }
+
+  // Fintech safety: prevent posting into closed periods.
+  // We compare by day (00:00) so callers can pass any time-of-day safely.
+  const day = new Date(date);
+  day.setHours(0, 0, 0, 0);
+  
+  // CRITICAL FIX #4: Block posting on or before ANY closed period (not just within range).
+  // This prevents backdating entries after period close, which would reopen prior periods.
+  const latestClosed = await tx.periodClose.findFirst({
+    where: { companyId },
+    orderBy: { toDate: 'desc' },
+    select: { fromDate: true, toDate: true },
+  });
+  if (latestClosed && day <= latestClosed.toDate) {
+    throw Object.assign(
+      new Error(
+        `cannot post on or before closed period (latest close: ${latestClosed.fromDate.toISOString().slice(0, 10)} to ${latestClosed.toDate.toISOString().slice(0, 10)})`
+      ),
+      { statusCode: 400 }
+    );
+  }
+
+  // Allocate a gapless journal entry number inside the same DB transaction.
+  // If the posting transaction rolls back, the sequence increment rolls back too (no gaps).
+  const entryNumber = await nextJournalEntryNumber(tx as any, companyId, date);
 
   // Normalize + validate lines
   const lines = rawLines.map((l, idx) => {
@@ -117,6 +143,7 @@ export async function postJournalEntry(
   return await tx.journalEntry.create({
     data: {
       companyId,
+      entryNumber,
       date,
       description,
       createdByUserId: input.createdByUserId ?? null,

@@ -7,6 +7,7 @@ import {
   BankingAccountKind,
   CashflowActivity,
   NormalBalance,
+  UserRole,
 } from '@prisma/client';
 
 export async function authRoutes(fastify: FastifyInstance) {
@@ -149,6 +150,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           password: hashedPassword,
           name: body.name ?? null,
           companyId: company.id,
+          role: UserRole.OWNER,
         },
       });
 
@@ -159,9 +161,19 @@ export async function authRoutes(fastify: FastifyInstance) {
       userId: result.user.id,
       email: result.user.email,
       companyId: result.company.id,
+      role: result.user.role,
     }, { expiresIn: JWT_EXPIRES_IN });
 
-    return { token, user: { id: result.user.id, email: result.user.email, name: result.user.name, companyId: result.company.id } };
+    return {
+      token,
+      user: {
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.name,
+        companyId: result.company.id,
+        role: result.user.role,
+      },
+    };
   });
 
   fastify.post('/login', async (request, reply) => {
@@ -194,9 +206,13 @@ export async function authRoutes(fastify: FastifyInstance) {
       userId: user.id,
       email: user.email,
       companyId: user.companyId,
+      role: (user as any).role ?? UserRole.OWNER,
     }, { expiresIn: JWT_EXPIRES_IN });
 
-    return { token, user: { id: user.id, email: user.email, name: user.name, companyId: user.companyId } };
+    return {
+      token,
+      user: { id: user.id, email: user.email, name: user.name, companyId: user.companyId, role: (user as any).role ?? UserRole.OWNER },
+    };
   });
 
   function normalBalanceForType(type: AccountType): NormalBalance {

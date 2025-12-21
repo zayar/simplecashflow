@@ -1,4 +1,3 @@
-import type { PrismaClient } from '@prisma/client';
 import type { Redis } from 'ioredis';
 
 type IdempotentResult<T> = { replay: boolean; response: T };
@@ -9,7 +8,7 @@ type IdempotentResult<T> = { replay: boolean; response: T };
  * Optionally caches responses in Redis for fast replay under retries.
  */
 export async function runIdempotentRequest<T>(
-  prisma: PrismaClient,
+  prisma: any,
   companyId: number,
   key: string,
   work: () => Promise<T>,

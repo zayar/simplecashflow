@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
+import Image from "next/image"
 import { useRouter } from "next/navigation"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -16,6 +17,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
+import { LogoMark } from "@/components/logo-mark"
 
 export default function RegisterPage() {
   const [email, setEmail] = useState("")
@@ -49,19 +51,35 @@ export default function RegisterPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="w-full max-w-sm space-y-6">
-        <div className="text-center">
-          <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl border bg-background text-sm font-semibold">
-            C
+    <div className="min-h-screen px-4 py-10">
+      <div className="mx-auto w-full max-w-6xl">
+        <div className="overflow-hidden rounded-3xl border bg-background shadow-sm">
+          <div className="grid md:grid-cols-2">
+            {/* Left: Form */}
+            <div className="p-6 sm:p-10">
+              <div className="mb-8 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <LogoMark className="h-10 w-10" title="Cashflow" />
+                  <div className="leading-tight">
+                    <div className="text-sm font-semibold">Cashflow</div>
+                    <div className="text-xs text-muted-foreground">Accounting & Cash Management</div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 rounded-full border bg-muted/30 p-1">
+                  <Link href="/login" className="rounded-full px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                    Login
+                  </Link>
+                  <div className="rounded-full bg-background px-3 py-1 text-xs font-medium">Sign Up</div>
+                </div>
           </div>
+
+              <div className="mb-6 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
-          <p className="text-sm text-muted-foreground">
-            Start with the basics — you can refine settings later.
-          </p>
+                <p className="text-sm text-muted-foreground">Start with the basics — you can refine settings later.</p>
         </div>
 
-        <Card className="shadow-sm">
+              <Card className="shadow-none border-muted/60">
         <CardHeader>
           <CardTitle className="text-lg">Sign up</CardTitle>
           <CardDescription>Create a workspace for your business.</CardDescription>
@@ -69,31 +87,25 @@ export default function RegisterPage() {
         <CardContent>
           <form onSubmit={handleSubmit} className="grid gap-4">
             <div className="grid gap-2">
-              <Label htmlFor="name">Full Name</Label>
-              <Input
-                id="name"
-                placeholder="John Doe"
-                required
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
+                      <Label htmlFor="name">Full name</Label>
+                      <Input id="name" placeholder="Enter your name" required value={name} onChange={(e) => setName(e.target.value)} />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="companyName">Company Name</Label>
+                      <Label htmlFor="companyName">Company name</Label>
               <Input
                 id="companyName"
-                placeholder="My Business Ltd."
+                        placeholder="Enter your company name"
                 required
                 value={companyName}
                 onChange={(e) => setCompanyName(e.target.value)}
               />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="email">Email</Label>
+                      <Label htmlFor="email">Email address</Label>
               <Input
                 id="email"
                 type="email"
-                placeholder="m@example.com"
+                        placeholder="Enter your email address"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -104,18 +116,22 @@ export default function RegisterPage() {
               <Input
                 id="password"
                 type="password"
+                        placeholder="Create a password"
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
             </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
+
+                    {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
             <Button className="w-full" type="submit" disabled={isSubmitting}>
               {isSubmitting ? "Creating..." : "Create account"}
             </Button>
-            <div className="mt-4 text-center text-sm">
+
+                    <div className="text-center text-sm text-muted-foreground">
               Already have an account?{" "}
-              <Link href="/login" className="font-medium underline underline-offset-4">
+                      <Link href="/login" className="font-medium text-foreground underline underline-offset-4">
                 Sign in
               </Link>
             </div>
@@ -123,9 +139,18 @@ export default function RegisterPage() {
         </CardContent>
         </Card>
 
-        <p className="text-center text-xs text-muted-foreground">
+              <p className="mt-6 text-center text-xs text-muted-foreground">
           We’ll store your session securely in cookies.
         </p>
+            </div>
+
+            {/* Right: Hero image (same as login) */}
+            <div className="relative hidden md:block">
+              <div className="absolute inset-0 bg-gradient-to-br from-primary/15 via-transparent to-primary/10" />
+              <Image src="/login-hero.svg" alt="Finance platform" fill priority className="object-cover" />
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

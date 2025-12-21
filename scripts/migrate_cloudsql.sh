@@ -25,6 +25,9 @@ if [[ -z "${DB_PASS:-}" ]]; then
   exit 1
 fi
 
+# URL-encode DB password for DATABASE_URL (needed if it contains @, :, /, #, etc.)
+DB_PASS_ENC="$(node -e "process.stdout.write(encodeURIComponent(process.env.DB_PASS || ''))")"
+
 cd "$(dirname "$0")/.."
 
 echo "Using Cloud SQL instance: ${INSTANCE_CONN}"
@@ -43,13 +46,34 @@ else
 fi
 
 echo "Starting Cloud SQL Proxy on 127.0.0.1:${PROXY_PORT}..."
-$PROXY_CMD --address 127.0.0.1 --port "${PROXY_PORT}" "${INSTANCE_CONN}" >/dev/null 2>&1 &
+PROXY_LOG="$(pwd)/.cloudsql-proxy.log"
+rm -f "$PROXY_LOG" || true
+echo "Proxy logs: ${PROXY_LOG}"
+$PROXY_CMD --address 127.0.0.1 --port "${PROXY_PORT}" "${INSTANCE_CONN}" >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 trap "kill ${PROXY_PID} 2>/dev/null || true" EXIT
 
-sleep 3
+# Wait until proxy is actually listening.
+for i in {1..30}; do
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "Cloud SQL Proxy exited unexpectedly. Last 50 log lines:"
+    tail -n 50 "$PROXY_LOG" || true
+    exit 1
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z 127.0.0.1 "${PROXY_PORT}" >/dev/null 2>&1; then
+      break
+    fi
+  fi
+  sleep 1
+done
 
-export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@127.0.0.1:${PROXY_PORT}/${DB_NAME}"
+export DATABASE_URL="mysql://${DB_USER}:${DB_PASS_ENC}@127.0.0.1:${PROXY_PORT}/${DB_NAME}"
+
+echo "Checking DB connectivity..."
+./node_modules/.bin/prisma db execute --schema prisma/schema.prisma --stdin <<'SQL'
+SELECT 1;
+SQL
 
 echo "Checking migration status..."
 # `migrate status` returns non-zero when there are pending migrations.
@@ -57,7 +81,18 @@ echo "Checking migration status..."
 ./node_modules/.bin/prisma migrate status --schema prisma/schema.prisma || true
 
 echo "Applying migrations (deploy)..."
-./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma
+for attempt in 1 2 3; do
+  if ./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma; then
+    break
+  fi
+  echo "Prisma migrate deploy failed (attempt ${attempt}/3). Retrying in 3s..."
+  sleep 3
+  if [[ "$attempt" == "3" ]]; then
+    echo "Prisma migrate deploy failed after retries. Last 120 proxy log lines:"
+    tail -n 120 "$PROXY_LOG" || true
+    exit 1
+  fi
+done
 
 echo "Regenerating Prisma client..."
 ./node_modules/.bin/prisma generate --schema prisma/schema.prisma

@@ -1,11 +1,11 @@
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import type { Redis } from 'ioredis';
 
 // Helper type to represent the transaction client
 type PrismaTx = Prisma.TransactionClient;
 
 export async function runIdempotent(
-  prisma: PrismaClient,
+  prisma: any,
   companyId: number,
   eventId: string,
   work: (tx: PrismaTx) => Promise<void>,
@@ -36,7 +36,7 @@ export async function runIdempotent(
   }
 
   try {
-    await prisma.$transaction(async (tx) => {
+    await prisma.$transaction(async (tx: any) => {
       // 1. Idempotency check: insert ProcessedEvent
       // If eventId exists, this throws P2002
       await tx.processedEvent.create({

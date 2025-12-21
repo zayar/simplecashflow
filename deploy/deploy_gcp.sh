@@ -14,11 +14,29 @@ WORKER_SUBSCRIPTION="cashflow-events-worker"
 RUNTIME_SA_NAME="cashflow-runtime"
 RUNTIME_SA_EMAIL="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 DB_URL_SECRET="cashflow-db-url"
+JWT_SECRET_NAME="cashflow-jwt-secret"
 
 # ---- Require password without echoing ----
 if [[ -z "${DB_PASS:-}" ]]; then
   read -s -p "Cloud SQL password for ${DB_USER}: " DB_PASS
   echo
+fi
+
+# URL-encode DB password for DATABASE_URL (needed if it contains @, :, /, #, etc.)
+DB_PASS_ENC="$(node -e "process.stdout.write(encodeURIComponent(process.env.DB_PASS || ''))")"
+
+# ---- Require JWT Secret (or generate one) ----
+if [[ -z "${JWT_SECRET:-}" ]]; then
+  echo
+  read -s -p "Enter JWT_SECRET (leave empty to generate a random one): " INPUT_JWT
+  echo
+  if [[ -z "${INPUT_JWT:-}" ]]; then
+    # Generate random hex string (32 bytes = 64 hex chars)
+    JWT_SECRET=$(openssl rand -hex 32)
+    echo "Generated random JWT_SECRET."
+  else
+    JWT_SECRET="$INPUT_JWT"
+  fi
 fi
 
 # ---- gcloud project ----
@@ -65,18 +83,66 @@ else
 fi
 
 echo "Starting proxy on port 3307..."
-$PROXY_CMD --address 0.0.0.0 --port 3307 "$INSTANCE_CONN" > /dev/null 2>&1 &
+PROXY_LOG="${ROOT_DIR}/.cloudsql-proxy.log"
+rm -f "$PROXY_LOG" || true
+echo "Proxy logs: ${PROXY_LOG}"
+# Bind explicitly to IPv4 localhost to avoid IPv6 localhost (::1) mismatch issues.
+$PROXY_CMD --address 127.0.0.1 --port 3307 "$INSTANCE_CONN" >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 
 # Ensure proxy is killed on script exit
 trap "kill $PROXY_PID 2>/dev/null" EXIT
 
 echo "Waiting for proxy..."
-sleep 5
+for i in {1..30}; do
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "Cloud SQL Proxy exited unexpectedly. Last 50 log lines:"
+    tail -n 50 "$PROXY_LOG" || true
+    exit 1
+  fi
+  # Prefer `nc` if present, fallback to sleep.
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z 127.0.0.1 3307 >/dev/null 2>&1; then
+      break
+    fi
+  fi
+  sleep 1
+done
 
 echo "Applying Prisma migrations to Cloud SQL..."
-export DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@localhost:3307/${DB_NAME}"
-./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma
+export DATABASE_URL="mysql://${DB_USER}:${DB_PASS_ENC}@127.0.0.1:3307/${DB_NAME}"
+
+# Quick connectivity check before migrations (gives clearer errors than P1017).
+set +e
+./node_modules/.bin/prisma db execute --schema prisma/schema.prisma --stdin <<'SQL'
+SELECT 1;
+SQL
+DB_CHECK_EXIT=$?
+set -e
+if [[ "$DB_CHECK_EXIT" != "0" ]]; then
+  echo "DB connectivity check failed. Last 80 proxy log lines:"
+  tail -n 80 "$PROXY_LOG" || true
+  echo ""
+  echo "Most common causes:"
+  echo "  - Wrong DB_PASS (password is hidden while typing)"
+  echo "  - Wrong DB_NAME (database doesn't exist)"
+  echo "  - Cloud SQL user doesn't exist or is blocked"
+  exit 1
+fi
+
+# Prisma can sometimes throw transient P1017 if the proxy is still warming up.
+for attempt in 1 2 3; do
+  if ./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma; then
+    break
+  fi
+  echo "Prisma migrate deploy failed (attempt ${attempt}/3). Retrying in 3s..."
+  sleep 3
+  if [[ "$attempt" == "3" ]]; then
+    echo "Prisma migrate deploy failed after retries. Last 120 proxy log lines:"
+    tail -n 120 "$PROXY_LOG" || true
+    exit 1
+  fi
+done
 
 # ---- Create runtime service account (if missing) ----
 if ! gcloud iam service-accounts describe "$RUNTIME_SA_EMAIL" >/dev/null 2>&1; then
@@ -96,7 +162,7 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --role="roles/pubsub.publisher" >/dev/null
 
 # ---- Secret Manager: store Cloud Run DATABASE_URL using unix socket ----
-SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
+SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS_ENC}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
 
 if ! gcloud secrets describe "$DB_URL_SECRET" >/dev/null 2>&1; then
   echo "Creating secret ${DB_URL_SECRET}..."
@@ -107,6 +173,21 @@ else
 fi
 
 gcloud secrets add-iam-policy-binding "$DB_URL_SECRET" \
+  --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor" >/dev/null
+
+# ---- Secret Manager: store JWT_SECRET ----
+if ! gcloud secrets describe "$JWT_SECRET_NAME" >/dev/null 2>&1; then
+  echo "Creating secret ${JWT_SECRET_NAME}..."
+  printf '%s' "$JWT_SECRET" | gcloud secrets create "$JWT_SECRET_NAME" --data-file=- >/dev/null
+else
+  # Optional: Update it if provided explicitly, otherwise leave existing version to avoid rotation churn
+  # For now, we only update if the user manually provided a new one or if we want to enforce rotation.
+  # Let's simple check: if it exists, we assume it's good unless the script is modified to force update.
+  echo "Secret ${JWT_SECRET_NAME} exists. Using latest version."
+fi
+
+gcloud secrets add-iam-policy-binding "$JWT_SECRET_NAME" \
   --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
   --role="roles/secretmanager.secretAccessor" >/dev/null
 
@@ -124,7 +205,7 @@ gcloud run deploy cashflow-api \
   --region "$REGION" \
   --add-cloudsql-instances "$INSTANCE_CONN" \
   --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC}" \
-  --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest" \
+  --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest,JWT_SECRET=${JWT_SECRET_NAME}:latest" \
   --service-account "$RUNTIME_SA_EMAIL"
 
 echo "Deploying cashflow-worker..."
@@ -150,6 +231,7 @@ gcloud run deploy cashflow-publisher \
   --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC},PUBLISH_INTERVAL_MS=1000,PUBLISH_BATCH_SIZE=50,LOCK_TIMEOUT_MS=60000" \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest" \
   --service-account "$RUNTIME_SA_EMAIL" \
+  --min-instances 1 \
   --no-allow-unauthenticated
 
 echo "Deploying cashflow-frontend..."

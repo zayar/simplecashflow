@@ -5,7 +5,7 @@ export type StockMoveInput = {
     warehouseId: number;
     itemId: number;
     date: Date;
-    type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
+    type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'SALE_RETURN' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
     direction: 'IN' | 'OUT';
     quantity: Prisma.Decimal;
     unitCostApplied: Prisma.Decimal;
@@ -59,4 +59,13 @@ export declare function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInp
     unitCostApplied: Prisma.Decimal;
     totalCostApplied: Prisma.Decimal;
 }>;
+export declare function getStockBalanceForUpdate(tx: PrismaTx, input: {
+    companyId: number;
+    warehouseId: number;
+    itemId: number;
+}): Promise<{
+    qtyOnHand: Prisma.Decimal;
+    avgUnitCost: Prisma.Decimal;
+    inventoryValue: Prisma.Decimal;
+} | null>;
 //# sourceMappingURL=stock.service.d.ts.map

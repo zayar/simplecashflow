@@ -121,7 +121,9 @@ export default function NewItemPage() {
                 <Input
                   id="sellingPrice"
                   type="number"
-                  step="0.01"
+                  inputMode="numeric"
+                  step="1"
+                  min="0"
                   required
                   value={formData.sellingPrice}
                   onChange={(e) => setFormData({ ...formData, sellingPrice: e.target.value })}
@@ -151,7 +153,9 @@ export default function NewItemPage() {
                 <Input
                   id="costPrice"
                   type="number"
-                  step="0.01"
+                  inputMode="numeric"
+                  step="1"
+                  min="0"
                   value={formData.costPrice}
                   onChange={(e) => setFormData({ ...formData, costPrice: e.target.value })}
                 />

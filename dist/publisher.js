@@ -12,7 +12,12 @@ function backoffMs(attempt) {
     return Math.min(ms, 60_000);
 }
 function buildEnvelopeFromEventRow(e) {
-    const companyId = e.companyId ?? 0;
+    const companyId = Number(e.companyId);
+    if (!Number.isInteger(companyId) || companyId <= 0) {
+        throw Object.assign(new Error('outbox event is missing a valid companyId (tenant)'), {
+            code: 'OUTBOX_TENANT_MISSING',
+        });
+    }
     const payload = e.payload ?? {};
     const aggregateId = e.aggregateId ??
         (typeof payload?.journalEntryId === 'number'
@@ -34,6 +39,19 @@ function buildEnvelopeFromEventRow(e) {
         source: e.source ?? 'cashflow-api',
         payload,
     };
+}
+async function deadLetterAndUnlock(eventId, reason) {
+    await prisma.event.update({
+        where: { eventId },
+        data: {
+            // Mark as "done" so it won't be retried forever. We keep the row for audit.
+            publishedAt: new Date(),
+            nextPublishAttemptAt: null,
+            lastPublishError: `dead-letter: ${reason}`,
+            lockId: null,
+            lockedAt: null,
+        },
+    });
 }
 async function claimBatch(lockId, now) {
     const staleBefore = new Date(now.getTime() - LOCK_TIMEOUT_MS);
@@ -121,6 +139,17 @@ async function tick() {
                 await markPublishedAndUnlock(e.eventId);
             }
             catch (err) {
+                if (err?.code === 'OUTBOX_TENANT_MISSING') {
+                    fastify.log.error({ err, eventId: e.eventId, eventType: e.eventType }, 'Dead-lettering outbox event due to missing tenant');
+                    try {
+                        await deadLetterAndUnlock(e.eventId, err.message);
+                    }
+                    catch (e2) {
+                        // If we can't dead-letter, fall back to retry scheduling.
+                        await releaseLockAndScheduleRetry(e.eventId, e2);
+                    }
+                    continue;
+                }
                 fastify.log.error({ err, eventId: e.eventId, eventType: e.eventType }, 'Failed to publish outbox event');
                 await releaseLockAndScheduleRetry(e.eventId, err);
             }
@@ -130,7 +159,17 @@ async function tick() {
         running = false;
     }
 }
-fastify.get('/health', async () => ({ status: 'ok' }));
+// Health check. Also triggers a best-effort tick so a scheduler ping can drive publishing
+// even if Cloud Run CPU is throttled while idle.
+fastify.get('/health', async () => {
+    try {
+        void tick();
+    }
+    catch {
+        // best-effort
+    }
+    return { status: 'ok' };
+});
 const start = async () => {
     const port = Number(process.env.PORT) || 8080;
     await fastify.listen({ port, host: '0.0.0.0' });

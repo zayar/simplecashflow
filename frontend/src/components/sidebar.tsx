@@ -15,12 +15,15 @@ import {
   ReceiptText,
   Truck,
   Settings,
+  Percent,
+  CreditCard,
 } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import { buttonVariants } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
+import { LogoMark } from "@/components/logo-mark"
 
 type NavItem = {
   href: string
@@ -29,31 +32,35 @@ type NavItem = {
 }
 
 const navGroups: { label: string; items: NavItem[] }[] = [
+  // Home
+  { label: "Home", items: [{ href: "/", label: "Home", icon: LayoutDashboard }] },
+
+  // Top-level items
+  { label: "", items: [{ href: "/items", label: "Items", icon: Package }] },
+
+  // Sales
   {
-    label: "Overview",
-    items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }],
-  },
-  {
-    label: "Money",
+    label: "Sales",
     items: [
+      { href: "/customers", label: "Customers", icon: Users },
       { href: "/invoices", label: "Invoices", icon: FileText },
+      { href: "/credit-notes", label: "Credit Notes", icon: FileText },
+      { href: "/sales/payments", label: "Payments", icon: CreditCard },
+    ],
+  },
+
+  // Purchases
+  {
+    label: "Purchases",
+    items: [
+      { href: "/vendors", label: "Vendors", icon: Truck },
       { href: "/expenses", label: "Expenses", icon: ReceiptText },
       { href: "/purchase-bills", label: "Purchase Bills", icon: ReceiptText },
-      { href: "/banking", label: "Banking", icon: Landmark },
+      { href: "/purchases/payments", label: "Payments", icon: CreditCard },
     ],
   },
-  {
-    label: "Accounting",
-    items: [
-      { href: "/journal", label: "Journal", icon: BookOpen },
-      { href: "/accounts", label: "Accounts", icon: Calculator },
-      { href: "/settings", label: "Company Profile", icon: Settings },
-    ],
-  },
-  {
-    label: "Reports",
-    items: [{ href: "/reports", label: "Reports", icon: BarChart }],
-  },
+
+  // Inventory
   {
     label: "Inventory",
     items: [
@@ -63,14 +70,25 @@ const navGroups: { label: string; items: NavItem[] }[] = [
       { href: "/inventory/warehouses", label: "Warehouses", icon: Package },
     ],
   },
+
+  // Banking
+  { label: "", items: [{ href: "/banking", label: "Banking", icon: Landmark }] },
+
+  // Accounting
   {
-    label: "Contacts",
+    label: "Accounting",
     items: [
-      { href: "/customers", label: "Customers", icon: Users },
-      { href: "/vendors", label: "Vendors", icon: Truck },
-      { href: "/items", label: "Items", icon: Package },
+      { href: "/journal", label: "Journal", icon: BookOpen },
+      { href: "/accounts", label: "Accounts", icon: Calculator },
+      { href: "/taxes", label: "Taxes", icon: Percent },
     ],
   },
+
+  // Reports
+  { label: "Reports", items: [{ href: "/reports", label: "Reports", icon: BarChart }] },
+
+  // Company Profile
+  { label: "", items: [{ href: "/settings", label: "Company Profile", icon: Settings }] },
 ]
 
 export function Sidebar() {
@@ -81,10 +99,8 @@ export function Sidebar() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex h-14 items-center gap-2 px-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg border bg-background text-sm font-semibold">
-          C
-        </div>
+      <Link href="/" className="flex h-14 items-center gap-2 px-4">
+        <LogoMark className="h-9 w-9" title="Cashflow" />
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold tracking-tight">
             Cashflow
@@ -93,7 +109,7 @@ export function Sidebar() {
             Company #{user.companyId}
           </div>
         </div>
-      </div>
+      </Link>
 
       <Separator />
 
@@ -101,9 +117,11 @@ export function Sidebar() {
         <nav className="space-y-4">
           {navGroups.map((group) => (
             <div key={group.label} className="space-y-1">
+              {group.label ? (
               <div className="px-2 text-xs font-medium text-muted-foreground">
                 {group.label}
               </div>
+              ) : null}
               <div className="space-y-1">
                 {group.items.map((item) => {
                   const isActive =
@@ -112,20 +130,23 @@ export function Sidebar() {
                       : pathname === item.href || pathname.startsWith(item.href + "/")
 
                   return (
-                    <Button
+                    <Link
                       key={item.href}
-                      asChild
-                      variant={isActive ? "secondary" : "ghost"}
+                      href={item.href}
                       className={cn(
+                        buttonVariants({
+                          variant: isActive ? "secondary" : "ghost",
+                          size: "sm",
+                        }),
                         "w-full justify-start gap-2",
                         isActive && "font-medium"
                       )}
                     >
-                      <Link href={item.href}>
+                      <span className="inline-flex items-center gap-2">
                         <item.icon className="h-4 w-4" />
                         {item.label}
-                      </Link>
-                    </Button>
+                      </span>
+                    </Link>
                   )
                 })}
               </div>

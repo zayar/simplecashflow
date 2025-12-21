@@ -6,16 +6,30 @@ import { getRedis } from '../../infrastructure/redis.js';
 import { withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
-import { isoNow } from '../../utils/date.js';
+import { isoNow, parseDateInput } from '../../utils/date.js';
 import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureWarehouse } from './stock.service.js';
+import { requireAnyRole, Roles } from '../../utils/rbac.js';
+import { writeAuditLog } from '../../infrastructure/auditLog.js';
 function d2(n) {
     return new Prisma.Decimal(n).toDecimalPlaces(2);
 }
 export async function inventoryRoutes(fastify) {
     fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
+    async function resolveDefaultWarehouseId(companyId) {
+        const company = await prisma.company.findUnique({
+            where: { id: companyId },
+            select: { defaultWarehouseId: true },
+        });
+        const fromCompany = company?.defaultWarehouseId ?? null;
+        if (fromCompany)
+            return fromCompany;
+        const wh = await prisma.warehouse.findFirst({
+            where: { companyId, isDefault: true },
+            select: { id: true },
+        });
+        return wh?.id ?? null;
+    }
     // --- Warehouses ---
     fastify.get('/companies/:companyId/warehouses', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -50,6 +64,7 @@ export async function inventoryRoutes(fastify) {
     // Header: Idempotency-Key
     fastify.post('/companies/:companyId/inventory/opening-balance', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
         const idempotencyKey = request.headers?.['idempotency-key'];
         if (!idempotencyKey) {
             reply.status(400);
@@ -62,13 +77,30 @@ export async function inventoryRoutes(fastify) {
         }
         const occurredAt = isoNow();
         const correlationId = randomUUID();
-        const date = body.date ? new Date(body.date) : new Date();
+        const date = parseDateInput(body.date) ?? new Date();
         if (body.date && isNaN(date.getTime())) {
             reply.status(400);
             return { error: 'invalid date' };
         }
         const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
-        const lockKeys = body.lines.map((l) => `lock:stock:${companyId}:${warehouseIdHint ?? 'default'}:${l.itemId}`);
+        const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
+        const resolvedWarehouseId = warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+        const lockKeys = body.lines.flatMap((l) => {
+            // Always lock by resolved numeric warehouseId when available to prevent races
+            // between "default warehouse" calls and explicit warehouseId calls.
+            const keys = [];
+            if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
+                keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
+                if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+                    keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+                }
+            }
+            else {
+                // Fallback: lock on default alias (also serializes callers while defaults are being bootstrapped).
+                keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+            }
+            return keys;
+        });
         const { replay, response: result } = await withLocksBestEffort(redis, lockKeys, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
@@ -148,27 +180,24 @@ export async function inventoryRoutes(fastify) {
                         payload: { journalEntryId: je.id, companyId },
                     },
                 });
+                await writeAuditLog(tx, {
+                    companyId,
+                    userId: request.user?.userId ?? null,
+                    action: 'inventory.opening_balance',
+                    entityType: 'JournalEntry',
+                    entityId: je.id,
+                    idempotencyKey,
+                    correlationId,
+                    metadata: {
+                        warehouseId,
+                        totalValue: totalValue.toString(),
+                        linesCount: (body.lines ?? []).length,
+                    },
+                });
                 return { journalEntryId: je.id, totalValue: totalValue.toString(), warehouseId, _jeEventId: jeEventId };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
         }, redis));
-        if (!replay) {
-            const ok = await publishDomainEvent({
-                eventId: result._jeEventId,
-                eventType: 'journal.entry.created',
-                schemaVersion: 'v1',
-                occurredAt: result._occurredAt,
-                companyId,
-                partitionKey: String(companyId),
-                correlationId: result._correlationId,
-                aggregateType: 'JournalEntry',
-                aggregateId: String(result.journalEntryId),
-                source: 'cashflow-api',
-                payload: { journalEntryId: result.journalEntryId, companyId },
-            });
-            if (ok)
-                await markEventPublished(result._jeEventId);
-        }
         return {
             warehouseId: result.warehouseId,
             journalEntryId: result.journalEntryId,
@@ -179,6 +208,7 @@ export async function inventoryRoutes(fastify) {
     // POST /companies/:companyId/inventory/adjustments
     fastify.post('/companies/:companyId/inventory/adjustments', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
         const idempotencyKey = request.headers?.['idempotency-key'];
         if (!idempotencyKey) {
             reply.status(400);
@@ -191,13 +221,27 @@ export async function inventoryRoutes(fastify) {
         }
         const occurredAt = isoNow();
         const correlationId = randomUUID();
-        const date = body.date ? new Date(body.date) : new Date();
+        const date = parseDateInput(body.date) ?? new Date();
         if (body.date && isNaN(date.getTime())) {
             reply.status(400);
             return { error: 'invalid date' };
         }
         const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
-        const lockKeys = body.lines.map((l) => `lock:stock:${companyId}:${warehouseIdHint ?? 'default'}:${l.itemId}`);
+        const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
+        const resolvedWarehouseId = warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+        const lockKeys = body.lines.flatMap((l) => {
+            const keys = [];
+            if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
+                keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
+                if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+                    keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+                }
+            }
+            else {
+                keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
+            }
+            return keys;
+        });
         const { replay, response: result } = await withLocksBestEffort(redis, lockKeys, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
@@ -335,27 +379,27 @@ export async function inventoryRoutes(fastify) {
                         payload: { journalEntryId: je.id, companyId },
                     },
                 });
+                await writeAuditLog(tx, {
+                    companyId,
+                    userId: request.user?.userId ?? null,
+                    action: 'inventory.adjustment',
+                    entityType: 'JournalEntry',
+                    entityId: je.id,
+                    idempotencyKey,
+                    correlationId,
+                    metadata: {
+                        warehouseId,
+                        offsetAccountId,
+                        referenceNumber: body.referenceNumber ?? null,
+                        reason: body.reason ?? null,
+                        linesCount: (body.lines ?? []).length,
+                        netValue: net.toString(),
+                    },
+                });
                 return { journalEntryId: je.id, netValue: net.toString(), warehouseId, _jeEventId: jeEventId };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
         }, redis));
-        if (!replay) {
-            const ok = await publishDomainEvent({
-                eventId: result._jeEventId,
-                eventType: 'journal.entry.created',
-                schemaVersion: 'v1',
-                occurredAt: result._occurredAt,
-                companyId,
-                partitionKey: String(companyId),
-                correlationId: result._correlationId,
-                aggregateType: 'JournalEntry',
-                aggregateId: String(result.journalEntryId),
-                source: 'cashflow-api',
-                payload: { journalEntryId: result.journalEntryId, companyId },
-            });
-            if (ok)
-                await markEventPublished(result._jeEventId);
-        }
         return {
             warehouseId: result.warehouseId,
             journalEntryId: result.journalEntryId,

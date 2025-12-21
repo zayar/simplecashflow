@@ -71,6 +71,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       .catch((err) => {
         console.error(err);
         if (cancelled) return;
+        // If we got logged out due to 401, don't keep the settings in a broken state loop.
         setCompanySettings(null);
       })
       .finally(() => {

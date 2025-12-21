@@ -7,10 +7,10 @@ import { useAuth } from '@/contexts/auth-context';
 import { fetchApi } from '@/lib/api';
 import { formatDateInTimeZone } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Pencil } from 'lucide-react';
 
 function statusBadge(status: string) {
   switch (status) {
@@ -35,6 +35,7 @@ export default function PurchaseBillDetailPage() {
 
   const [bill, setBill] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
+  const [posting, setPosting] = useState(false);
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -62,9 +63,31 @@ export default function PurchaseBillDetailPage() {
   const totalPaid = useMemo(() => Number(bill?.totalPaid ?? 0), [bill]);
   const remaining = useMemo(() => Number(bill?.remainingBalance ?? 0), [bill]);
 
+  const missingAccountLines = useMemo(() => {
+    const lines = (bill?.lines ?? []) as any[];
+    const missing: number[] = [];
+    for (const [idx, l] of lines.entries()) {
+      const it = l.item;
+      const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
+      // Tracked items should be Inventory Asset (configured); if account is missing, posting will fail.
+      if (isTracked && !l.accountId) missing.push(idx + 1);
+      // Non-tracked requires an EXPENSE account mapping before posting.
+      if (!isTracked && !l.accountId) missing.push(idx + 1);
+    }
+    return Array.from(new Set(missing));
+  }, [bill]);
+
+  const canPost = useMemo(() => {
+    if (!bill) return false;
+    if (bill.status !== 'DRAFT') return false;
+    return missingAccountLines.length === 0;
+  }, [bill, missingAccountLines]);
+
   const postBill = async () => {
     if (!user?.companyId) return;
     if (!confirm('Post this purchase bill? This will increase Inventory and Accounts Payable.')) return;
+    if (posting) return;
+    setPosting(true);
     try {
       await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}/post`, {
         method: 'POST',
@@ -74,6 +97,8 @@ export default function PurchaseBillDetailPage() {
       await load();
     } catch (err: any) {
       alert(err.message || 'Failed to post purchase bill');
+    } finally {
+      setPosting(false);
     }
   };
 
@@ -102,22 +127,48 @@ export default function PurchaseBillDetailPage() {
 
         <div className="flex gap-2">
           {bill?.status === 'DRAFT' ? (
-            <Button onClick={postBill}>Post</Button>
+            <Link href={`/purchase-bills/${id}/edit`} className={buttonVariants({ variant: 'outline' })}>
+              <span className="inline-flex items-center gap-2">
+                <Pencil className="h-4 w-4" /> Edit
+              </span>
+            </Link>
+          ) : null}
+          {bill?.status === 'DRAFT' ? (
+            <Button
+              onClick={postBill}
+              loading={posting}
+              loadingText="Posting..."
+              disabled={loading || !canPost}
+              title={!canPost ? 'Set an account for all lines before posting.' : undefined}
+            >
+              Post
+            </Button>
           ) : null}
           {(bill?.status === 'POSTED' || bill?.status === 'PARTIAL') && remaining > 0 ? (
-            <Button asChild>
-              <Link href={`/purchase-bills/${id}/payment`}>Record payment</Link>
-            </Button>
+            <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
+              Record payment
+            </Link>
           ) : null}
           {bill?.journalEntryId ? (
-            <Button asChild variant="outline">
-              <Link href={`/journal/${bill.journalEntryId}`}>View Journal Entry</Link>
-            </Button>
+            <Link
+              href={`/journal/${bill.journalEntryId}`}
+              className={buttonVariants({ variant: 'outline' })}
+            >
+              View Journal Entry
+            </Link>
           ) : null}
         </div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
+        {bill?.status === 'DRAFT' && missingAccountLines.length > 0 ? (
+          <div className="md:col-span-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm">
+            <div className="font-medium">Account mapping required to post</div>
+            <div className="text-muted-foreground">
+              Please select an account for line(s): <b>{missingAccountLines.join(', ')}</b>. You can still keep this as a draft.
+            </div>
+          </div>
+        ) : null}
         <Card className="shadow-sm md:col-span-2">
           <CardHeader>
             <CardTitle className="text-lg">Lines</CardTitle>

@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { prisma } from '../../infrastructure/db.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
 import { Prisma } from '@prisma/client';
 import { postJournalEntry } from './posting.service.js';
 import { enforceCompanyScope, forbidClientProvidedCompanyId, requireCompanyIdParam } from '../../utils/tenant.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { getRedis } from '../../infrastructure/redis.js';
 import { withLockBestEffort } from '../../infrastructure/locks.js';
-import { normalizeToDay } from '../../utils/date.js';
+import { normalizeToDay, parseDateInput } from '../../utils/date.js';
+import { requireAnyRole, Roles } from '../../utils/rbac.js';
+import { writeAuditLog } from '../../infrastructure/auditLog.js';
 export async function ledgerRoutes(fastify) {
     // All ledger endpoints are tenant-scoped and must be authenticated.
     fastify.addHook('preHandler', fastify.authenticate);
@@ -51,6 +51,7 @@ export async function ledgerRoutes(fastify) {
             const totalCredit = e.lines.reduce((sum, l) => sum + Number(l.credit), 0);
             return {
                 id: e.id,
+                entryNumber: e.entryNumber ?? null,
                 date: e.date,
                 description: e.description,
                 totalDebit,
@@ -60,6 +61,97 @@ export async function ledgerRoutes(fastify) {
                 createdAt: e.createdAt,
             };
         });
+    });
+    // --- Manual journal entry creation (tenant-scoped) ---
+    // POST /companies/:companyId/journal-entries
+    // Requires Idempotency-Key; creates an immutable JournalEntry + emits outbox event.
+    fastify.post('/companies/:companyId/journal-entries', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const body = request.body;
+        if (!body.lines || body.lines.length === 0) {
+            reply.status(400);
+            return { error: 'at least one line is required' };
+        }
+        const date = parseDateInput(body.date) ?? new Date();
+        if (body.date && isNaN(date.getTime())) {
+            reply.status(400);
+            return { error: 'invalid date (must be ISO string)' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const eventId = randomUUID();
+        const correlationId = eventId;
+        const occurredAt = new Date().toISOString();
+        const lockKey = `lock:manual-journal:${companyId}:${date.toISOString().slice(0, 10)}`;
+        const { response } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const created = await prisma.$transaction(async (tx) => {
+                const je = await postJournalEntry(tx, {
+                    companyId,
+                    date,
+                    description: body.description ?? '',
+                    createdByUserId: request.user?.userId ?? null,
+                    lines: (body.lines ?? []).map((line) => ({
+                        accountId: Number(line.accountId),
+                        debit: new Prisma.Decimal((line.debit ?? 0).toFixed(2)),
+                        credit: new Prisma.Decimal((line.credit ?? 0).toFixed(2)),
+                    })),
+                });
+                // Totals for response/event
+                const totalDebit = je.lines.reduce((sum, l) => sum.add(new Prisma.Decimal(l.debit)), new Prisma.Decimal(0));
+                const totalCredit = je.lines.reduce((sum, l) => sum.add(new Prisma.Decimal(l.credit)), new Prisma.Decimal(0));
+                await tx.event.create({
+                    data: {
+                        companyId,
+                        eventId,
+                        eventType: 'journal.entry.created',
+                        schemaVersion: 'v1',
+                        occurredAt: new Date(occurredAt),
+                        source: 'cashflow-api',
+                        partitionKey: String(companyId),
+                        correlationId,
+                        aggregateType: 'JournalEntry',
+                        aggregateId: String(je.id),
+                        type: 'JournalEntryCreated',
+                        payload: {
+                            journalEntryId: je.id,
+                            companyId,
+                            totalDebit: Number(totalDebit),
+                            totalCredit: Number(totalCredit),
+                        },
+                    },
+                });
+                await writeAuditLog(tx, {
+                    companyId,
+                    userId: request.user?.userId ?? null,
+                    action: 'journal_entry.create_manual',
+                    entityType: 'JournalEntry',
+                    entityId: je.id,
+                    idempotencyKey,
+                    correlationId,
+                    metadata: {
+                        date,
+                        description: body.description ?? '',
+                        totalDebit: Number(totalDebit),
+                        totalCredit: Number(totalCredit),
+                        linesCount: (body.lines ?? []).length,
+                    },
+                });
+                return {
+                    id: je.id,
+                    date: je.date,
+                    description: je.description,
+                    totalDebit: Number(totalDebit),
+                    totalCredit: Number(totalCredit),
+                    balanced: new Prisma.Decimal(totalDebit).toDecimalPlaces(2).equals(new Prisma.Decimal(totalCredit).toDecimalPlaces(2)),
+                };
+            });
+            return created;
+        }, redis));
+        return response;
     });
     // --- Journal Entry detail (for UI) ---
     fastify.get('/companies/:companyId/journal-entries/:journalEntryId', async (request, reply) => {
@@ -87,6 +179,7 @@ export async function ledgerRoutes(fastify) {
         const totalCredit = entry.lines.reduce((sum, l) => sum + Number(l.credit), 0);
         return {
             id: entry.id,
+            entryNumber: entry.entryNumber ?? null,
             date: entry.date,
             description: entry.description,
             totalDebit,
@@ -103,6 +196,7 @@ export async function ledgerRoutes(fastify) {
     });
     // --- Journal Entry API (with debit = credit check) ---
     fastify.post('/journal-entries', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
         const body = request.body;
         if (!body.lines || body.lines.length === 0) {
             reply.status(400);
@@ -110,7 +204,7 @@ export async function ledgerRoutes(fastify) {
         }
         // Never trust companyId from client. We derive it from JWT (and forbid mismatches).
         const companyId = forbidClientProvidedCompanyId(request, reply, body.companyId);
-        const date = body.date ? new Date(body.date) : new Date();
+        const date = parseDateInput(body.date) ?? new Date();
         // Prepare event data
         const eventId = randomUUID();
         const correlationId = eventId; // Step 1 default: correlationId = first eventId in workflow
@@ -124,7 +218,7 @@ export async function ledgerRoutes(fastify) {
             return { error: 'Idempotency-Key header is required' };
         }
         // Wrap in idempotency so retries can't duplicate journal entries.
-        const { replay, response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        const { response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const entry = await prisma.$transaction(async (tx) => {
                 const created = await postJournalEntry(tx, {
                     companyId,
@@ -161,42 +255,33 @@ export async function ledgerRoutes(fastify) {
                         },
                     },
                 });
+                await writeAuditLog(tx, {
+                    companyId,
+                    userId: request.user?.userId ?? null,
+                    action: 'journal_entry.create',
+                    entityType: 'JournalEntry',
+                    entityId: created.id,
+                    idempotencyKey,
+                    correlationId,
+                    metadata: {
+                        date,
+                        description: body.description ?? '',
+                        totalDebit: Number(totalDebit),
+                        totalCredit: Number(totalCredit),
+                    },
+                });
                 return created;
             });
-            const envelope = {
-                eventId,
-                eventType,
-                schemaVersion,
-                occurredAt,
-                companyId,
-                partitionKey: String(companyId),
-                correlationId,
-                aggregateType: 'JournalEntry',
-                aggregateId: String(entry.id),
-                source,
-                payload: {
-                    journalEntryId: entry.id,
-                    companyId,
-                    // Informational totals; consumers should trust stored JournalLines.
-                    totalDebit: entry.lines.reduce((sum, l) => sum + Number(l.debit), 0),
-                    totalCredit: entry.lines.reduce((sum, l) => sum + Number(l.credit), 0),
-                },
-            };
-            return { entry, envelope };
+            return entry;
         }, redis);
-        if (!replay) {
-            const published = await publishDomainEvent(response.envelope);
-            if (published) {
-                await markEventPublished(eventId);
-            }
-        }
-        return response.entry;
+        return response;
     });
     // --- Reverse a posted journal entry (immutable ledger) ---
     // POST /companies/:companyId/journal-entries/:journalEntryId/reverse
     // Requires Idempotency-Key header to prevent duplicate reversals under retries.
     fastify.post('/companies/:companyId/journal-entries/:journalEntryId/reverse', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
         const journalEntryId = Number(request.params?.journalEntryId);
         if (!companyId || Number.isNaN(journalEntryId)) {
             reply.status(400);
@@ -208,7 +293,7 @@ export async function ledgerRoutes(fastify) {
             return { error: 'Idempotency-Key header is required' };
         }
         const body = (request.body ?? {});
-        const reversalDate = body.date ? new Date(body.date) : new Date();
+        const reversalDate = parseDateInput(body.date) ?? new Date();
         if (body.date && isNaN(reversalDate.getTime())) {
             reply.status(400);
             return { error: 'invalid date (must be ISO string)' };
@@ -249,6 +334,20 @@ export async function ledgerRoutes(fastify) {
                         reversalOfJournalEntryId: original.id,
                         reversalReason: body.reason ?? null,
                         lines: reversalLines,
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'journal_entry.reverse',
+                        entityType: 'JournalEntry',
+                        entityId: reversalEntry.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            originalJournalEntryId: original.id,
+                            reversalDate,
+                            reason: body.reason ?? null,
+                        },
                     });
                     // Event 1: journal.entry.created (for the reversal entry) => triggers summaries/reporting consumers.
                     const createdEventId = randomUUID();
@@ -308,47 +407,6 @@ export async function ledgerRoutes(fastify) {
                     _occurredAt: occurredAt,
                 };
             }, redis));
-            if (!replay) {
-                const createdOk = await publishDomainEvent({
-                    eventId: result._createdEventId,
-                    eventType: 'journal.entry.created',
-                    schemaVersion: 'v1',
-                    occurredAt: result._occurredAt,
-                    companyId,
-                    partitionKey: String(companyId),
-                    correlationId: result._correlationId,
-                    aggregateType: 'JournalEntry',
-                    aggregateId: String(result.reversalJournalEntryId),
-                    source: 'cashflow-api',
-                    payload: {
-                        journalEntryId: result.reversalJournalEntryId,
-                        companyId,
-                        reversalOfJournalEntryId: result.originalJournalEntryId,
-                    },
-                });
-                if (createdOk)
-                    await markEventPublished(result._createdEventId);
-                const reversedOk = await publishDomainEvent({
-                    eventId: result._reversedEventId,
-                    eventType: 'journal.entry.reversed',
-                    schemaVersion: 'v1',
-                    occurredAt: result._occurredAt,
-                    companyId,
-                    partitionKey: String(companyId),
-                    correlationId: result._correlationId,
-                    aggregateType: 'JournalEntry',
-                    aggregateId: String(result.originalJournalEntryId),
-                    source: 'cashflow-api',
-                    payload: {
-                        originalJournalEntryId: result.originalJournalEntryId,
-                        reversalJournalEntryId: result.reversalJournalEntryId,
-                        companyId,
-                        reason: body.reason ?? null,
-                    },
-                });
-                if (reversedOk)
-                    await markEventPublished(result._reversedEventId);
-            }
             return {
                 originalJournalEntryId: result.originalJournalEntryId,
                 reversalJournalEntryId: result.reversalJournalEntryId,
@@ -372,6 +430,7 @@ export async function ledgerRoutes(fastify) {
     // It is safe because it uses immutable journal entries and is idempotent + locked.
     fastify.post('/companies/:companyId/period-close', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
         const query = request.query;
         if (!query.from || !query.to) {
             reply.status(400);
@@ -516,6 +575,21 @@ export async function ledgerRoutes(fastify) {
                             createdByUserId: request.user?.userId ?? null,
                         },
                     });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'period_close.create',
+                        entityType: 'PeriodClose',
+                        entityId: periodClose.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            from: query.from,
+                            to: query.to,
+                            journalEntryId: je.id,
+                            netProfit: netProfit.toString(),
+                        },
+                    });
                     const eventId = randomUUID();
                     await tx.event.create({
                         data: {
@@ -551,23 +625,6 @@ export async function ledgerRoutes(fastify) {
                     _occurredAt: occurredAt,
                 };
             }, redis));
-            if (!replay && !result.alreadyClosed) {
-                const ok = await publishDomainEvent({
-                    eventId: result._eventId,
-                    eventType: 'journal.entry.created',
-                    schemaVersion: 'v1',
-                    occurredAt: result._occurredAt,
-                    companyId,
-                    partitionKey: String(companyId),
-                    correlationId: result._correlationId,
-                    aggregateType: 'JournalEntry',
-                    aggregateId: String(result.journalEntryId),
-                    source: 'cashflow-api',
-                    payload: { journalEntryId: result.journalEntryId, companyId },
-                });
-                if (ok)
-                    await markEventPublished(result._eventId);
-            }
             return {
                 companyId,
                 from: query.from,
@@ -669,6 +726,37 @@ export async function ledgerRoutes(fastify) {
             },
             _sum: { debitTotal: true, creditTotal: true },
         });
+        // Compute current earnings (net income) up to asOf from INCOME/EXPENSE accounts.
+        // This removes the confusing "Out of balance" warning in Balance Sheet before period close.
+        // After a period close, INCOME/EXPENSE accounts for closed periods are zeroed by the close entry,
+        // so this naturally trends toward 0 for closed periods.
+        const pnlGrouped = await prisma.accountBalance.groupBy({
+            by: ['accountId'],
+            where: { companyId, date: { lte: asOfDate } },
+            _sum: { debitTotal: true, creditTotal: true },
+        });
+        const pnlAccountIds = pnlGrouped.map((g) => g.accountId);
+        const pnlAccounts = await prisma.account.findMany({
+            where: { companyId, id: { in: pnlAccountIds }, type: { in: ['INCOME', 'EXPENSE'] } },
+            select: { id: true, type: true },
+        });
+        const pnlById = new Map(pnlAccounts.map((a) => [a.id, a]));
+        let totalIncome = new Prisma.Decimal(0);
+        let totalExpense = new Prisma.Decimal(0);
+        for (const g of pnlGrouped) {
+            const acc = pnlById.get(g.accountId);
+            if (!acc)
+                continue;
+            const debit = new Prisma.Decimal(g._sum.debitTotal ?? 0).toDecimalPlaces(2);
+            const credit = new Prisma.Decimal(g._sum.creditTotal ?? 0).toDecimalPlaces(2);
+            if (acc.type === 'INCOME')
+                totalIncome = totalIncome.add(credit.sub(debit));
+            if (acc.type === 'EXPENSE')
+                totalExpense = totalExpense.add(debit.sub(credit));
+        }
+        totalIncome = totalIncome.toDecimalPlaces(2);
+        totalExpense = totalExpense.toDecimalPlaces(2);
+        const currentEarnings = totalIncome.sub(totalExpense).toDecimalPlaces(2);
         const accountIds = grouped.map((g) => g.accountId);
         const accounts = await prisma.account.findMany({
             where: {
@@ -704,6 +792,22 @@ export async function ledgerRoutes(fastify) {
         const assets = rows.filter((r) => r.type === 'ASSET');
         const liabilities = rows.filter((r) => r.type === 'LIABILITY');
         const equity = rows.filter((r) => r.type === 'EQUITY');
+        // Add synthetic equity line for current earnings so accounting equation holds without requiring period close.
+        // If currentEarnings is 0, omit to reduce noise.
+        if (!currentEarnings.equals(0)) {
+            const credit = currentEarnings.greaterThan(0) ? currentEarnings : new Prisma.Decimal(0);
+            const debit = currentEarnings.lessThan(0) ? currentEarnings.abs() : new Prisma.Decimal(0);
+            equity.push({
+                accountId: 0,
+                code: '9999',
+                name: 'Current Period Earnings',
+                type: 'EQUITY',
+                debit: debit.toString(),
+                credit: credit.toString(),
+                // For equity, normal balance is credit - debit
+                balance: credit.sub(debit).toDecimalPlaces(2).toString(),
+            });
+        }
         const sumBalances = (items) => items.reduce((sum, r) => sum.add(new Prisma.Decimal(r.balance)), new Prisma.Decimal(0)).toDecimalPlaces(2);
         const totalAssets = sumBalances(assets);
         const totalLiabilities = sumBalances(liabilities);
@@ -715,7 +819,7 @@ export async function ledgerRoutes(fastify) {
                 assets: totalAssets.toString(),
                 liabilities: totalLiabilities.toString(),
                 equity: totalEquity.toString(),
-                // Accounting equation check (ignores income/expense until closed to equity)
+                // Accounting equation check (includes current earnings as synthetic equity line)
                 balanced: totalAssets.equals(totalLiabilities.add(totalEquity)),
             },
             assets,
@@ -1050,6 +1154,212 @@ export async function ledgerRoutes(fastify) {
                     return `Change in ${group}`;
             }
         }
+    });
+    // --- Diagnostics: why reports might be empty ---
+    // GET /companies/:companyId/reports/diagnostics
+    // This helps identify whether projections (AccountBalance/DailySummary) are missing vs. date-range/user issues.
+    fastify.get('/companies/:companyId/reports/diagnostics', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const [jeCount, jlCount, abCount, dsCount, peCount, outboxUnpub, outboxTotal] = await Promise.all([
+            prisma.journalEntry.count({ where: { companyId } }),
+            prisma.journalLine.count({ where: { companyId } }),
+            prisma.accountBalance.count({ where: { companyId } }),
+            prisma.dailySummary.count({ where: { companyId } }),
+            prisma.processedEvent.count({ where: { companyId } }),
+            prisma.event.count({ where: { companyId, publishedAt: null } }),
+            prisma.event.count({ where: { companyId } }),
+        ]);
+        const lastJe = await prisma.journalEntry.findFirst({
+            where: { companyId },
+            orderBy: [{ date: 'desc' }, { id: 'desc' }],
+            select: { id: true, date: true, description: true, createdAt: true },
+        });
+        const lastOutbox = await prisma.event.findFirst({
+            where: { companyId },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            select: { eventId: true, eventType: true, createdAt: true, publishedAt: true, lastPublishError: true },
+        });
+        const lastAb = await prisma.accountBalance.findFirst({
+            where: { companyId },
+            orderBy: [{ date: 'desc' }, { id: 'desc' }],
+            select: { date: true },
+        });
+        return {
+            companyId,
+            counts: {
+                journalEntries: jeCount,
+                journalLines: jlCount,
+                accountBalanceRows: abCount,
+                dailySummaryRows: dsCount,
+                processedEvents: peCount,
+                outboxTotal,
+                outboxUnpublished: outboxUnpub,
+            },
+            latest: {
+                journalEntry: lastJe
+                    ? {
+                        id: lastJe.id,
+                        date: lastJe.date,
+                        createdAt: lastJe.createdAt,
+                        description: lastJe.description,
+                    }
+                    : null,
+                outboxEvent: lastOutbox
+                    ? {
+                        eventId: lastOutbox.eventId,
+                        eventType: lastOutbox.eventType,
+                        createdAt: lastOutbox.createdAt,
+                        publishedAt: lastOutbox.publishedAt,
+                        lastPublishError: lastOutbox.lastPublishError ?? null,
+                    }
+                    : null,
+                accountBalanceDate: lastAb?.date ?? null,
+            },
+            hint: jeCount > 0 && abCount === 0
+                ? 'Ledger has data but projections are empty. Ensure publisher+worker are deployed and processing events, or run the rebuild-projections admin endpoint.'
+                : abCount > 0
+                    ? 'Projections exist. If UI shows empty, check report date ranges/timezone/companyId.'
+                    : 'No journal entries found for this company yet.',
+        };
+    });
+    // --- Admin: rebuild projections from immutable ledger (backfill) ---
+    // POST /companies/:companyId/admin/rebuild-projections?from=YYYY-MM-DD&to=YYYY-MM-DD
+    // Recomputes AccountBalance and DailySummary for the date range from JournalEntry/JournalLine source of truth.
+    // Also inserts ProcessedEvent rows for existing outbox journal.entry.created events in-range to prevent double counting
+    // when the worker later processes those events.
+    fastify.post('/companies/:companyId/admin/rebuild-projections', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const query = request.query;
+        if (!query.from || !query.to) {
+            reply.status(400);
+            return { error: 'from and to are required (YYYY-MM-DD)' };
+        }
+        const fromDate = normalizeToDay(new Date(query.from));
+        const toDate = normalizeToDay(new Date(query.to));
+        if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid from/to dates' };
+        }
+        if (fromDate.getTime() > toDate.getTime()) {
+            reply.status(400);
+            return { error: 'from must be <= to' };
+        }
+        const result = await prisma.$transaction(async (tx) => {
+            // 1) Clear existing projections in range
+            const deletedAb = await tx.accountBalance.deleteMany({
+                where: { companyId, date: { gte: fromDate, lte: toDate } },
+            });
+            const deletedDs = await tx.dailySummary.deleteMany({
+                where: { companyId, date: { gte: fromDate, lte: toDate } },
+            });
+            // 2) Rebuild AccountBalance (daily per-account debit/credit totals)
+            const abRows = (await tx.$queryRaw `
+        SELECT
+          DATE(je.date) AS day,
+          jl.accountId AS accountId,
+          SUM(jl.debit) AS debitTotal,
+          SUM(jl.credit) AS creditTotal
+        FROM JournalLine jl
+        JOIN JournalEntry je ON je.id = jl.journalEntryId
+        WHERE jl.companyId = ${companyId}
+          AND je.companyId = ${companyId}
+          AND je.date >= ${fromDate}
+          AND je.date <= ${toDate}
+        GROUP BY day, jl.accountId
+      `);
+            // Bulk insert in chunks (createMany)
+            const abData = abRows.map((r) => ({
+                companyId,
+                accountId: Number(r.accountId),
+                date: normalizeToDay(new Date(r.day)),
+                debitTotal: new Prisma.Decimal(r.debitTotal ?? 0).toDecimalPlaces(2),
+                creditTotal: new Prisma.Decimal(r.creditTotal ?? 0).toDecimalPlaces(2),
+            }));
+            let createdAb = 0;
+            const chunkSize = 500;
+            for (let i = 0; i < abData.length; i += chunkSize) {
+                const chunk = abData.slice(i, i + chunkSize);
+                const res = await tx.accountBalance.createMany({ data: chunk, skipDuplicates: true });
+                createdAb += res.count ?? 0;
+            }
+            // 3) Rebuild DailySummary (income/expense only, per day)
+            const dsRows = (await tx.$queryRaw `
+        SELECT
+          DATE(je.date) AS day,
+          SUM(CASE WHEN a.type = 'INCOME' THEN (jl.credit - jl.debit) ELSE 0 END) AS totalIncome,
+          SUM(CASE WHEN a.type = 'EXPENSE' THEN (jl.debit - jl.credit) ELSE 0 END) AS totalExpense
+        FROM JournalLine jl
+        JOIN JournalEntry je ON je.id = jl.journalEntryId
+        JOIN Account a ON a.id = jl.accountId
+        WHERE jl.companyId = ${companyId}
+          AND je.companyId = ${companyId}
+          AND a.companyId = ${companyId}
+          AND je.date >= ${fromDate}
+          AND je.date <= ${toDate}
+        GROUP BY day
+      `);
+            const dsData = dsRows
+                .map((r) => ({
+                companyId,
+                date: normalizeToDay(new Date(r.day)),
+                totalIncome: new Prisma.Decimal(r.totalIncome ?? 0).toDecimalPlaces(2),
+                totalExpense: new Prisma.Decimal(r.totalExpense ?? 0).toDecimalPlaces(2),
+            }))
+                // Avoid creating rows with both 0 (keeps table smaller; worker behaves similarly)
+                .filter((r) => !r.totalIncome.equals(0) || !r.totalExpense.equals(0));
+            let createdDs = 0;
+            for (let i = 0; i < dsData.length; i += chunkSize) {
+                const chunk = dsData.slice(i, i + chunkSize);
+                const res = await tx.dailySummary.createMany({ data: chunk, skipDuplicates: true });
+                createdDs += res.count ?? 0;
+            }
+            // 4) Mark existing outbox journal.entry.created events as processed for this range to prevent double counting
+            const eventIds = (await tx.$queryRaw `
+        SELECT e.eventId AS eventId
+        FROM Event e
+        JOIN JournalEntry je
+          ON CAST(JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.journalEntryId')) AS SIGNED) = je.id
+        WHERE e.companyId = ${companyId}
+          AND e.eventType = 'journal.entry.created'
+          AND je.companyId = ${companyId}
+          AND je.date >= ${fromDate}
+          AND je.date <= ${toDate}
+      `);
+            let processedInserted = 0;
+            if (eventIds.length > 0) {
+                const peData = eventIds
+                    .map((r) => r.eventId)
+                    .filter((x) => typeof x === 'string' && x.length > 0)
+                    .map((eventId) => ({ eventId, companyId }));
+                for (let i = 0; i < peData.length; i += 1000) {
+                    const chunk = peData.slice(i, i + 1000);
+                    const res = await tx.processedEvent.createMany({ data: chunk, skipDuplicates: true });
+                    processedInserted += res.count ?? 0;
+                }
+            }
+            await writeAuditLog(tx, {
+                companyId,
+                userId: request.user?.userId ?? null,
+                action: 'projections.rebuild',
+                entityType: 'Company',
+                entityId: companyId,
+                idempotencyKey: null,
+                correlationId: null,
+                metadata: {
+                    from: query.from,
+                    to: query.to,
+                    deleted: { accountBalance: deletedAb.count, dailySummary: deletedDs.count },
+                    created: { accountBalance: createdAb, dailySummary: createdDs, processedEvents: processedInserted },
+                },
+            });
+            return {
+                deleted: { accountBalance: deletedAb.count, dailySummary: deletedDs.count },
+                created: { accountBalance: createdAb, dailySummary: createdDs, processedEvents: processedInserted },
+            };
+        });
+        return { companyId, from: query.from, to: query.to, ...result };
     });
     // Legacy route kept for backward compatibility (deprecated).
     // GET /reports/pnl?companyId=...&from=...&to=...

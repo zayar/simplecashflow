@@ -2,15 +2,19 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getAccounts, getVendors, updateBill } from '@/lib/api';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { ArrowLeft, FileText, Calendar, Building2, BookOpen, DollarSign } from 'lucide-react';
+import { ArrowLeft, FileText, Calendar, Building2, BookOpen, DollarSign, Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatDateInTimeZone } from '@/lib/utils';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { SelectNative } from '@/components/ui/select-native';
+import { Textarea } from '@/components/ui/textarea';
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -27,6 +31,21 @@ export default function ExpenseDetailPage() {
 
   const [bill, setBill] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [editMode, setEditMode] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [posting, setPosting] = useState(false);
+  const [postError, setPostError] = useState<string | null>(null);
+  const [vendors, setVendors] = useState<any[]>([]);
+  const [expenseAccounts, setExpenseAccounts] = useState<any[]>([]);
+  const [form, setForm] = useState({
+    vendorId: '',
+    expenseDate: '',
+    dueDate: '',
+    description: '',
+    amount: '',
+    currency: '',
+    expenseAccountId: '',
+  });
 
   const load = async () => {
     if (!user?.companyId || !billId) return;
@@ -34,6 +53,18 @@ export default function ExpenseDetailPage() {
     try {
       const data = await fetchApi(`/companies/${user.companyId}/expenses/${billId}`);
       setBill(data);
+      // keep form in sync when not actively editing
+      if (!editMode) {
+        setForm({
+          vendorId: data?.vendor?.id ? String(data.vendor.id) : '',
+          expenseDate: data?.expenseDate ? String(data.expenseDate).slice(0, 10) : '',
+          dueDate: data?.dueDate ? String(data.dueDate).slice(0, 10) : '',
+          description: data?.description ?? '',
+          amount: data?.amount ? String(Number(data.amount)) : '',
+          currency: data?.currency ?? '',
+          expenseAccountId: data?.expenseAccount?.id ? String(data.expenseAccount.id) : '',
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -43,8 +74,110 @@ export default function ExpenseDetailPage() {
     load().catch(console.error);
   }, [user?.companyId, billId]);
 
+  useEffect(() => {
+    if (!user?.companyId) return;
+    getVendors(user.companyId).then(setVendors).catch(console.error);
+    getAccounts(user.companyId)
+      .then((all) => setExpenseAccounts(all.filter((a: any) => a.type === 'EXPENSE')))
+      .catch(console.error);
+  }, [user?.companyId]);
+
   const journals = useMemo(() => (bill?.journalEntries ?? []) as any[], [bill]);
   const showJournal = bill?.status && bill.status !== 'DRAFT';
+
+  const baseCurrency = (companySettings?.baseCurrency ?? '').trim().toUpperCase();
+  const effectiveCurrency = baseCurrency || (form.currency ?? '').trim().toUpperCase();
+  const canEdit = bill?.status === 'DRAFT';
+
+  const makeIdempotencyKey = () => {
+    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? (crypto as any).randomUUID()
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
+
+  const startEdit = () => {
+    if (!canEdit) return;
+    setEditMode(true);
+  };
+
+  const cancelEdit = () => {
+    setEditMode(false);
+    // restore from current bill
+    setForm({
+      vendorId: bill?.vendor?.id ? String(bill.vendor.id) : '',
+      expenseDate: bill?.expenseDate ? String(bill.expenseDate).slice(0, 10) : '',
+      dueDate: bill?.dueDate ? String(bill.dueDate).slice(0, 10) : '',
+      description: bill?.description ?? '',
+      amount: bill?.amount ? String(Number(bill.amount)) : '',
+      currency: bill?.currency ?? '',
+      expenseAccountId: bill?.expenseAccount?.id ? String(bill.expenseAccount.id) : '',
+    });
+  };
+
+  const saveEdit = async () => {
+    if (!user?.companyId || !bill?.id) return;
+    const amountNum = Number(form.amount);
+    if (!amountNum || amountNum <= 0) {
+      alert('Amount must be > 0');
+      return;
+    }
+    if (!form.description || !form.description.trim()) {
+      alert('Description is required');
+      return;
+    }
+    if (!form.expenseAccountId) {
+      alert('Please select an expense account');
+      return;
+    }
+    if (baseCurrency) {
+      // In single-currency mode currency is fixed.
+      // Keep silent and let backend enforce, but ensure we send the correct one.
+    } else if (form.currency && !/^[A-Za-z]{3}$/.test(form.currency.trim())) {
+      alert('Currency must be a 3-letter code (e.g. MMK, USD)');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await updateBill(user.companyId, Number(bill.id), {
+        vendorId: form.vendorId ? Number(form.vendorId) : null,
+        expenseDate: form.expenseDate || undefined,
+        dueDate: form.dueDate ? form.dueDate : null,
+        description: form.description,
+        amount: amountNum,
+        currency: baseCurrency ? baseCurrency : (form.currency ? form.currency.trim().toUpperCase() : null),
+        expenseAccountId: form.expenseAccountId ? Number(form.expenseAccountId) : null,
+      });
+      setEditMode(false);
+      await load();
+    } catch (err: any) {
+      console.error(err);
+      alert(err.message || 'Failed to update expense');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const postExpense = async () => {
+    if (!user?.companyId || !bill?.id) return;
+    if (posting) return;
+    if (!confirm('Post this expense? This will create journal entries and increase Accounts Payable.')) return;
+    setPostError(null);
+    setPosting(true);
+    try {
+      await fetchApi(`/companies/${user.companyId}/expenses/${bill.id}/post`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': makeIdempotencyKey() },
+        body: JSON.stringify({}),
+      });
+      await load();
+    } catch (err: any) {
+      console.error(err);
+      setPostError(err?.message ?? 'Failed to post expense');
+    } finally {
+      setPosting(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -92,12 +225,27 @@ export default function ExpenseDetailPage() {
             <div className="text-sm text-muted-foreground">{bill.expenseNumber}</div>
           </div>
         </div>
+        <div className="flex items-center gap-2">
+          {bill.status === 'DRAFT' && !editMode && (
+            <Button onClick={postExpense} disabled={posting}>
+              {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {posting ? 'Posting...' : 'Post'}
+            </Button>
+          )}
+          {bill.status === 'DRAFT' && !editMode && (
+            <Button variant="outline" onClick={startEdit}>
+              Edit
+            </Button>
+          )}
         {(bill.status === 'POSTED' || bill.status === 'PARTIAL') && (
           <Link href={`/expenses/${bill.id}/payment`}>
             <Button>Pay Expense</Button>
           </Link>
         )}
       </div>
+      </div>
+
+      {postError ? <div className="text-sm text-red-600">{postError}</div> : null}
 
       <div className="grid gap-6 md:grid-cols-2">
         <Card className="shadow-sm">
@@ -105,6 +253,103 @@ export default function ExpenseDetailPage() {
             <CardTitle className="flex items-center gap-2"><FileText className="h-5 w-5" /> Details</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            {editMode ? (
+              <div className="space-y-4">
+                <div className="grid gap-2">
+                  <Label>Vendor</Label>
+                  <SelectNative
+                    value={form.vendorId}
+                    onChange={(e) => setForm((p) => ({ ...p, vendorId: e.target.value }))}
+                  >
+                    <option value="">—</option>
+                    {vendors.map((v: any) => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}
+                      </option>
+                    ))}
+                  </SelectNative>
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Expense Date</Label>
+                  <Input
+                    type="date"
+                    value={form.expenseDate}
+                    onChange={(e) => setForm((p) => ({ ...p, expenseDate: e.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Due Date</Label>
+                  <Input
+                    type="date"
+                    value={form.dueDate}
+                    onChange={(e) => setForm((p) => ({ ...p, dueDate: e.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Expense Account</Label>
+                  <SelectNative
+                    value={form.expenseAccountId}
+                    onChange={(e) => setForm((p) => ({ ...p, expenseAccountId: e.target.value }))}
+                  >
+                    <option value="">Select an account</option>
+                    {expenseAccounts.map((a: any) => (
+                      <option key={a.id} value={a.id}>
+                        {a.code} - {a.name}
+                      </option>
+                    ))}
+                  </SelectNative>
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Description</Label>
+                  <Textarea
+                    value={form.description}
+                    onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))}
+                    className="min-h-[90px]"
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Amount</Label>
+                  <Input
+                    type="number"
+                    inputMode="numeric"
+                    min="1"
+                    step="1"
+                    value={form.amount}
+                    onChange={(e) => setForm((p) => ({ ...p, amount: e.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label>Currency</Label>
+                  <Input
+                    value={effectiveCurrency}
+                    disabled={!!baseCurrency}
+                    placeholder="MMK"
+                    onChange={(e) => setForm((p) => ({ ...p, currency: e.target.value }))}
+                  />
+                  {baseCurrency && (
+                    <p className="text-xs text-muted-foreground">
+                      Currency is locked to company base currency ({baseCurrency}).
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <Button variant="outline" onClick={cancelEdit} disabled={saving}>
+                    Cancel
+                  </Button>
+                  <Button onClick={saveEdit} disabled={saving}>
+                    {saving ? 'Saving…' : 'Save'}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
             <div className="flex items-center gap-2 text-sm text-muted-foreground"><Building2 className="h-4 w-4" /> Vendor</div>
             <div className="font-medium">{bill.vendor?.name ?? '—'}</div>
 
@@ -133,6 +378,8 @@ export default function ExpenseDetailPage() {
             <div className="pt-2">
               <Badge variant="outline">{bill.status}</Badge>
             </div>
+              </>
+            )}
           </CardContent>
         </Card>
 

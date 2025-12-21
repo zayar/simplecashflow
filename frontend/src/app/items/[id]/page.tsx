@@ -6,7 +6,7 @@ import { useParams } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -78,15 +78,18 @@ export default function ItemDetailPage() {
         </div>
 
         <div className="flex gap-2">
-          <Button asChild variant="outline">
-            <Link href="/items">Back</Link>
-          </Button>
-          <Button asChild variant="outline">
-            <Link href={`/inventory/opening-balance?itemId=${itemId}`}>Opening Stock</Link>
-          </Button>
-          <Button asChild>
-            <Link href="/inventory/adjustments">Adjust Stock</Link>
-          </Button>
+          <Link href="/items" className={buttonVariants({ variant: 'outline' })}>
+            Back
+          </Link>
+          <Link
+            href={`/inventory/opening-balance?itemId=${itemId}`}
+            className={buttonVariants({ variant: 'outline' })}
+          >
+            Opening Stock
+          </Link>
+          <Link href="/inventory/adjustments" className={buttonVariants({ variant: 'default' })}>
+            Adjust Stock
+          </Link>
         </div>
       </div>
 

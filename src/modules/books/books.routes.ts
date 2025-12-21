@@ -2,10 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
 import { randomUUID } from 'node:crypto';
-import { AccountType, ItemType, Prisma } from '@prisma/client';
+import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
@@ -13,7 +11,10 @@ import { BankingAccountKind } from '@prisma/client';
 import { getRedis } from '../../infrastructure/redis.js';
 import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { applyStockMoveWac } from '../inventory/stock.service.js';
-import { ensureInventoryCompanyDefaults } from '../inventory/stock.service.js';
+import { ensureInventoryCompanyDefaults, ensureInventoryItem, getStockBalanceForUpdate } from '../inventory/stock.service.js';
+import { requireAnyRole, Roles } from '../../utils/rbac.js';
+import { writeAuditLog } from '../../infrastructure/auditLog.js';
+import { nextCreditNoteNumber } from '../sequence/sequence.service.js';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -31,6 +32,68 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // All Books endpoints are tenant-scoped and must be authenticated.
   fastify.addHook('preHandler', fastify.authenticate);
   const redis = getRedis();
+
+  function normalizeCurrencyOrNull(input: unknown): string | null {
+    if (input === undefined || input === null) return null;
+    const s = String(input).trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(s)) {
+      throw Object.assign(new Error('currency must be a 3-letter code (e.g. MMK, USD)'), {
+        statusCode: 400,
+      });
+    }
+    return s;
+  }
+
+  function enforceSingleCurrency(companyBaseCurrency: string | null, docCurrency: string | null) {
+    if (!companyBaseCurrency) return;
+    if (!docCurrency) {
+      throw Object.assign(new Error('currency is required when company baseCurrency is set'), {
+        statusCode: 400,
+      });
+    }
+    if (docCurrency !== companyBaseCurrency) {
+      throw Object.assign(
+        new Error(`currency mismatch: document currency ${docCurrency} must equal company baseCurrency ${companyBaseCurrency}`),
+        { statusCode: 400 }
+      );
+    }
+  }
+
+  async function ensureSalesIncomeAccount(tx: any, companyId: number): Promise<number> {
+    // Default revenue mapping for invoices when user doesn't care about accounting.
+    // Code 4000 is our canonical "Sales Income" (seeded at company creation, but we also self-heal here).
+    const existing = await tx.account.findFirst({
+      where: { companyId, code: '4000', type: AccountType.INCOME },
+      select: { id: true },
+    });
+    if (existing?.id) return existing.id;
+
+    const created = await tx.account.create({
+      data: {
+        companyId,
+        code: '4000',
+        name: 'Sales Income',
+        type: AccountType.INCOME,
+        normalBalance: 'CREDIT',
+        reportGroup: AccountReportGroup.SALES_REVENUE,
+        cashflowActivity: CashflowActivity.OPERATING,
+        isActive: true,
+      },
+      select: { id: true },
+    });
+    return created.id;
+  }
+
+  // Prisma client types in dev environments require `prisma generate` after schema changes.
+  // We keep this include typed as `any` to avoid blocking builds in environments where the generated client
+  // hasn't been refreshed yet (CI/local will regenerate and still work correctly).
+  const invoiceLinesIncludeWithIncomeAccount: any = {
+    include: { item: true, incomeAccount: { select: { id: true, code: true, name: true, type: true } } },
+  };
+
+  const creditNoteLinesIncludeWithIncomeAccount: any = {
+    include: { item: true, incomeAccount: { select: { id: true, code: true, name: true, type: true } } },
+  };
 
   // --- Books: Customers ---
   fastify.get('/companies/:companyId/customers', async (request, reply) => {
@@ -251,7 +314,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: invoiceId, companyId },
       include: {
         customer: true,
-        lines: { include: { item: true } },
+        lines: invoiceLinesIncludeWithIncomeAccount,
         journalEntry: {
           include: {
             lines: {
@@ -328,8 +391,12 @@ export async function booksRoutes(fastify: FastifyInstance) {
       status: invoice.status,
       invoiceDate: invoice.invoiceDate,
       dueDate: invoice.dueDate,
+      subtotal: (invoice as any).subtotal ?? null,
+      taxAmount: (invoice as any).taxAmount ?? null,
       total: invoice.total,
       currency: invoice.currency,
+      customerNotes: (invoice as any).customerNotes ?? null,
+      termsAndConditions: (invoice as any).termsAndConditions ?? null,
       lines: invoice.lines,
       payments: invoice.payments.map((p) => ({
         id: p.id,
@@ -359,7 +426,18 @@ export async function booksRoutes(fastify: FastifyInstance) {
       invoiceDate?: string;
       dueDate?: string;
       currency?: string;
-      lines?: { itemId: number; description?: string; quantity: number; unitPrice?: number }[];
+      customerNotes?: string;
+      termsAndConditions?: string;
+      lines?: {
+        itemId: number;
+        description?: string;
+        quantity: number;
+        unitPrice?: number;
+        // taxRate is decimal (e.g., 0.07 for 7%)
+        taxRate?: number;
+        // Optional per-line income account mapping (INCOME). Default UX uses Sales Income (4000).
+        incomeAccountId?: number;
+      }[];
     };
 
     if (!body.customerId || !body.lines || body.lines.length === 0) {
@@ -371,6 +449,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const customer = await prisma.customer.findFirst({
       where: { id: body.customerId, companyId },
     });
+    // Currency policy (single-currency per company if baseCurrency is set)
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { baseCurrency: true },
+    });
+    const baseCurrency = normalizeCurrencyOrNull(company?.baseCurrency ?? null);
+    const requestedCurrency = normalizeCurrencyOrNull(body.currency ?? null);
+    const customerCurrency = normalizeCurrencyOrNull((customer as any).currency ?? null);
+
+    // If baseCurrency is set, invoice currency must match it (no multi-currency yet).
+    const invoiceCurrency = baseCurrency ?? requestedCurrency ?? customerCurrency;
+    enforceSingleCurrency(baseCurrency, invoiceCurrency);
+
     if (!customer) {
       reply.status(400);
       return { error: 'customerId not found in this company' };
@@ -397,13 +488,46 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const invoiceDate = parseDateInput(body.invoiceDate) ?? new Date();
     const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
 
+    // Validate optional income accounts (tenant-safe) and determine Sales Income default.
+    const requestedIncomeAccountIds = Array.from(
+      new Set((body.lines ?? []).map((l) => Number((l as any).incomeAccountId ?? 0)).filter((x) => x > 0))
+    );
+    const incomeAccounts =
+      requestedIncomeAccountIds.length === 0
+        ? []
+        : await prisma.account.findMany({
+            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+            select: { id: true },
+          });
+    const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+    for (const id of requestedIncomeAccountIds) {
+      if (!incomeIdSet.has(id)) {
+        reply.status(400);
+        return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+      }
+    }
+
+    const salesIncomeAccountId = await prisma.$transaction(async (tx) => ensureSalesIncomeAccount(tx, companyId));
+
     // Compute totals using Decimal (money-safe).
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
     let total = new Prisma.Decimal(0);
     const computedLines = body.lines.map((line) => {
       const item = itemById.get(line.itemId)!;
       const qty = toMoneyDecimal(line.quantity);
       const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
-      const lineTotal = qty.mul(unit).toDecimalPlaces(2);
+      const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const rate = new Prisma.Decimal(Number((line as any).taxRate ?? 0)).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
+          statusCode: 400,
+        });
+      }
+      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+      subtotal = subtotal.add(lineSubtotal);
+      taxAmount = taxAmount.add(lineTax);
       total = total.add(lineTotal);
 
       return {
@@ -412,7 +536,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
         description: line.description ?? null,
         quantity: qty,
         unitPrice: unit,
-        lineTotal,
+        lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+        taxRate: rate,
+        taxAmount: lineTax,
+        incomeAccountId: Number((line as any).incomeAccountId ?? 0) || salesIncomeAccountId,
       };
     });
 
@@ -424,22 +551,215 @@ export async function booksRoutes(fastify: FastifyInstance) {
         status: 'DRAFT',
         invoiceDate,
         dueDate,
-        currency: body.currency ?? customer.currency ?? null,
+        currency: invoiceCurrency,
+        subtotal: subtotal.toDecimalPlaces(2),
+        taxAmount: taxAmount.toDecimalPlaces(2),
         total: total.toDecimalPlaces(2), // stored but will be recomputed when posted
+        customerNotes:
+          body.customerNotes !== undefined && body.customerNotes !== null
+            ? String(body.customerNotes)
+            : null,
+        termsAndConditions:
+          body.termsAndConditions !== undefined && body.termsAndConditions !== null
+            ? String(body.termsAndConditions)
+            : null,
         lines: { create: computedLines },
       },
       include: {
         customer: true,
-        lines: { include: { item: true } },
+        lines: invoiceLinesIncludeWithIncomeAccount,
       },
     });
 
     return invoice;
   });
 
+  // Update invoice (DRAFT only)
+  fastify.put('/companies/:companyId/invoices/:invoiceId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const invoiceId = Number((request.params as any)?.invoiceId);
+    if (!companyId || Number.isNaN(invoiceId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or invoiceId' };
+    }
+
+    const body = request.body as {
+      customerId?: number;
+      invoiceDate?: string;
+      dueDate?: string | null;
+      currency?: string | null;
+      customerNotes?: string | null;
+      termsAndConditions?: string | null;
+      lines?: {
+        itemId: number;
+        description?: string;
+        quantity: number;
+        unitPrice?: number;
+        taxRate?: number;
+        incomeAccountId?: number;
+      }[];
+    };
+
+    if (!body.customerId || !body.lines || body.lines.length === 0) {
+      reply.status(400);
+      return { error: 'customerId and at least one line are required' };
+    }
+
+    const invoiceDate = parseDateInput(body.invoiceDate) ?? new Date();
+    const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
+    if (body.invoiceDate && isNaN(invoiceDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid invoiceDate' };
+    }
+    if (body.dueDate && dueDate && isNaN(dueDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid dueDate' };
+    }
+
+    const customer = await prisma.customer.findFirst({
+      where: { id: Number(body.customerId), companyId },
+    });
+    if (!customer) {
+      reply.status(400);
+      return { error: 'customerId not found in this company' };
+    }
+
+    // Currency policy (single-currency per company if baseCurrency is set)
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { baseCurrency: true },
+    });
+    const baseCurrency = normalizeCurrencyOrNull(company?.baseCurrency ?? null);
+    const requestedCurrency = normalizeCurrencyOrNull((body as any).currency ?? null);
+    const customerCurrency = normalizeCurrencyOrNull((customer as any).currency ?? null);
+    const invoiceCurrency = baseCurrency ?? requestedCurrency ?? customerCurrency;
+    enforceSingleCurrency(baseCurrency, invoiceCurrency);
+
+    // Validate and load items (tenant-safe).
+    const itemIds = body.lines.map((l) => l.itemId);
+    const items = await prisma.item.findMany({
+      where: { companyId, id: { in: itemIds } },
+    });
+    const itemById = new Map(items.map((i) => [i.id, i]));
+
+    for (const line of body.lines) {
+      if (!line.quantity || line.quantity <= 0) {
+        reply.status(400);
+        return { error: 'each line must have quantity > 0' };
+      }
+      if (!itemById.get(line.itemId)) {
+        reply.status(400);
+        return { error: `itemId ${line.itemId} not found in this company` };
+      }
+    }
+
+    // Validate optional income accounts (tenant-safe) and determine Sales Income default.
+    const requestedIncomeAccountIds = Array.from(
+      new Set((body.lines ?? []).map((l) => Number((l as any).incomeAccountId ?? 0)).filter((x) => x > 0))
+    );
+    const incomeAccounts =
+      requestedIncomeAccountIds.length === 0
+        ? []
+        : await prisma.account.findMany({
+            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+            select: { id: true },
+          });
+    const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+    for (const id of requestedIncomeAccountIds) {
+      if (!incomeIdSet.has(id)) {
+        reply.status(400);
+        return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+      }
+    }
+
+    const salesIncomeAccountId = await prisma.$transaction(async (tx) => ensureSalesIncomeAccount(tx, companyId));
+
+    // Compute totals using Decimal (money-safe).
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
+    let total = new Prisma.Decimal(0);
+    const computedLines = body.lines.map((line) => {
+      const item = itemById.get(line.itemId)!;
+      const qty = toMoneyDecimal(line.quantity);
+      const unit = toMoneyDecimal(line.unitPrice ?? Number((item as any).sellingPrice));
+      const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const rate = new Prisma.Decimal(Number((line as any).taxRate ?? 0)).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
+          statusCode: 400,
+        });
+      }
+      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+      subtotal = subtotal.add(lineSubtotal);
+      taxAmount = taxAmount.add(lineTax);
+      total = total.add(lineTotal);
+
+      return {
+        companyId,
+        itemId: item.id,
+        description: line.description ?? null,
+        quantity: qty,
+        unitPrice: unit,
+        lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+        taxRate: rate,
+        taxAmount: lineTax,
+        incomeAccountId: Number((line as any).incomeAccountId ?? 0) || salesIncomeAccountId,
+      };
+    });
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // Lock invoice row so concurrent edits don't race, and also block edits after post.
+      await (tx as any).$queryRaw`
+        SELECT id FROM Invoice
+        WHERE id = ${invoiceId} AND companyId = ${companyId}
+        FOR UPDATE
+      `;
+
+      const existing = await tx.invoice.findFirst({
+        where: { id: invoiceId, companyId },
+        select: { id: true, status: true, journalEntryId: true },
+      });
+      if (!existing) {
+        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+      }
+      if (existing.status !== 'DRAFT' || existing.journalEntryId) {
+        throw Object.assign(new Error('only DRAFT invoices can be edited'), { statusCode: 400 });
+      }
+
+      return await tx.invoice.update({
+        where: { id: invoiceId, companyId },
+        data: {
+          customerId: customer.id,
+          invoiceDate,
+          dueDate: dueDate ?? null,
+          currency: invoiceCurrency,
+          subtotal: subtotal.toDecimalPlaces(2),
+          taxAmount: taxAmount.toDecimalPlaces(2),
+          total: total.toDecimalPlaces(2),
+          customerNotes:
+            body.customerNotes !== undefined && body.customerNotes !== null ? String(body.customerNotes) : null,
+          termsAndConditions:
+            body.termsAndConditions !== undefined && body.termsAndConditions !== null
+              ? String(body.termsAndConditions)
+              : null,
+          lines: {
+            deleteMany: {}, // all invoice lines
+            create: computedLines,
+          },
+        },
+        include: { customer: true, lines: invoiceLinesIncludeWithIncomeAccount },
+      });
+    });
+
+    return updated;
+  });
+
   // POST (confirm) an invoice: DRAFT -> POSTED creates journal entry
   fastify.post('/companies/:companyId/invoices/:invoiceId/post', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const invoiceId = Number((request.params as any)?.invoiceId);
     if (!companyId || Number.isNaN(invoiceId)) {
       reply.status(400);
@@ -508,6 +828,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
           async () => {
             const txResult = await prisma.$transaction(
               async (tx) => {
+          // DB-level serialization safety: lock the invoice row so concurrent posts
+          // (with different idempotency keys) cannot double-post.
+          await (tx as any).$queryRaw`
+            SELECT id FROM Invoice
+            WHERE id = ${invoiceId} AND companyId = ${companyId}
+            FOR UPDATE
+          `;
+
           const invoice = await tx.invoice.findFirst({
             where: { id: invoiceId, companyId },
             include: {
@@ -523,6 +851,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
           if (invoice.status !== 'DRAFT') {
             throw Object.assign(new Error('only DRAFT invoices can be posted'), { statusCode: 400 });
           }
+
+          // Currency policy: if company has baseCurrency, invoice currency must match it.
+          const baseCurrency = normalizeCurrencyOrNull((invoice.company as any).baseCurrency ?? null);
+          const invCurrency = normalizeCurrencyOrNull((invoice as any).currency ?? null);
+          enforceSingleCurrency(baseCurrency, invCurrency ?? baseCurrency);
 
           if (!invoice.company.accountsReceivableAccountId) {
             throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), {
@@ -545,21 +878,72 @@ export async function booksRoutes(fastify: FastifyInstance) {
           }
 
           // Recompute totals from stored lines (source of truth).
-          let total = new Prisma.Decimal(0);
+          let subtotal = new Prisma.Decimal(0);
+          let taxAmount = new Prisma.Decimal(0);
           const incomeBuckets = new Map<number, Prisma.Decimal>();
 
           for (const line of invoice.lines) {
             const qty = new Prisma.Decimal(line.quantity);
             const unit = new Prisma.Decimal(line.unitPrice);
-            const lineTotal = qty.mul(unit).toDecimalPlaces(2);
-            total = total.add(lineTotal);
+            const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+            subtotal = subtotal.add(lineSubtotal);
 
-            const incomeAccountId = line.item.incomeAccountId;
+            const taxRate = new Prisma.Decimal((line as any).taxRate ?? 0).toDecimalPlaces(4);
+            if (taxRate.lessThan(0) || taxRate.greaterThan(1)) {
+              throw Object.assign(new Error('invoice line taxRate must be between 0 and 1'), { statusCode: 400 });
+            }
+            const lineTax = lineSubtotal.mul(taxRate).toDecimalPlaces(2);
+            taxAmount = taxAmount.add(lineTax);
+
+            const incomeAccountId = (line as any).incomeAccountId ?? (line as any).item?.incomeAccountId;
+            if (!incomeAccountId) {
+              throw Object.assign(new Error('invoice line is missing income account mapping'), { statusCode: 400 });
+            }
             const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-            incomeBuckets.set(incomeAccountId, prev.add(lineTotal));
+            incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal)); // Revenue excludes tax
           }
 
-          total = total.toDecimalPlaces(2);
+          subtotal = subtotal.toDecimalPlaces(2);
+          taxAmount = taxAmount.toDecimalPlaces(2);
+          const total = subtotal.add(taxAmount).toDecimalPlaces(2); // Total = subtotal + tax
+
+          // CRITICAL FIX #3: Rounding validation - ensure recomputed total matches stored total.
+          // This prevents debit != credit if line-level rounding drifted from sum-then-round.
+          const storedTotal = new Prisma.Decimal(invoice.total).toDecimalPlaces(2);
+          if (!total.equals(storedTotal)) {
+            throw Object.assign(
+              new Error(
+                `rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}. Invoice may have been corrupted.`
+              ),
+              { statusCode: 400, recomputedTotal: total.toString(), storedTotal: storedTotal.toString() }
+            );
+          }
+
+          // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
+          let taxPayableAccountId: number | null = null;
+          if (taxAmount.greaterThan(0)) {
+            const existing = await tx.account.findFirst({
+              where: { companyId, type: AccountType.LIABILITY, code: '2100' },
+              select: { id: true },
+            });
+            if (existing?.id) {
+              taxPayableAccountId = existing.id;
+            } else {
+              const created = await tx.account.create({
+                data: {
+                  companyId,
+                  code: '2100',
+                  name: 'Tax Payable',
+                  type: AccountType.LIABILITY,
+                  normalBalance: 'CREDIT',
+                  reportGroup: 'OTHER_CURRENT_LIABILITY',
+                  cashflowActivity: 'OPERATING',
+                },
+                select: { id: true },
+              });
+              taxPayableAccountId = created.id;
+            }
+          }
 
           // Inventory V1: deduct stock + compute COGS (WAC) at invoice post time
           const tracked = invoice.lines.filter((l) => l.item.type === 'GOODS' && (l.item as any).trackInventory);
@@ -596,33 +980,51 @@ export async function booksRoutes(fastify: FastifyInstance) {
             totalCogs = totalCogs.toDecimalPlaces(2);
           }
 
+          // CRITICAL FIX #5: Build journal entry lines including tax
+          // Tax entry: Dr AR (total), Cr Revenue (subtotal), Cr Tax Payable (taxAmount)
+          const jeLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
+            // Debit: Accounts Receivable (full amount including tax)
+            { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
+            // Credit: Revenue accounts (subtotal, excluding tax)
+            ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
+              accountId: incomeAccountId,
+              debit: new Prisma.Decimal(0),
+              credit: amount.toDecimalPlaces(2),
+            })),
+          ];
+
+          // Tax Payable (credit) when tax exists
+          if (taxAmount.greaterThan(0)) {
+            jeLines.push({
+              accountId: taxPayableAccountId!,
+              debit: new Prisma.Decimal(0),
+              credit: taxAmount,
+            });
+          }
+
+          // Add COGS entries for inventory-tracked items
+          if (totalCogs.greaterThan(0)) {
+            const invCfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
+            jeLines.push(
+              {
+                accountId: invCfg.cogsAccountId!,
+                debit: totalCogs,
+                credit: new Prisma.Decimal(0),
+              },
+              {
+                accountId: invCfg.inventoryAssetAccountId!,
+                debit: new Prisma.Decimal(0),
+                credit: totalCogs,
+              }
+            );
+          }
+
           const journalEntry = await postJournalEntry(tx, {
             companyId,
             date: invoice.invoiceDate,
             description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
             createdByUserId: (request as any).user?.userId ?? null,
-            lines: [
-              { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
-              ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
-                accountId: incomeAccountId,
-                debit: new Prisma.Decimal(0),
-                credit: amount.toDecimalPlaces(2),
-              })),
-              ...(totalCogs.greaterThan(0)
-                ? [
-                    {
-                      accountId: ((invoice.company as any).cogsAccountId ?? (await ensureInventoryCompanyDefaults(tx as any, companyId)).cogsAccountId)!,
-                      debit: totalCogs,
-                      credit: new Prisma.Decimal(0),
-                    },
-                    {
-                      accountId: ((invoice.company as any).inventoryAssetAccountId ?? (await ensureInventoryCompanyDefaults(tx as any, companyId)).inventoryAssetAccountId)!,
-                      debit: new Prisma.Decimal(0),
-                      credit: totalCogs,
-                    },
-                  ]
-                : []),
-            ],
+            lines: jeLines,
           });
 
           // Link inventory moves to the invoice posting JournalEntry (best-effort)
@@ -633,13 +1035,45 @@ export async function booksRoutes(fastify: FastifyInstance) {
             });
           }
 
-          // Update invoice to POSTED and link journal entry.
-          const updatedInvoice = await tx.invoice.update({
-            where: { id: invoice.id },
+          // Update invoice to POSTED and link journal entry (tenant-safe).
+          const upd = await tx.invoice.updateMany({
+            where: { id: invoice.id, companyId },
             data: {
               status: 'POSTED',
+              subtotal,
+              taxAmount,
               total,
               amountPaid: new Prisma.Decimal(0),
+              journalEntryId: journalEntry.id,
+              // Backfill currency to baseCurrency on post if missing (single-currency mode).
+              ...(baseCurrency && !invCurrency ? { currency: baseCurrency } : {}),
+            },
+          });
+          if ((upd as any).count !== 1) {
+            throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+          }
+          const updatedInvoice = await tx.invoice.findFirst({
+            where: { id: invoice.id, companyId },
+            select: { id: true, status: true, total: true, journalEntryId: true },
+          });
+          if (!updatedInvoice) {
+            throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+          }
+
+          await writeAuditLog(tx as any, {
+            companyId,
+            userId: (request as any).user?.userId ?? null,
+            action: 'invoice.post',
+            entityType: 'Invoice',
+            entityId: updatedInvoice.id,
+            idempotencyKey,
+            correlationId,
+            metadata: {
+              invoiceNumber: (invoice as any).invoiceNumber,
+              invoiceDate: invoice.invoiceDate,
+              customerId: invoice.customerId,
+              total: total.toString(),
+              totalCogs: totalCogs.toString(),
               journalEntryId: journalEntry.id,
             },
           });
@@ -712,46 +1146,6 @@ export async function booksRoutes(fastify: FastifyInstance) {
       )
     );
 
-    // First execution: attempt publish now (still safe if it fails; outbox publisher will deliver later).
-    if (!replay) {
-      const publishJeOk = await publishDomainEvent({
-        eventId: (result as any)._jeEventId,
-        eventType: 'journal.entry.created',
-        schemaVersion: 'v1',
-        occurredAt: (result as any)._occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId: (result as any)._correlationId,
-        aggregateType: 'JournalEntry',
-        aggregateId: String(result.journalEntryId),
-        source: 'cashflow-api',
-        payload: {
-          journalEntryId: result.journalEntryId,
-          companyId,
-        },
-      });
-      if (publishJeOk) await markEventPublished((result as any)._jeEventId);
-
-      const publishInvoiceOk = await publishDomainEvent({
-        eventId: (result as any)._invoiceEventId,
-        eventType: 'invoice.posted',
-        schemaVersion: 'v1',
-        occurredAt: (result as any)._occurredAt,
-        companyId,
-        partitionKey: String(companyId),
-        correlationId: (result as any)._correlationId,
-        aggregateType: 'Invoice',
-        aggregateId: String(result.invoiceId),
-        source: 'cashflow-api',
-        payload: {
-          invoiceId: result.invoiceId,
-          journalEntryId: result.journalEntryId,
-          total: result.total,
-        },
-      });
-      if (publishInvoiceOk) await markEventPublished((result as any)._invoiceEventId);
-    }
-
     // Always return stable business response
     return {
       invoiceId: result.invoiceId,
@@ -764,6 +1158,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // Payments: record and post to ledger (Bank/Cash Dr, AR Cr)
   fastify.post('/companies/:companyId/invoices/:invoiceId/payments', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const invoiceId = Number((request.params as any)?.invoiceId);
     if (!companyId || Number.isNaN(invoiceId)) {
       reply.status(400);
@@ -805,9 +1200,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
           async () => {
             const txResult = await prisma.$transaction(
               async (tx) => {
+                // DB-level serialization safety: lock the invoice row so concurrent payments can't overspend.
+                await tx.$queryRaw`
+                  SELECT id FROM Invoice
+                  WHERE id = ${invoiceId} AND companyId = ${companyId}
+                  FOR UPDATE
+                `;
+
                 const invoice = await tx.invoice.findFirst({
                   where: { id: invoiceId, companyId },
-                  include: { company: { select: { accountsReceivableAccountId: true } } },
+                  include: { company: { select: { accountsReceivableAccountId: true, baseCurrency: true } } },
                 });
                 if (!invoice) {
                   throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
@@ -828,6 +1230,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
                     statusCode: 400,
                   });
                 }
+
+                // Currency policy: if company has baseCurrency, invoice currency must match it.
+                const baseCurrency = normalizeCurrencyOrNull((invoice.company as any).baseCurrency ?? null);
+                const invCurrency = normalizeCurrencyOrNull((invoice as any).currency ?? null);
+                enforceSingleCurrency(baseCurrency, invCurrency ?? baseCurrency);
 
                 const arAccount = await tx.account.findFirst({
                   where: {
@@ -891,6 +1298,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
                 const amount = toMoneyDecimal(amountNumber);
 
+                // Prevent overpayment based on source-of-truth payments sum (non-reversed).
+                const sumBefore = await tx.payment.aggregate({
+                  where: { invoiceId: invoice.id, companyId, reversedAt: null },
+                  _sum: { amount: true },
+                });
+                const totalPaidBefore = (sumBefore._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                const remainingBefore = new Prisma.Decimal(invoice.total)
+                  .sub(totalPaidBefore)
+                  .toDecimalPlaces(2);
+                if (amount.greaterThan(remainingBefore)) {
+                  throw Object.assign(
+                    new Error(`amount cannot exceed remaining balance of ${remainingBefore.toString()}`),
+                    { statusCode: 400 }
+                  );
+                }
+
                 const journalEntry = await postJournalEntry(tx, {
                   companyId,
                   date: paymentDate,
@@ -922,9 +1345,33 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
                 const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
 
-                const updatedInvoice = await tx.invoice.update({
-                  where: { id: invoice.id },
+                const updInv = await tx.invoice.updateMany({
+                  where: { id: invoice.id, companyId },
                   data: { amountPaid: totalPaid, status: newStatus },
+                });
+                if ((updInv as any).count !== 1) {
+                  throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                }
+                const updatedInvoice = { id: invoice.id, status: newStatus };
+
+                await writeAuditLog(tx as any, {
+                  companyId,
+                  userId: (request as any).user?.userId ?? null,
+                  action: 'invoice.payment.create',
+                  entityType: 'Payment',
+                  entityId: payment.id,
+                  idempotencyKey,
+                  correlationId,
+                  metadata: {
+                    invoiceId: invoice.id,
+                    invoiceNumber: (invoice as any).invoiceNumber,
+                    paymentDate,
+                    amount: amount.toString(),
+                    bankAccountId: bankAccount.id,
+                    journalEntryId: journalEntry.id,
+                    newInvoiceStatus: updatedInvoice.status,
+                    newAmountPaid: totalPaid.toString(),
+                  },
                 });
 
                 // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
@@ -994,47 +1441,6 @@ export async function booksRoutes(fastify: FastifyInstance) {
         )
       );
 
-      if (!replay) {
-        const publishJeOk = await publishDomainEvent({
-          eventId: (result as any)._jeEventId,
-          eventType: 'journal.entry.created',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(result.journalEntryId),
-          source: 'cashflow-api',
-          payload: {
-            journalEntryId: result.journalEntryId,
-            companyId,
-          },
-        });
-        if (publishJeOk) await markEventPublished((result as any)._jeEventId);
-
-        const publishPaymentOk = await publishDomainEvent({
-          eventId: (result as any)._paymentEventId,
-          eventType: 'payment.recorded',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'Payment',
-          aggregateId: String(result.paymentId),
-          source: 'cashflow-api',
-          payload: {
-            paymentId: result.paymentId,
-            invoiceId,
-            journalEntryId: result.journalEntryId,
-            amount: (body.amount ?? 0).toFixed(2),
-            bankAccountId: body.bankAccountId,
-          },
-        });
-        if (publishPaymentOk) await markEventPublished((result as any)._paymentEventId);
-      }
-
       return {
         invoiceId: result.invoiceId,
         invoiceStatus: result.invoiceStatus,
@@ -1054,6 +1460,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // POST /companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse
   fastify.post('/companies/:companyId/invoices/:invoiceId/payments/:paymentId/reverse', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const invoiceId = Number((request.params as any)?.invoiceId);
     const paymentId = Number((request.params as any)?.paymentId);
     if (!companyId || Number.isNaN(invoiceId) || Number.isNaN(paymentId)) {
@@ -1150,19 +1557,45 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   ? 'PAID'
                   : 'PARTIAL';
 
-              const updatedInvoice = await tx.invoice.update({
-                where: { id: invoiceId },
+              const updInv2 = await tx.invoice.updateMany({
+                where: { id: invoiceId, companyId },
                 data: { amountPaid: newPaid, status: newStatus },
               });
+              if ((updInv2 as any).count !== 1) {
+                throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+              }
+              const updatedInvoice = { id: invoiceId, status: newStatus };
 
               // Mark payment as reversed (document audit)
-              await tx.payment.update({
-                where: { id: payment.id },
+              const updPay = await tx.payment.updateMany({
+                where: { id: payment.id, companyId },
                 data: {
                   reversedAt: new Date(occurredAt),
                   reversalReason: body.reason ?? null,
                   reversalJournalEntryId: reversalEntry.id,
                   reversedByUserId: (request as any).user?.userId ?? null,
+                },
+              });
+              if ((updPay as any).count !== 1) {
+                throw Object.assign(new Error('payment not found'), { statusCode: 404 });
+              }
+
+              await writeAuditLog(tx as any, {
+                companyId,
+                userId: (request as any).user?.userId ?? null,
+                action: 'invoice.payment.reverse',
+                entityType: 'Payment',
+                entityId: payment.id,
+                idempotencyKey,
+                correlationId,
+                metadata: {
+                  invoiceId: payment.invoice.id,
+                  invoiceNumber: payment.invoice.invoiceNumber,
+                  reversalDate,
+                  reason: body.reason ?? null,
+                  reversalJournalEntryId: reversalEntry.id,
+                  newInvoiceStatus: updatedInvoice.status,
+                  newAmountPaid: newPaid.toString(),
                 },
               });
 
@@ -1259,71 +1692,1144 @@ export async function booksRoutes(fastify: FastifyInstance) {
         )
       );
 
-      if (!replay) {
-        const createdOk = await publishDomainEvent({
-          eventId: (result as any)._createdEventId,
-          eventType: 'journal.entry.created',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(result.reversalJournalEntryId),
-          source: 'cashflow-api',
-          payload: {
-            journalEntryId: result.reversalJournalEntryId,
-            companyId,
-            reversalOfJournalEntryId: result.originalJournalEntryId,
-          },
-        });
-        if (createdOk) await markEventPublished((result as any)._createdEventId);
-
-        const reversedOk = await publishDomainEvent({
-          eventId: (result as any)._reversedEventId,
-          eventType: 'journal.entry.reversed',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(result.originalJournalEntryId),
-          source: 'cashflow-api',
-          payload: {
-            companyId,
-            originalJournalEntryId: result.originalJournalEntryId,
-            reversalJournalEntryId: result.reversalJournalEntryId,
-          },
-        });
-        if (reversedOk) await markEventPublished((result as any)._reversedEventId);
-
-        const paymentRevOk = await publishDomainEvent({
-          eventId: (result as any)._paymentReversedEventId,
-          eventType: 'payment.reversed',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'Payment',
-          aggregateId: String(result.paymentId),
-          source: 'cashflow-api',
-          payload: {
-            paymentId: result.paymentId,
-            invoiceId: result.invoiceId,
-            reversalJournalEntryId: result.reversalJournalEntryId,
-          },
-        });
-        if (paymentRevOk) await markEventPublished((result as any)._paymentReversedEventId);
-      }
-
       return {
         paymentId: result.paymentId,
         invoiceId: result.invoiceId,
         invoiceStatus: result.invoiceStatus,
         reversalJournalEntryId: result.reversalJournalEntryId,
       };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
+  });
+
+  // --- Credit Notes (Sales returns / AR reduction) ---
+  // Credit note V1:
+  // - Draft creation (lines based on Items)
+  // - Post: creates JE that reverses revenue: Dr INCOME, Cr AR
+  // - Inventory restock is NOT applied in v1 (can be added later).
+
+  // --- Payments list (for UI) ---
+  // Sales: Payments received (customer payments against invoices)
+  fastify.get('/companies/:companyId/sales/payments', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const rows = await prisma.payment.findMany({
+      where: { companyId },
+      orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+      take: 200,
+      include: {
+        invoice: { select: { id: true, invoiceNumber: true, customer: { select: { id: true, name: true } } } },
+        bankAccount: { select: { id: true, code: true, name: true } },
+      },
+    });
+    return rows.map((p) => ({
+      id: p.id,
+      paymentDate: p.paymentDate,
+      amount: p.amount.toString(),
+      invoiceId: p.invoiceId,
+      invoiceNumber: (p as any).invoice?.invoiceNumber ?? null,
+      customerId: (p as any).invoice?.customer?.id ?? null,
+      customerName: (p as any).invoice?.customer?.name ?? null,
+      bankAccountId: p.bankAccountId,
+      bankAccountName: (p as any).bankAccount ? `${(p as any).bankAccount.code} - ${(p as any).bankAccount.name}` : null,
+      journalEntryId: p.journalEntryId ?? null,
+      reversedAt: p.reversedAt ?? null,
+    }));
+  });
+
+  fastify.get('/companies/:companyId/sales/payments/:paymentId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const paymentId = Number((request.params as any)?.paymentId);
+    if (Number.isNaN(paymentId)) {
+      reply.status(400);
+      return { error: 'invalid paymentId' };
+    }
+    const p = await prisma.payment.findFirst({
+      where: { id: paymentId, companyId },
+      include: {
+        invoice: { include: { customer: true } },
+        bankAccount: true,
+        journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+        reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+      } as any,
+    });
+    if (!p) {
+      reply.status(404);
+      return { error: 'payment not found' };
+    }
+    return p;
+  });
+
+  // Purchases: Payments made (vendor payments against Expenses and Purchase Bills)
+  fastify.get('/companies/:companyId/purchases/payments', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const [expensePays, pbPays] = await Promise.all([
+      (prisma as any).expensePayment.findMany({
+        where: { companyId },
+        orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+        take: 200,
+        include: {
+          expense: { include: { vendor: true } },
+          bankAccount: { select: { id: true, code: true, name: true } },
+        },
+      }),
+      (prisma as any).purchaseBillPayment.findMany({
+        where: { companyId },
+        orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+        take: 200,
+        include: {
+          purchaseBill: { include: { vendor: true } },
+          bankAccount: { select: { id: true, code: true, name: true } },
+        },
+      }),
+    ]);
+
+    const mapped = [
+      ...(expensePays ?? []).map((p: any) => ({
+        type: 'expense' as const,
+        id: p.id,
+        paymentDate: p.paymentDate,
+        amount: p.amount?.toString?.() ?? String(p.amount ?? '0'),
+        bankAccountId: p.bankAccountId,
+        bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
+        referenceId: p.expenseId,
+        referenceNumber: p.expense?.expenseNumber ?? null,
+        vendorName: p.expense?.vendor?.name ?? null,
+        journalEntryId: p.journalEntryId ?? null,
+        reversedAt: p.reversedAt ?? null,
+      })),
+      ...(pbPays ?? []).map((p: any) => ({
+        type: 'purchase-bill' as const,
+        id: p.id,
+        paymentDate: p.paymentDate,
+        amount: p.amount?.toString?.() ?? String(p.amount ?? '0'),
+        bankAccountId: p.bankAccountId,
+        bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
+        referenceId: p.purchaseBillId,
+        referenceNumber: p.purchaseBill?.billNumber ?? null,
+        vendorName: p.purchaseBill?.vendor?.name ?? null,
+        journalEntryId: p.journalEntryId ?? null,
+        reversedAt: p.reversedAt ?? null,
+      })),
+    ];
+
+    mapped.sort((a, b) => {
+      const ad = new Date(a.paymentDate).getTime();
+      const bd = new Date(b.paymentDate).getTime();
+      if (bd !== ad) return bd - ad;
+      return Number(b.id) - Number(a.id);
+    });
+
+    return mapped.slice(0, 200);
+  });
+
+  fastify.get('/companies/:companyId/purchases/payments/:paymentType/:paymentId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const paymentType = String((request.params as any)?.paymentType ?? '').toLowerCase();
+    const paymentId = Number((request.params as any)?.paymentId);
+    if (Number.isNaN(paymentId)) {
+      reply.status(400);
+      return { error: 'invalid paymentId' };
+    }
+    if (paymentType === 'expense') {
+      const p = await (prisma as any).expensePayment.findFirst({
+        where: { id: paymentId, companyId },
+        include: {
+          expense: { include: { vendor: true } },
+          bankAccount: true,
+          journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+          reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+        },
+      });
+      if (!p) {
+        reply.status(404);
+        return { error: 'payment not found' };
+      }
+      return { type: 'expense', payment: p };
+    }
+    if (paymentType === 'purchase-bill') {
+      const p = await (prisma as any).purchaseBillPayment.findFirst({
+        where: { id: paymentId, companyId },
+        include: {
+          purchaseBill: { include: { vendor: true, warehouse: true } },
+          bankAccount: true,
+          journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+          reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+        },
+      });
+      if (!p) {
+        reply.status(404);
+        return { error: 'payment not found' };
+      }
+      return { type: 'purchase-bill', payment: p };
+    }
+    reply.status(400);
+    return { error: 'invalid paymentType (use expense or purchase-bill)' };
+  });
+
+  // List credit notes
+  fastify.get('/companies/:companyId/credit-notes', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const rows = await (prisma as any).creditNote.findMany({
+      where: { companyId },
+      orderBy: [{ creditNoteDate: 'desc' }, { id: 'desc' }],
+      include: { customer: true },
+    });
+    return rows.map((cn: any) => ({
+      id: cn.id,
+      creditNoteNumber: cn.creditNoteNumber,
+      status: cn.status,
+      creditNoteDate: cn.creditNoteDate,
+      customerName: cn.customer?.name ?? null,
+      total: cn.total?.toString?.() ?? String(cn.total ?? '0'),
+      journalEntryId: cn.journalEntryId ?? null,
+      createdAt: cn.createdAt,
+    }));
+  });
+
+  // Create credit note (DRAFT)
+  fastify.post('/companies/:companyId/credit-notes', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+
+    const body = request.body as {
+      invoiceId?: number | null;
+      customerId?: number;
+      creditNoteDate?: string;
+      currency?: string;
+      customerNotes?: string;
+      termsAndConditions?: string;
+      lines?: {
+        itemId?: number;
+        invoiceLineId?: number | null;
+        description?: string;
+        quantity?: number;
+        unitPrice?: number;
+        // taxRate is decimal (e.g., 0.0700 for 7%). UI can send 0.07.
+        taxRate?: number;
+        incomeAccountId?: number;
+      }[];
+    };
+
+    if (!body.customerId) {
+      reply.status(400);
+      return { error: 'customerId is required' };
+    }
+    if (!body.lines?.length) {
+      reply.status(400);
+      return { error: 'lines is required' };
+    }
+
+    const creditNoteDate = parseDateInput(body.creditNoteDate) ?? new Date();
+    if (body.creditNoteDate && isNaN(creditNoteDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid creditNoteDate' };
+    }
+
+    const customer = await prisma.customer.findFirst({ where: { id: Number(body.customerId), companyId } });
+    if (!customer) {
+      reply.status(400);
+      return { error: 'customerId not found in this company' };
+    }
+
+    // Validate items and compute totals using Decimal
+    const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId)).filter(Boolean)));
+    const items = await prisma.item.findMany({
+      where: { companyId, id: { in: itemIds } },
+      select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
+    });
+    const itemById = new Map(items.map((i) => [i.id, i]));
+
+    const requestedIncomeAccountIds = Array.from(
+      new Set((body.lines ?? []).map((l) => Number((l as any).incomeAccountId ?? 0)).filter((x) => x > 0))
+    );
+    const incomeAccounts =
+      requestedIncomeAccountIds.length === 0
+        ? []
+        : await prisma.account.findMany({
+            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+            select: { id: true },
+          });
+    const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+    for (const id of requestedIncomeAccountIds) {
+      if (!incomeIdSet.has(id)) {
+        reply.status(400);
+        return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+      }
+    }
+
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
+    let total = new Prisma.Decimal(0);
+    const computedLines: any[] = [];
+    for (const [idx, l] of (body.lines ?? []).entries()) {
+      const itemId = Number(l.itemId);
+      if (!itemId || Number.isNaN(itemId)) {
+        reply.status(400);
+        return { error: `lines[${idx}].itemId is required` };
+      }
+      const item = itemById.get(itemId);
+      if (!item) {
+        reply.status(400);
+        return { error: `lines[${idx}].itemId not found in this company` };
+      }
+      const qty = toMoneyDecimal(l.quantity ?? 0);
+      if (qty.lessThanOrEqualTo(0)) {
+        reply.status(400);
+        return { error: `lines[${idx}].quantity must be > 0` };
+      }
+      const unit = toMoneyDecimal(l.unitPrice ?? Number(item.sellingPrice ?? 0));
+      if (unit.lessThanOrEqualTo(0)) {
+        reply.status(400);
+        return { error: `lines[${idx}].unitPrice must be > 0` };
+      }
+
+      const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        reply.status(400);
+        return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+      }
+      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+
+      subtotal = subtotal.add(lineSubtotal);
+      taxAmount = taxAmount.add(lineTax);
+      total = total.add(lineTotal);
+
+      computedLines.push({
+        companyId,
+        itemId: item.id,
+        description: l.description ?? item.name ?? null,
+        quantity: qty,
+        unitPrice: unit,
+        lineTotal, // subtotal + tax
+        taxRate: rate,
+        taxAmount: lineTax,
+        incomeAccountId: Number((l as any).incomeAccountId ?? 0) || null,
+      });
+    }
+    subtotal = subtotal.toDecimalPlaces(2);
+    taxAmount = taxAmount.toDecimalPlaces(2);
+    total = total.toDecimalPlaces(2);
+
+    const created = await prisma.$transaction(async (tx: any) => {
+      const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
+      const creditNoteNumber = await nextCreditNoteNumber(tx, companyId);
+      return await tx.creditNote.create({
+        data: {
+          companyId,
+          invoiceId: body.invoiceId ? Number(body.invoiceId) : null,
+          customerId: customer.id,
+          creditNoteNumber,
+          status: 'DRAFT',
+          creditNoteDate,
+          currency: body.currency ?? null,
+          subtotal,
+          taxAmount,
+          total,
+          customerNotes:
+            body.customerNotes !== undefined && body.customerNotes !== null ? String(body.customerNotes) : null,
+          termsAndConditions:
+            body.termsAndConditions !== undefined && body.termsAndConditions !== null
+              ? String(body.termsAndConditions)
+              : null,
+          lines: {
+            create: computedLines.map((l: any, idx: number) => ({
+              ...l,
+              invoiceLineId: Number((body.lines ?? [])[idx]?.invoiceLineId ?? 0) || null,
+              incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
+            })),
+          },
+        },
+        include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
+      });
+    });
+
+    return created;
+  });
+
+  // Update credit note (DRAFT only)
+  fastify.put('/companies/:companyId/credit-notes/:creditNoteId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const creditNoteId = Number((request.params as any)?.creditNoteId);
+    if (!companyId || Number.isNaN(creditNoteId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or creditNoteId' };
+    }
+
+    const body = request.body as {
+      customerId?: number;
+      creditNoteDate?: string;
+      currency?: string | null;
+      customerNotes?: string | null;
+      termsAndConditions?: string | null;
+      invoiceId?: number | null;
+      lines?: {
+        itemId?: number;
+        invoiceLineId?: number | null;
+        description?: string;
+        quantity?: number;
+        unitPrice?: number;
+        taxRate?: number;
+        incomeAccountId?: number;
+      }[];
+    };
+
+    if (!body.customerId) {
+      reply.status(400);
+      return { error: 'customerId is required' };
+    }
+    if (!body.lines?.length) {
+      reply.status(400);
+      return { error: 'lines is required' };
+    }
+
+    const creditNoteDate = parseDateInput(body.creditNoteDate) ?? new Date();
+    if (body.creditNoteDate && isNaN(creditNoteDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid creditNoteDate' };
+    }
+
+    const customer = await prisma.customer.findFirst({ where: { id: Number(body.customerId), companyId } });
+    if (!customer) {
+      reply.status(400);
+      return { error: 'customerId not found in this company' };
+    }
+
+    // Validate items and compute totals using Decimal (same as create).
+    const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId)).filter(Boolean)));
+    const items = await prisma.item.findMany({
+      where: { companyId, id: { in: itemIds } },
+      select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
+    });
+    const itemById = new Map(items.map((i) => [i.id, i]));
+
+    const requestedIncomeAccountIds = Array.from(
+      new Set((body.lines ?? []).map((l) => Number((l as any).incomeAccountId ?? 0)).filter((x) => x > 0))
+    );
+    const incomeAccounts =
+      requestedIncomeAccountIds.length === 0
+        ? []
+        : await prisma.account.findMany({
+            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+            select: { id: true },
+          });
+    const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+    for (const id of requestedIncomeAccountIds) {
+      if (!incomeIdSet.has(id)) {
+        reply.status(400);
+        return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+      }
+    }
+
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
+    let total = new Prisma.Decimal(0);
+    const computedLines: any[] = [];
+    for (const [idx, l] of (body.lines ?? []).entries()) {
+      const itemId = Number(l.itemId);
+      if (!itemId || Number.isNaN(itemId)) {
+        reply.status(400);
+        return { error: `lines[${idx}].itemId is required` };
+      }
+      const item = itemById.get(itemId);
+      if (!item) {
+        reply.status(400);
+        return { error: `lines[${idx}].itemId not found in this company` };
+      }
+      const qty = toMoneyDecimal(l.quantity ?? 0);
+      if (qty.lessThanOrEqualTo(0)) {
+        reply.status(400);
+        return { error: `lines[${idx}].quantity must be > 0` };
+      }
+      const unit = toMoneyDecimal(l.unitPrice ?? Number(item.sellingPrice ?? 0));
+      if (unit.lessThanOrEqualTo(0)) {
+        reply.status(400);
+        return { error: `lines[${idx}].unitPrice must be > 0` };
+      }
+
+      const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        reply.status(400);
+        return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+      }
+      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+
+      subtotal = subtotal.add(lineSubtotal);
+      taxAmount = taxAmount.add(lineTax);
+      total = total.add(lineTotal);
+
+      computedLines.push({
+        companyId,
+        itemId: item.id,
+        description: l.description ?? item.name ?? null,
+        quantity: qty,
+        unitPrice: unit,
+        lineTotal, // subtotal + tax
+        taxRate: rate,
+        taxAmount: lineTax,
+        invoiceLineId: Number(l.invoiceLineId ?? 0) || null,
+        incomeAccountId: Number((l as any).incomeAccountId ?? 0) || null,
+      });
+    }
+    subtotal = subtotal.toDecimalPlaces(2);
+    taxAmount = taxAmount.toDecimalPlaces(2);
+    total = total.toDecimalPlaces(2);
+
+    const updated = await prisma.$transaction(async (tx: any) => {
+      const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
+      await tx.$queryRaw`
+        SELECT id FROM CreditNote
+        WHERE id = ${creditNoteId} AND companyId = ${companyId}
+        FOR UPDATE
+      `;
+
+      const existing = await tx.creditNote.findFirst({
+        where: { id: creditNoteId, companyId },
+        select: { id: true, status: true, journalEntryId: true, invoiceId: true },
+      });
+      if (!existing) {
+        throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+      }
+      if (existing.status !== 'DRAFT' || existing.journalEntryId) {
+        throw Object.assign(new Error('only DRAFT credit notes can be edited'), { statusCode: 400 });
+      }
+
+      // Keep invoice linkage stable (switching linkage changes inventory return semantics).
+      const requestedInvoiceId = body.invoiceId ? Number(body.invoiceId) : null;
+      const existingInvoiceId = existing.invoiceId ? Number(existing.invoiceId) : null;
+      if (requestedInvoiceId !== existingInvoiceId) {
+        throw Object.assign(new Error('invoiceId cannot be changed once credit note is created'), { statusCode: 400 });
+      }
+
+      return await tx.creditNote.update({
+        where: { id: creditNoteId, companyId },
+        data: {
+          customerId: customer.id,
+          creditNoteDate,
+          currency: body.currency ?? null,
+          subtotal,
+          taxAmount,
+          total,
+          customerNotes:
+            body.customerNotes !== undefined && body.customerNotes !== null ? String(body.customerNotes) : null,
+          termsAndConditions:
+            body.termsAndConditions !== undefined && body.termsAndConditions !== null
+              ? String(body.termsAndConditions)
+              : null,
+          lines: {
+            deleteMany: {},
+            create: computedLines.map((l: any) => ({
+              ...l,
+              incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
+            })),
+          },
+        },
+        include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
+      });
+    });
+
+    return updated;
+  });
+
+  // Cleanest returns: create credit note directly from an invoice.
+  // POST /companies/:companyId/invoices/:invoiceId/credit-notes
+  // Body: { creditNoteDate?, lines: [{ invoiceLineId, quantity }] }
+  fastify.post('/companies/:companyId/invoices/:invoiceId/credit-notes', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const invoiceId = Number((request.params as any)?.invoiceId);
+    if (!companyId || Number.isNaN(invoiceId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or invoiceId' };
+    }
+
+    const body = request.body as {
+      creditNoteDate?: string;
+      lines?: { invoiceLineId?: number; quantity?: number }[];
+    };
+    if (!body.lines?.length) {
+      reply.status(400);
+      return { error: 'lines is required' };
+    }
+
+    const creditNoteDate = parseDateInput(body.creditNoteDate) ?? new Date();
+    if (body.creditNoteDate && isNaN(creditNoteDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid creditNoteDate' };
+    }
+
+    const inv = await prisma.invoice.findFirst({
+      where: { id: invoiceId, companyId },
+      include: { customer: true, lines: invoiceLinesIncludeWithIncomeAccount, company: true },
+    });
+    if (!inv) {
+      reply.status(404);
+      return { error: 'invoice not found' };
+    }
+    if (inv.status === 'DRAFT') {
+      reply.status(400);
+      return { error: 'cannot create credit note from a DRAFT invoice' };
+    }
+
+    // Build return lines from invoice lines and validate quantities (prevent over-return).
+    const lineById = new Map((inv.lines ?? []).map((l: any) => [l.id, l]));
+    const requested = (body.lines ?? []).map((l, idx) => {
+      const invoiceLineId = Number(l.invoiceLineId);
+      const qtyNum = Number(l.quantity ?? 0);
+      if (!invoiceLineId || Number.isNaN(invoiceLineId)) {
+        throw Object.assign(new Error(`lines[${idx}].invoiceLineId is required`), { statusCode: 400 });
+      }
+      if (!qtyNum || qtyNum <= 0) {
+        throw Object.assign(new Error(`lines[${idx}].quantity must be > 0`), { statusCode: 400 });
+      }
+      const invoiceLine = lineById.get(invoiceLineId);
+      if (!invoiceLine) {
+        throw Object.assign(new Error(`invoiceLineId ${invoiceLineId} not found on this invoice`), { statusCode: 400 });
+      }
+      return { invoiceLineId, qty: toMoneyDecimal(qtyNum), invoiceLine };
+    });
+
+    // Calculate already returned quantities for this invoice (posted credit notes only)
+    const returnedAgg = await (prisma as any).creditNoteLine.groupBy({
+      by: ['invoiceLineId'],
+      where: {
+        companyId,
+        invoiceLineId: { in: requested.map((r) => r.invoiceLineId) },
+        creditNote: { invoiceId: inv.id, status: 'POSTED' },
+      },
+      _sum: { quantity: true },
+    });
+    const returnedByInvoiceLineId = new Map<number, Prisma.Decimal>(
+      (returnedAgg ?? []).map((r: any) => [
+        Number(r.invoiceLineId),
+        new Prisma.Decimal(r._sum.quantity ?? 0).toDecimalPlaces(2),
+      ])
+    );
+
+    // Build computed lines using invoice unit price (cleanest) and enforce qty <= remaining
+    // Note: invoice-based credit notes (this endpoint) currently default tax to 0 because invoices v1 do not store tax.
+    // If you want tax-aware returns, use the generic /companies/:companyId/credit-notes endpoint (UI-driven) which accepts taxRate.
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
+    let total = new Prisma.Decimal(0);
+    const computedLines: any[] = [];
+    for (const r of requested) {
+      const soldQty = new Prisma.Decimal(r.invoiceLine.quantity).toDecimalPlaces(2);
+      const alreadyReturned = returnedByInvoiceLineId.get(r.invoiceLineId) ?? new Prisma.Decimal(0);
+      const remaining = soldQty.sub(alreadyReturned).toDecimalPlaces(2);
+      if (r.qty.greaterThan(remaining)) {
+        throw Object.assign(
+          new Error(`return qty exceeds remaining qty for invoiceLineId ${r.invoiceLineId} (remaining ${remaining.toString()})`),
+          { statusCode: 400 }
+        );
+      }
+      const unit = new Prisma.Decimal(r.invoiceLine.unitPrice).toDecimalPlaces(2);
+      const lineSubtotal = r.qty.mul(unit).toDecimalPlaces(2);
+      const rate = new Prisma.Decimal(0).toDecimalPlaces(4);
+      const lineTax = new Prisma.Decimal(0).toDecimalPlaces(2);
+      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+      subtotal = subtotal.add(lineSubtotal);
+      taxAmount = taxAmount.add(lineTax);
+      total = total.add(lineTotal);
+      computedLines.push({
+        companyId,
+        invoiceLineId: r.invoiceLineId,
+        itemId: r.invoiceLine.itemId,
+        description: r.invoiceLine.description ?? r.invoiceLine.item?.name ?? null,
+        quantity: r.qty,
+        unitPrice: unit,
+        lineTotal,
+        taxRate: rate,
+        taxAmount: lineTax,
+        incomeAccountId: Number((r.invoiceLine as any).incomeAccountId ?? 0) || null,
+      });
+    }
+    subtotal = subtotal.toDecimalPlaces(2);
+    taxAmount = taxAmount.toDecimalPlaces(2);
+    total = total.toDecimalPlaces(2);
+
+    const created = await prisma.$transaction(async (tx: any) => {
+      const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
+      const creditNoteNumber = await nextCreditNoteNumber(tx, companyId);
+      return await tx.creditNote.create({
+        data: {
+          companyId,
+          invoiceId: inv.id,
+          customerId: inv.customerId,
+          creditNoteNumber,
+          status: 'DRAFT',
+          creditNoteDate,
+          currency: inv.currency ?? null,
+          subtotal,
+          taxAmount,
+          total,
+          lines: {
+            create: computedLines.map((l: any) => ({
+              ...l,
+              incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
+            })),
+          },
+        },
+        include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
+      });
+    });
+
+    return created;
+  });
+
+  // Credit note detail
+  fastify.get('/companies/:companyId/credit-notes/:creditNoteId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const creditNoteId = Number((request.params as any)?.creditNoteId);
+    if (Number.isNaN(creditNoteId)) {
+      reply.status(400);
+      return { error: 'invalid creditNoteId' };
+    }
+    const cn = await (prisma as any).creditNote.findFirst({
+      where: { id: creditNoteId, companyId },
+      include: {
+        customer: true,
+        lines: creditNoteLinesIncludeWithIncomeAccount,
+        journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+      },
+    });
+    if (!cn) {
+      reply.status(404);
+      return { error: 'credit note not found' };
+    }
+    return cn;
+  });
+
+  // Post credit note: DRAFT -> POSTED (creates JE Dr INCOME / Cr AR)
+  fastify.post('/companies/:companyId/credit-notes/:creditNoteId/post', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const creditNoteId = Number((request.params as any)?.creditNoteId);
+    if (!companyId || Number.isNaN(creditNoteId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or creditNoteId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+    const lockKey = `lock:credit-note:post:${companyId}:${creditNoteId}`;
+
+    try {
+      // Pre-read to compute stock lock keys (avoid concurrent WAC distortions under heavy return load).
+      const pre = await (prisma as any).creditNote.findFirst({
+        where: { id: creditNoteId, companyId },
+        select: {
+          id: true,
+          company: { select: { defaultWarehouseId: true } },
+          lines: {
+            select: {
+              itemId: true,
+              item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+            },
+          },
+        },
+      });
+      if (!pre) {
+        reply.status(404);
+        return { error: 'credit note not found' };
+      }
+
+      let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
+      if (!fallbackWarehouseId) {
+        const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+        fallbackWarehouseId = wh?.id ?? null;
+      }
+
+      const trackedLines = (pre.lines ?? []).filter((l: any) => l.item.type === 'GOODS' && l.item.trackInventory);
+      if (trackedLines.length > 0) {
+        const missingWh = trackedLines.some((l: any) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+        if (missingWh) {
+          reply.status(400);
+          return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+        }
+      }
+
+      const stockLockKeys =
+        trackedLines.length === 0
+          ? []
+          : trackedLines.map((l: any) => {
+              const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId) as number;
+              return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+            });
+
+      const { response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () =>
+        withLockBestEffort(redis, lockKey, 30_000, async () =>
+          runIdempotentRequest(
+            prisma,
+            companyId,
+            idempotencyKey,
+            async () => {
+              const txResult = await prisma.$transaction(async (tx: any) => {
+              // DB-level serialization safety
+              await tx.$queryRaw`
+                SELECT id FROM CreditNote
+                WHERE id = ${creditNoteId} AND companyId = ${companyId}
+                FOR UPDATE
+              `;
+
+              const cn = await tx.creditNote.findFirst({
+                where: { id: creditNoteId, companyId },
+                include: { company: true, customer: true, lines: { include: { item: true } } },
+              });
+              if (!cn) throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+              if (cn.status !== 'DRAFT') {
+                throw Object.assign(new Error('only DRAFT credit notes can be posted'), { statusCode: 400 });
+              }
+
+              // CRITICAL FIX #1: Currency validation - ensure credit note currency matches company baseCurrency
+              const baseCurrency = ((cn.company as any).baseCurrency ?? '').trim().toUpperCase() || null;
+              const cnCurrency = ((cn as any).currency ?? '').trim().toUpperCase() || null;
+              if (baseCurrency && cnCurrency && baseCurrency !== cnCurrency) {
+                throw Object.assign(
+                  new Error(`currency mismatch: credit note currency ${cnCurrency} must match company baseCurrency ${baseCurrency}`),
+                  { statusCode: 400 }
+                );
+              }
+
+              const arId = (cn.company as any).accountsReceivableAccountId;
+              if (!arId) {
+                throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+              }
+              const arAccount = await tx.account.findFirst({ where: { id: arId, companyId, type: AccountType.ASSET } });
+              if (!arAccount) {
+                throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), { statusCode: 400 });
+              }
+
+              // Clean returns require invoice linkage for tracked inventory items (to restock at original cost/warehouse).
+              // If there is no invoice linkage, we still allow posting the credit note for financial purposes,
+              // but we treat tracked items as "credit-only" (no stock moves, no COGS reversal).
+              const sourceInvoiceId = (cn as any).invoiceId ? Number((cn as any).invoiceId) : null;
+
+              // Inventory config for COGS reversal when we restock tracked items.
+              const invCfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
+              const invAssetId = invCfg.inventoryAssetAccountId ?? null;
+              const cogsId = invCfg.cogsAccountId ?? null;
+
+              // Recompute totals + bucket by income account + compute return cost for tracked lines.
+              // Tax-aware credit notes:
+              // - revenue reversal uses subtotal (qty*unitPrice)
+              // - tax liability reversal uses sum(taxAmount)
+              // - AR reduction uses total = subtotal + tax
+              let subtotal = new Prisma.Decimal(0);
+              let taxAmount = new Prisma.Decimal(0);
+              let total = new Prisma.Decimal(0);
+              const incomeBuckets = new Map<number, Prisma.Decimal>();
+              let totalReturnCost = new Prisma.Decimal(0);
+
+              for (const line of cn.lines ?? []) {
+                const qty = new Prisma.Decimal(line.quantity);
+                const unit = new Prisma.Decimal(line.unitPrice);
+                const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+                const lineTax = new Prisma.Decimal((line as any).taxAmount ?? 0).toDecimalPlaces(2);
+                const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+                subtotal = subtotal.add(lineSubtotal);
+                taxAmount = taxAmount.add(lineTax);
+                total = total.add(lineTotal);
+                const incomeAccountId = (line as any).incomeAccountId ?? (line as any).item?.incomeAccountId;
+                if (!incomeAccountId) {
+                  throw Object.assign(new Error('credit note line is missing income account mapping'), { statusCode: 400 });
+                }
+                const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
+                incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal));
+
+                const item = (line as any).item;
+                const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
+                const hasInvoiceLink = !!sourceInvoiceId && !!(line as any).invoiceLineId;
+
+                if (isTracked && hasInvoiceLink) {
+                  if (!invAssetId || !cogsId) {
+                    throw Object.assign(
+                      new Error('company inventory accounts not configured (inventoryAssetAccountId/cogsAccountId)'),
+                      { statusCode: 400 }
+                    );
+                  }
+
+                  await ensureInventoryItem(tx as any, companyId, line.itemId);
+
+                  // Clean cost + warehouse allocation:
+                  // Allocate return quantity across the original SALE_ISSUE StockMoves for this invoice+item.
+                  // This guarantees the return uses the same cost basis and warehouse(s) as the original sale.
+                  const saleMoves = (await tx.stockMove.findMany({
+                    where: {
+                      companyId,
+                      itemId: line.itemId,
+                      type: 'SALE_ISSUE',
+                      direction: 'OUT',
+                      referenceType: 'Invoice',
+                      referenceId: String(sourceInvoiceId),
+                    },
+                    orderBy: [{ warehouseId: 'asc' }, { id: 'asc' }],
+                    select: { id: true, warehouseId: true, quantity: true, unitCostApplied: true },
+                  })) as any[];
+                  if (!saleMoves.length) {
+                    throw Object.assign(new Error('cannot locate original sale stock moves for return (invoice linkage missing or inventory not tracked at sale time)'), {
+                      statusCode: 400,
+                      invoiceId: sourceInvoiceId,
+                      itemId: line.itemId,
+                    });
+                  }
+
+                  // Returned qty for this invoice+item by warehouse (posted credit notes only)
+                  const returnedByWh = (await tx.$queryRaw<
+                    Array<{ warehouseId: number; qty: any }>
+                  >`
+                    SELECT sm.warehouseId as warehouseId, SUM(sm.quantity) as qty
+                    FROM StockMove sm
+                    JOIN CreditNote cn2
+                      ON cn2.id = CAST(sm.referenceId AS SIGNED)
+                    WHERE sm.companyId = ${companyId}
+                      AND sm.itemId = ${line.itemId}
+                      AND sm.type = 'SALE_RETURN'
+                      AND sm.direction = 'IN'
+                      AND sm.referenceType = 'CreditNote'
+                      AND cn2.companyId = ${companyId}
+                      AND cn2.invoiceId = ${sourceInvoiceId}
+                      AND cn2.status = 'POSTED'
+                    GROUP BY sm.warehouseId
+                  `) as Array<{ warehouseId: number; qty: any }>;
+                  const returnedWhMap = new Map<number, Prisma.Decimal>(
+                    (returnedByWh ?? []).map((r) => [Number(r.warehouseId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)])
+                  );
+
+                  // Compute remaining quantities per sale move after previous returns (FIFO per warehouse)
+                  const movesByWarehouse = new Map<number, any[]>();
+                  for (const m of saleMoves) {
+                    const wid = Number(m.warehouseId);
+                    const list = movesByWarehouse.get(wid) ?? [];
+                    list.push(m);
+                    movesByWarehouse.set(wid, list);
+                  }
+
+                  // Allocate return qty across warehouses/moves
+                  let remainingToReturn = qty.toDecimalPlaces(2);
+                  for (const [wid, moves] of movesByWarehouse.entries()) {
+                    if (remainingToReturn.lessThanOrEqualTo(0)) break;
+                    let returnedToConsume = returnedWhMap.get(wid) ?? new Prisma.Decimal(0);
+
+                    for (const m of moves) {
+                      if (remainingToReturn.lessThanOrEqualTo(0)) break;
+                      const moveQty = new Prisma.Decimal(m.quantity).toDecimalPlaces(2);
+                      const alreadyReturnedFromThisMove = returnedToConsume.greaterThan(0)
+                        ? (returnedToConsume.lessThan(moveQty) ? returnedToConsume : moveQty)
+                        : new Prisma.Decimal(0);
+                      returnedToConsume = returnedToConsume.sub(alreadyReturnedFromThisMove).toDecimalPlaces(2);
+                      const available = moveQty.sub(alreadyReturnedFromThisMove).toDecimalPlaces(2);
+                      if (available.lessThanOrEqualTo(0)) continue;
+
+                      const allocQty = new Prisma.Decimal(Math.min(Number(available), Number(remainingToReturn))).toDecimalPlaces(2);
+                      const unitCost = new Prisma.Decimal(m.unitCostApplied).toDecimalPlaces(2);
+
+                      const applied = await applyStockMoveWac(tx as any, {
+                        companyId,
+                        warehouseId: wid,
+                        itemId: line.itemId,
+                        date: cn.creditNoteDate,
+                        type: 'SALE_RETURN',
+                        direction: 'IN',
+                        quantity: allocQty,
+                        unitCostApplied: unitCost,
+                        referenceType: 'CreditNote',
+                        referenceId: String(cn.id),
+                        correlationId,
+                        createdByUserId: (request as any).user?.userId ?? null,
+                        journalEntryId: null,
+                      });
+
+                      totalReturnCost = totalReturnCost
+                        .add(new Prisma.Decimal(applied.totalCostApplied))
+                        .toDecimalPlaces(2);
+
+                      remainingToReturn = remainingToReturn.sub(allocQty).toDecimalPlaces(2);
+                    }
+                  }
+
+                  if (remainingToReturn.greaterThan(0)) {
+                    throw Object.assign(new Error('return quantity exceeds remaining sold quantity for this invoice (after previous returns)'), {
+                      statusCode: 400,
+                      invoiceId: sourceInvoiceId,
+                      itemId: line.itemId,
+                      qtyRequested: qty.toString(),
+                      qtyUnallocated: remainingToReturn.toString(),
+                    });
+                  }
+                } else if (isTracked && !hasInvoiceLink) {
+                  // Credit-only for tracked goods when not linked to an invoice line.
+                  // This keeps ledger correct but does NOT restock inventory. If there is a physical return,
+                  // user must do an inventory adjustment or create the credit note from the original invoice.
+                  // (No-op here on inventory.)
+                }
+              }
+              subtotal = subtotal.toDecimalPlaces(2);
+              taxAmount = taxAmount.toDecimalPlaces(2);
+              total = total.toDecimalPlaces(2);
+
+              // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
+              let taxPayableAccountId: number | null = null;
+              if (taxAmount.greaterThan(0)) {
+                const existing = await tx.account.findFirst({
+                  where: { companyId, type: AccountType.LIABILITY, code: '2100' },
+                  select: { id: true },
+                });
+                if (existing?.id) {
+                  taxPayableAccountId = existing.id;
+                } else {
+                  const created = await tx.account.create({
+                    data: {
+                      companyId,
+                      code: '2100',
+                      name: 'Tax Payable',
+                      type: AccountType.LIABILITY,
+                      normalBalance: 'CREDIT',
+                      reportGroup: 'OTHER_CURRENT_LIABILITY',
+                      cashflowActivity: 'OPERATING',
+                    },
+                    select: { id: true },
+                  });
+                  taxPayableAccountId = created.id;
+                }
+              }
+
+              const jeLines: any[] = [
+                // Dr Income (reduce revenue)
+                ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
+                  accountId: incomeAccountId,
+                  debit: amount.toDecimalPlaces(2),
+                  credit: new Prisma.Decimal(0),
+                })),
+                ...(taxAmount.greaterThan(0)
+                  ? [
+                      // Dr Tax Payable (reduce liability)
+                      { accountId: taxPayableAccountId, debit: taxAmount, credit: new Prisma.Decimal(0) },
+                    ]
+                  : []),
+                // Cr AR (reduce receivable)
+                { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: total },
+              ];
+
+              // Reverse COGS if we restocked anything: Dr Inventory / Cr COGS
+              if (totalReturnCost.greaterThan(0)) {
+                jeLines.push(
+                  { accountId: invAssetId!, debit: totalReturnCost, credit: new Prisma.Decimal(0) },
+                  { accountId: cogsId!, debit: new Prisma.Decimal(0), credit: totalReturnCost }
+                );
+              }
+
+              const je = await postJournalEntry(tx, {
+                companyId,
+                date: cn.creditNoteDate,
+                description: `Credit Note ${cn.creditNoteNumber} for ${(cn.customer as any)?.name ?? 'Customer'}`,
+                createdByUserId: (request as any).user?.userId ?? null,
+                skipAccountValidation: true,
+                lines: jeLines,
+              });
+
+              // Link inventory moves to the posting JournalEntry (best-effort)
+              if (totalReturnCost.greaterThan(0)) {
+                await (tx as any).stockMove.updateMany({
+                  where: { companyId, correlationId, journalEntryId: null },
+                  data: { journalEntryId: je.id },
+                });
+              }
+
+              const updCn = await tx.creditNote.updateMany({
+                where: { id: cn.id, companyId },
+                data: { status: 'POSTED', subtotal, taxAmount, total, journalEntryId: je.id },
+              });
+              if ((updCn as any).count !== 1) {
+                throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+              }
+              const updated = { id: cn.id, status: 'POSTED' as const };
+
+              const jeEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: jeEventId,
+                  eventType: 'journal.entry.created',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(je.id),
+                  type: 'JournalEntryCreated',
+                  payload: { journalEntryId: je.id, companyId },
+                },
+              });
+
+              const cnPostedEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: cnPostedEventId,
+                  eventType: 'credit_note.posted',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'CreditNote',
+                  aggregateId: String(cn.id),
+                  type: 'CreditNotePosted',
+                  payload: { creditNoteId: cn.id, journalEntryId: je.id, total: total.toString() },
+                },
+              });
+
+              await writeAuditLog(tx as any, {
+                companyId,
+                userId: (request as any).user?.userId ?? null,
+                action: 'credit_note.post',
+                entityType: 'CreditNote',
+                entityId: cn.id,
+                idempotencyKey,
+                correlationId,
+                metadata: {
+                  creditNoteNumber: cn.creditNoteNumber,
+                  creditNoteDate: cn.creditNoteDate,
+                  total: total.toString(),
+                  totalReturnCost: totalReturnCost.toString(),
+                  journalEntryId: je.id,
+                },
+              });
+
+              return {
+                creditNoteId: updated.id,
+                status: updated.status,
+                journalEntryId: je.id,
+                total: total.toString(),
+                totalReturnCost: totalReturnCost.toString(),
+              };
+            });
+
+            return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+          },
+          redis
+          )
+        )
+      );
+
+      return result as any;
     } catch (err: any) {
       if (err?.statusCode) {
         reply.status(err.statusCode);
@@ -1421,6 +2927,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
     }
     for (const p of expense.payments ?? []) {
       if (p.journalEntry) {
+        // If this payment reuses the same JournalEntry as the posting (paid immediately),
+        // avoid showing duplicate entries in the UI.
+        if (expense.journalEntry && p.journalEntry.id === expense.journalEntry.id) continue;
         journalEntries.push({
           kind: 'BILL_PAYMENT_RECORDED',
           paymentId: p.id,
@@ -1472,6 +2981,178 @@ export async function booksRoutes(fastify: FastifyInstance) {
       remainingBalance: Number(expense.amount) - totalPaid,
       journalEntries,
     };
+  });
+
+  // Update bill (DRAFT only): allow editing all fields before posting.
+  // PUT /companies/:companyId/expenses/:expenseId
+  fastify.put('/companies/:companyId/expenses/:expenseId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT, Roles.CLERK], 'OWNER, ACCOUNTANT, or CLERK');
+    const expenseId = Number((request.params as any)?.expenseId);
+    if (Number.isNaN(expenseId)) {
+      reply.status(400);
+      return { error: 'invalid expenseId' };
+    }
+
+    const body = (request.body ?? {}) as {
+      vendorId?: number | null;
+      expenseDate?: string;
+      dueDate?: string | null;
+      description?: string;
+      amount?: number;
+      currency?: string | null;
+      expenseAccountId?: number | null;
+    };
+
+    if (!body.description || typeof body.description !== 'string' || !body.description.trim()) {
+      reply.status(400);
+      return { error: 'description is required' };
+    }
+    if (body.amount === undefined || body.amount === null || Number(body.amount) <= 0) {
+      reply.status(400);
+      return { error: 'amount (>0) is required' };
+    }
+
+    const expenseDate = parseDateInput(body.expenseDate) ?? new Date();
+    const dueDate = body.dueDate === undefined ? undefined : body.dueDate === null ? null : parseDateInput(body.dueDate);
+    if (body.expenseDate && isNaN(expenseDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid expenseDate' };
+    }
+    if (body.dueDate && dueDate && isNaN(dueDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid dueDate' };
+    }
+
+    // Tenant-safe validations for referenced entities.
+    if (body.vendorId) {
+      const vendor = await prisma.vendor.findFirst({ where: { id: body.vendorId, companyId } });
+      if (!vendor) {
+        reply.status(400);
+        return { error: 'vendorId not found in this company' };
+      }
+    }
+    if (body.expenseAccountId) {
+      const expAcc = await prisma.account.findFirst({
+        where: { id: body.expenseAccountId, companyId, type: AccountType.EXPENSE },
+      });
+      if (!expAcc) {
+        reply.status(400);
+        return { error: 'expenseAccountId must be an EXPENSE account in this company' };
+      }
+    }
+
+    // Currency policy: if company has baseCurrency, document currency must match it.
+    const company = await prisma.company.findFirst({
+      where: { id: companyId },
+      select: { baseCurrency: true },
+    });
+    const baseCurrency = normalizeCurrencyOrNull((company as any)?.baseCurrency ?? null);
+    const docCurrency = normalizeCurrencyOrNull(body.currency ?? null);
+    if (baseCurrency) {
+      // In single-currency mode, require and enforce exact match.
+      enforceSingleCurrency(baseCurrency, docCurrency ?? baseCurrency);
+    }
+
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+
+    try {
+      const updated = await prisma.$transaction(async (tx) => {
+        // Serialize draft edits to prevent lost updates.
+        await (tx as any).$queryRaw`
+          SELECT id FROM Expense
+          WHERE id = ${expenseId} AND companyId = ${companyId}
+          FOR UPDATE
+        `;
+
+        const existing = await tx.expense.findFirst({
+          where: { id: expenseId, companyId },
+          select: { id: true, status: true, journalEntryId: true },
+        });
+        if (!existing) {
+          throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+        }
+        if ((existing as any).status !== 'DRAFT') {
+          throw Object.assign(new Error('only DRAFT expenses can be edited'), { statusCode: 400 });
+        }
+        if ((existing as any).journalEntryId) {
+          throw Object.assign(new Error('cannot edit an expense that already has a journal entry'), { statusCode: 400 });
+        }
+
+        const upd = await tx.expense.updateMany({
+          where: { id: expenseId, companyId, status: 'DRAFT' },
+          data: {
+            vendorId: body.vendorId ?? null,
+            expenseDate,
+            dueDate: dueDate === undefined ? null : dueDate,
+            description: body.description!.trim(),
+            amount: toMoneyDecimal(Number(body.amount)),
+            currency: body.currency === undefined ? null : docCurrency,
+            expenseAccountId: body.expenseAccountId ?? null,
+          } as any,
+        });
+        if ((upd as any).count !== 1) {
+          throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+        }
+
+        const refreshed = await tx.expense.findFirst({
+          where: { id: expenseId, companyId },
+          include: { vendor: true, expenseAccount: true },
+        });
+        if (!refreshed) {
+          throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+        }
+
+        await writeAuditLog(tx as any, {
+          companyId,
+          userId: (request as any).user?.userId ?? null,
+          action: 'expense.update_draft',
+          entityType: 'Expense',
+          entityId: expenseId,
+          idempotencyKey: idempotencyKey ?? null,
+          correlationId,
+          metadata: {
+            expenseDate,
+            dueDate: dueDate === undefined ? null : dueDate,
+            vendorId: body.vendorId ?? null,
+            expenseAccountId: body.expenseAccountId ?? null,
+            amount: Number(body.amount),
+            currency: docCurrency ?? null,
+            occurredAt,
+          },
+        });
+
+        return refreshed;
+      });
+
+      return {
+        id: updated.id,
+        expenseNumber: updated.expenseNumber,
+        status: updated.status,
+        vendor: (updated as any).vendor ?? null,
+        expenseDate: updated.expenseDate,
+        dueDate: (updated as any).dueDate ?? null,
+        amount: updated.amount,
+        currency: updated.currency,
+        description: updated.description,
+        expenseAccount: (updated as any).expenseAccount
+          ? {
+              id: (updated as any).expenseAccount.id,
+              code: (updated as any).expenseAccount.code,
+              name: (updated as any).expenseAccount.name,
+              type: (updated as any).expenseAccount.type,
+            }
+          : null,
+      };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
   });
 
   // Create bill (DRAFT)
@@ -1544,6 +3225,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // Post bill: DRAFT -> POSTED (creates JE: Dr Expense / Cr Accounts Payable)
   fastify.post('/companies/:companyId/expenses/:expenseId/post', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const expenseId = Number((request.params as any)?.expenseId);
     if (!companyId || Number.isNaN(expenseId)) {
       reply.status(400);
@@ -1559,6 +3241,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const occurredAt = isoNow();
     const correlationId = randomUUID();
     const lockKey = `lock:bill:post:${companyId}:${expenseId}`;
+    const body = (request.body ?? {}) as { bankAccountId?: number };
 
     try {
       const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () =>
@@ -1568,6 +3251,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
           idempotencyKey,
           async () => {
             const txResult = await prisma.$transaction(async (tx) => {
+              // DB-level serialization safety: lock the expense row so concurrent posts
+              // (with different idempotency keys) cannot double-post.
+              await (tx as any).$queryRaw`
+                SELECT id FROM Expense
+                WHERE id = ${expenseId} AND companyId = ${companyId}
+                FOR UPDATE
+              `;
+
               const bill = await tx.expense.findFirst({
                 where: { id: expenseId, companyId },
                 include: { company: true, vendor: true },
@@ -1589,6 +3280,124 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 });
               }
 
+              const amount = new Prisma.Decimal(bill.amount).toDecimalPlaces(2);
+              const bankAccountId = Number(body.bankAccountId ?? 0) || null;
+
+              // Paid immediately: Dr Expense / Cr Bank (no Accounts Payable)
+              if (bankAccountId) {
+                const bankAccount = await tx.account.findFirst({
+                  where: { id: bankAccountId, companyId, type: AccountType.ASSET },
+                });
+                if (!bankAccount) {
+                  throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
+                    statusCode: 400,
+                  });
+                }
+
+                const banking = await tx.bankingAccount.findFirst({
+                  where: { companyId, accountId: bankAccount.id },
+                  select: { kind: true },
+                });
+                if (!banking) {
+                  throw Object.assign(
+                    new Error('Paid Through must be a banking account (create it under Banking first)'),
+                    { statusCode: 400 }
+                  );
+                }
+                if (banking.kind === BankingAccountKind.CREDIT_CARD) {
+                  throw Object.assign(new Error('cannot pay from a credit card account'), { statusCode: 400 });
+                }
+
+                const je = await postJournalEntry(tx, {
+                  companyId,
+                  date: bill.expenseDate,
+                  description: `Expense ${bill.expenseNumber}${bill.vendor ? ` for ${bill.vendor.name}` : ''}: ${bill.description}`,
+                  createdByUserId: (request as any).user?.userId ?? null,
+                  skipAccountValidation: true,
+                  lines: [
+                    { accountId: expAcc.id, debit: amount, credit: new Prisma.Decimal(0) },
+                    { accountId: bankAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+                  ],
+                });
+
+                const updBill = await tx.expense.updateMany({
+                  where: { id: bill.id, companyId },
+                  data: { status: 'PAID', journalEntryId: je.id, amountPaid: amount },
+                });
+                if ((updBill as any).count !== 1) {
+                  throw Object.assign(new Error('bill not found'), { statusCode: 404 });
+                }
+                const updated = { id: bill.id, status: 'PAID' as const };
+
+                await writeAuditLog(tx as any, {
+                  companyId,
+                  userId: (request as any).user?.userId ?? null,
+                  action: 'bill.post',
+                  entityType: 'Expense',
+                  entityId: bill.id,
+                  idempotencyKey,
+                  correlationId,
+                  metadata: {
+                    expenseNumber: bill.expenseNumber,
+                    expenseDate: bill.expenseDate,
+                    amount: amount.toString(),
+                    paidImmediately: true,
+                    bankAccountId: bankAccount.id,
+                    journalEntryId: je.id,
+                    newStatus: updated.status,
+                  },
+                });
+
+                await (tx as any).expensePayment.create({
+                  data: {
+                    companyId,
+                    expenseId: bill.id,
+                    paymentDate: bill.expenseDate,
+                    amount,
+                    bankAccountId: bankAccount.id,
+                    journalEntryId: je.id,
+                  },
+                });
+
+                const jeEventId = randomUUID();
+                await tx.event.create({
+                  data: {
+                    companyId,
+                    eventId: jeEventId,
+                    eventType: 'journal.entry.created',
+                    schemaVersion: 'v1',
+                    occurredAt: new Date(occurredAt),
+                    source: 'cashflow-api',
+                    partitionKey: String(companyId),
+                    correlationId,
+                    aggregateType: 'JournalEntry',
+                    aggregateId: String(je.id),
+                    type: 'JournalEntryCreated',
+                    payload: { journalEntryId: je.id, companyId },
+                  },
+                });
+
+                const billPostedEventId = randomUUID();
+                await tx.event.create({
+                  data: {
+                    companyId,
+                    eventId: billPostedEventId,
+                    eventType: 'bill.posted',
+                    schemaVersion: 'v1',
+                    occurredAt: new Date(occurredAt),
+                    source: 'cashflow-api',
+                    partitionKey: String(companyId),
+                    correlationId,
+                    aggregateType: 'Expense',
+                    aggregateId: String(bill.id),
+                    type: 'BillPosted',
+                    payload: { expenseId: bill.id, journalEntryId: je.id, amount: amount.toString() },
+                  },
+                });
+
+                return { updated, je, jeEventId, billPostedEventId };
+              }
+
               const apId = (bill.company as any).accountsPayableAccountId;
               if (!apId) {
                 throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
@@ -1602,7 +3411,6 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 });
               }
 
-              const amount = new Prisma.Decimal(bill.amount).toDecimalPlaces(2);
               const je = await postJournalEntry(tx, {
                 companyId,
                 date: bill.expenseDate,
@@ -1614,9 +3422,31 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 ],
               });
 
-              const updated = await tx.expense.update({
-                where: { id: bill.id },
+              const updBill2 = await tx.expense.updateMany({
+                where: { id: bill.id, companyId },
                 data: { status: 'POSTED', journalEntryId: je.id },
+              });
+              if ((updBill2 as any).count !== 1) {
+                throw Object.assign(new Error('bill not found'), { statusCode: 404 });
+              }
+              const updated = { id: bill.id, status: 'POSTED' as const };
+
+              await writeAuditLog(tx as any, {
+                companyId,
+                userId: (request as any).user?.userId ?? null,
+                action: 'bill.post',
+                entityType: 'Expense',
+                entityId: bill.id,
+                idempotencyKey,
+                correlationId,
+                metadata: {
+                  expenseNumber: bill.expenseNumber,
+                  expenseDate: bill.expenseDate,
+                  amount: amount.toString(),
+                  paidImmediately: false,
+                  journalEntryId: je.id,
+                  newStatus: updated.status,
+                },
               });
 
               const jeEventId = randomUUID();
@@ -1672,38 +3502,6 @@ export async function booksRoutes(fastify: FastifyInstance) {
         )
       );
 
-      if (!replay) {
-        const jeOk = await publishDomainEvent({
-          eventId: (result as any)._jeEventId,
-          eventType: 'journal.entry.created',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(result.journalEntryId),
-          source: 'cashflow-api',
-          payload: { journalEntryId: result.journalEntryId, companyId },
-        });
-        if (jeOk) await markEventPublished((result as any)._jeEventId);
-
-        const billOk = await publishDomainEvent({
-          eventId: (result as any)._billPostedEventId,
-          eventType: 'bill.posted',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'Expense',
-          aggregateId: String(result.expenseId),
-          source: 'cashflow-api',
-          payload: { expenseId: result.expenseId, journalEntryId: result.journalEntryId },
-        });
-        if (billOk) await markEventPublished((result as any)._billPostedEventId);
-      }
-
       return { expenseId: result.expenseId, status: result.status, journalEntryId: result.journalEntryId };
     } catch (err: any) {
       if (err?.statusCode) {
@@ -1717,6 +3515,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // Record bill payment: Dr AP / Cr Cash-Bank
   fastify.post('/companies/:companyId/expenses/:expenseId/payments', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const expenseId = Number((request.params as any)?.expenseId);
     if (!companyId || Number.isNaN(expenseId)) {
       reply.status(400);
@@ -1748,6 +3547,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
           idempotencyKey,
           async () => {
             const txResult = await prisma.$transaction(async (tx) => {
+              // DB-level serialization safety: lock the expense row so concurrent payments
+              // cannot overspend remaining balance even if Redis is unavailable.
+              await (tx as any).$queryRaw`
+                SELECT id FROM Expense
+                WHERE id = ${expenseId} AND companyId = ${companyId}
+                FOR UPDATE
+              `;
+
               const bill = await tx.expense.findFirst({
                 where: { id: expenseId, companyId },
                 include: { company: true },
@@ -1755,6 +3562,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
               if (!bill) throw Object.assign(new Error('expense not found'), { statusCode: 404 });
               if (bill.status !== 'POSTED' && bill.status !== 'PARTIAL') {
                 throw Object.assign(new Error('payments allowed only for POSTED or PARTIAL bills'), { statusCode: 400 });
+              }
+
+              // CRITICAL FIX #1: Currency validation - ensure expense currency matches company baseCurrency
+              const baseCurrency = ((bill.company as any).baseCurrency ?? '').trim().toUpperCase() || null;
+              const billCurrency = ((bill as any).currency ?? '').trim().toUpperCase() || null;
+              if (baseCurrency && billCurrency && baseCurrency !== billCurrency) {
+                throw Object.assign(
+                  new Error(`currency mismatch: expense currency ${billCurrency} must match company baseCurrency ${baseCurrency}`),
+                  { statusCode: 400 }
+                );
               }
 
               const apId = (bill.company as any).accountsPayableAccountId;
@@ -1813,9 +3630,32 @@ export async function booksRoutes(fastify: FastifyInstance) {
               const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
               const newStatus = totalPaid.greaterThanOrEqualTo(bill.amount) ? 'PAID' : 'PARTIAL';
 
-              await tx.expense.update({
-                where: { id: bill.id },
+              const updBill3 = await tx.expense.updateMany({
+                where: { id: bill.id, companyId },
                 data: { amountPaid: totalPaid, status: newStatus },
+              });
+              if ((updBill3 as any).count !== 1) {
+                throw Object.assign(new Error('bill not found'), { statusCode: 404 });
+              }
+
+              await writeAuditLog(tx as any, {
+                companyId,
+                userId: (request as any).user?.userId ?? null,
+                action: 'bill.payment.create',
+                entityType: 'ExpensePayment',
+                entityId: pay.id,
+                idempotencyKey,
+                correlationId,
+                metadata: {
+                  expenseId: bill.id,
+                  expenseNumber: bill.expenseNumber,
+                  paymentDate,
+                  amount: amount.toString(),
+                  bankAccountId: bankAccount.id,
+                  journalEntryId: je.id,
+                  newStatus,
+                  newAmountPaid: totalPaid.toString(),
+                },
               });
 
               const jeEventId = randomUUID();
@@ -1870,38 +3710,6 @@ export async function booksRoutes(fastify: FastifyInstance) {
           redis
         )
       );
-
-      if (!replay) {
-        const jeOk = await publishDomainEvent({
-          eventId: (result as any)._jeEventId,
-          eventType: 'journal.entry.created',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'JournalEntry',
-          aggregateId: String(result.journalEntryId),
-          source: 'cashflow-api',
-          payload: { journalEntryId: result.journalEntryId, companyId },
-        });
-        if (jeOk) await markEventPublished((result as any)._jeEventId);
-
-        const payOk = await publishDomainEvent({
-          eventId: (result as any)._paymentEventId,
-          eventType: 'bill.payment.recorded',
-          schemaVersion: 'v1',
-          occurredAt: (result as any)._occurredAt,
-          companyId,
-          partitionKey: String(companyId),
-          correlationId: (result as any)._correlationId,
-          aggregateType: 'ExpensePayment',
-          aggregateId: String(result.expensePaymentId),
-          source: 'cashflow-api',
-          payload: { expensePaymentId: result.expensePaymentId, expenseId: result.expenseId, journalEntryId: result.journalEntryId },
-        });
-        if (payOk) await markEventPublished((result as any)._paymentEventId);
-      }
 
       return { expenseId: result.expenseId, expensePaymentId: result.expensePaymentId, journalEntryId: result.journalEntryId };
     } catch (err: any) {

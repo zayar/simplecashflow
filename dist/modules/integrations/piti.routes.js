@@ -1,6 +1,4 @@
 import { prisma } from '../../infrastructure/db.js';
-import { publishDomainEvent } from '../../infrastructure/pubsub.js';
-import { markEventPublished } from '../../infrastructure/events.js';
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
@@ -50,7 +48,7 @@ export async function pitiRoutes(fastify) {
         const eventType = 'integration.piti.sale.imported'; // Canonical dot-delimited name
         const schemaVersion = 'v1';
         const source = 'integration:piti';
-        const { replay, response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        const { response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const entry = await prisma.$transaction(async (tx) => {
                 const journalEntry = await postJournalEntry(tx, {
                     companyId,
@@ -83,32 +81,9 @@ export async function pitiRoutes(fastify) {
                 });
                 return journalEntry;
             });
-            const envelope = {
-                eventId,
-                eventType,
-                schemaVersion,
-                occurredAt,
-                companyId,
-                partitionKey: String(companyId),
-                correlationId,
-                aggregateType: 'JournalEntry',
-                aggregateId: String(entry.id),
-                source,
-                payload: {
-                    journalEntryId: entry.id,
-                    amount,
-                },
-            };
-            return { entry, envelope };
+            return entry;
         }, redis);
-        const entry = response.entry;
-        if (!replay) {
-            const published = await publishDomainEvent(response.envelope);
-            if (published) {
-                await markEventPublished(eventId);
-            }
-        }
-        return entry;
+        return response;
     });
 }
 //# sourceMappingURL=piti.routes.js.map

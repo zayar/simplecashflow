@@ -8,7 +8,7 @@ import { Menu, LogOut } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { cn } from "@/lib/utils"
 import { Sidebar } from "@/components/sidebar"
-import { Button } from "@/components/ui/button"
+import { buttonVariants } from "@/components/ui/button"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import {
   DropdownMenu,
@@ -25,6 +25,7 @@ function pageTitleFromPath(pathname: string) {
   if (pathname === "/") return "Dashboard"
   const map: Record<string, string> = {
     "/invoices": "Invoices",
+    "/credit-notes": "Credit Notes",
     "/expenses": "Expenses",
     "/customers": "Customers",
     "/vendors": "Vendors",
@@ -102,10 +103,12 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
               {/* Mobile menu */}
               <div className="lg:hidden">
                 <Sheet>
-                  <SheetTrigger asChild>
-                    <Button variant="ghost" size="icon" aria-label="Open menu">
-                      <Menu className="h-5 w-5" />
-                    </Button>
+                  <SheetTrigger
+                    aria-label="Open menu"
+                    className={buttonVariants({ variant: "ghost", size: "icon" })}
+                    type="button"
+                  >
+                    <Menu className="h-5 w-5" />
                   </SheetTrigger>
                   <SheetContent side="left" className="p-0">
                     <Sidebar />
@@ -123,20 +126,24 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
               </div>
 
               {user ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" className="h-9 gap-2 px-2">
-                      <Avatar className="h-7 w-7">
-                        <AvatarFallback>
-                          {(user.name || user.email || "U")
-                            .slice(0, 1)
-                            .toUpperCase()}
-                        </AvatarFallback>
-                      </Avatar>
-                      <span className="hidden max-w-[180px] truncate text-sm font-medium md:inline">
-                        {user.name || user.email}
-                      </span>
-                    </Button>
+                <DropdownMenu modal={false}>
+                  <DropdownMenuTrigger
+                    className={cn(
+                      buttonVariants({ variant: "ghost", size: "sm" }),
+                      "h-9 gap-2 px-2"
+                    )}
+                    type="button"
+                  >
+                    <Avatar className="h-7 w-7">
+                      <AvatarFallback>
+                        {(user.name || user.email || "U")
+                          .slice(0, 1)
+                          .toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
+                    <span className="hidden max-w-[180px] truncate text-sm font-medium md:inline">
+                      {user.name || user.email}
+                    </span>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-56">
                     <DropdownMenuLabel className="space-y-0.5">
@@ -149,7 +156,9 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
                     </DropdownMenuLabel>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem asChild>
-                      <Link href="/reports">Reports</Link>
+                      <Link href="/reports">
+                        <span>Reports</span>
+                      </Link>
                     </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem

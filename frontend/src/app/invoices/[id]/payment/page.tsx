@@ -359,14 +359,16 @@ export default function RecordPaymentPage() {
               </div>
 
               <div className="flex justify-end gap-4 pt-4">
-                <Button type="button" variant="outline" onClick={() => router.back()}>
+                <Button type="button" variant="outline" onClick={() => router.back()} disabled={loading}>
                   Cancel
                 </Button>
                 <Button 
                   type="submit" 
-                  disabled={loading || !canPay || isFullyPaid || !formData.bankAccountId}
+                  loading={loading}
+                  loadingText="Recording Payment..."
+                  disabled={!canPay || isFullyPaid || !formData.bankAccountId}
                 >
-                  {loading ? 'Recording Payment...' : 'Record Payment'}
+                  Record Payment
                 </Button>
               </div>
             </form>

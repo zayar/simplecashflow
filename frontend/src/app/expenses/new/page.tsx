@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useAuth } from '@/contexts/auth-context';
-import { createBill, getAccounts, getVendors, postBill, payBill, fetchApi, Vendor, Account } from '@/lib/api';
+import { createBill, getAccounts, getVendors, postBill, fetchApi, Vendor, Account } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
@@ -104,15 +104,8 @@ export default function NewBillPage() {
         const selected = depositAccounts.find((d: any) => d.account?.id?.toString() === form.paidThroughAccountId);
         if (!selected) throw new Error('Pay Through must be a banking account (create it under Banking first)');
 
-        // Post
-        await postBill(user.companyId, bill.id);
-        
-        // Pay
-        await payBill(user.companyId, bill.id, {
-          amount,
-          paymentDate: form.expenseDate,
-          bankAccountId: Number(form.paidThroughAccountId),
-        });
+        // Post as "paid immediately": Dr Expense / Cr Bank (no Accounts Payable)
+        await postBill(user.companyId, bill.id, { bankAccountId: Number(form.paidThroughAccountId) });
 
         // Redirect to list (or stay on page if "Save and New", but currently just redirecting)
         router.push('/expenses');
@@ -191,8 +184,9 @@ export default function NewBillPage() {
                     </SelectNative>
                     <Input 
                       type="number" 
-                      step="0.01" 
-                      min="0.01" 
+                      inputMode="numeric"
+                      step="1" 
+                      min="1" 
                       required 
                       value={form.amount} 
                       onChange={(e) => setForm({ ...form, amount: e.target.value })} 

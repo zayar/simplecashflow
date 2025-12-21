@@ -6,7 +6,14 @@ export type StockMoveInput = {
   warehouseId: number;
   itemId: number;
   date: Date;
-  type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
+  type:
+    | 'OPENING'
+    | 'ADJUSTMENT'
+    | 'SALE_ISSUE'
+    | 'SALE_RETURN'
+    | 'PURCHASE_RECEIPT'
+    | 'TRANSFER_OUT'
+    | 'TRANSFER_IN';
   direction: 'IN' | 'OUT';
   quantity: Prisma.Decimal;
   unitCostApplied: Prisma.Decimal;
@@ -218,8 +225,13 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
     throw Object.assign(new Error('quantity must be > 0'), { statusCode: 400 });
   }
 
-  const existing = await (tx as any).stockBalance.findFirst({
-    where: { companyId: input.companyId, warehouseId: input.warehouseId, itemId: input.itemId },
+  // DB-level safety: lock the StockBalance row inside the current transaction so concurrent writes
+  // cannot oversell or compute WAC based on stale balances. This makes negative inventory prevention
+  // independent of Redis availability.
+  const existing = await lockAndGetStockBalanceRowForUpdate(tx, {
+    companyId: input.companyId,
+    warehouseId: input.warehouseId,
+    itemId: input.itemId,
   });
 
   const Q = existing ? new Prisma.Decimal(existing.qtyOnHand) : d0();
@@ -348,6 +360,46 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
     unitCostApplied: unitCost,
     totalCostApplied: inValue,
   };
+}
+
+async function lockAndGetStockBalanceRowForUpdate(
+  tx: PrismaTx,
+  input: { companyId: number; warehouseId: number; itemId: number }
+): Promise<{ qtyOnHand: Prisma.Decimal; avgUnitCost: Prisma.Decimal; inventoryValue: Prisma.Decimal } | null> {
+  const { companyId, warehouseId, itemId } = input;
+  if (!Number.isInteger(companyId) || companyId <= 0) return null;
+  if (!Number.isInteger(warehouseId) || warehouseId <= 0) return null;
+  if (!Number.isInteger(itemId) || itemId <= 0) return null;
+
+  // Ensure the row exists so we can reliably acquire a row lock.
+  // Uses the unique key (companyId, warehouseId, itemId).
+  await (tx as any).$executeRaw`
+    INSERT INTO StockBalance (companyId, warehouseId, itemId, qtyOnHand, avgUnitCost, inventoryValue, createdAt, updatedAt)
+    VALUES (${companyId}, ${warehouseId}, ${itemId}, 0, 0, 0, NOW(), NOW())
+    ON DUPLICATE KEY UPDATE updatedAt = updatedAt
+  `;
+
+  const rows = (await (tx as any).$queryRaw`
+    SELECT qtyOnHand, avgUnitCost, inventoryValue
+    FROM StockBalance
+    WHERE companyId = ${companyId} AND warehouseId = ${warehouseId} AND itemId = ${itemId}
+    FOR UPDATE
+  `) as Array<{ qtyOnHand: any; avgUnitCost: any; inventoryValue: any }>;
+
+  const r = rows?.[0];
+  if (!r) return null;
+  return {
+    qtyOnHand: new Prisma.Decimal(r.qtyOnHand),
+    avgUnitCost: new Prisma.Decimal(r.avgUnitCost),
+    inventoryValue: new Prisma.Decimal(r.inventoryValue),
+  };
+}
+
+export async function getStockBalanceForUpdate(
+  tx: PrismaTx,
+  input: { companyId: number; warehouseId: number; itemId: number }
+) {
+  return await lockAndGetStockBalanceRowForUpdate(tx, input);
 }
 
 

@@ -9,6 +9,8 @@ import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureWarehouse } from './stock.service.js';
+import { requireAnyRole, Roles } from '../../utils/rbac.js';
+import { writeAuditLog } from '../../infrastructure/auditLog.js';
 
 function d2(n: number) {
   return new Prisma.Decimal(n).toDecimalPlaces(2);
@@ -70,6 +72,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
   // Header: Idempotency-Key
   fastify.post('/companies/:companyId/inventory/opening-balance', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
     if (!idempotencyKey) {
       reply.status(400);
@@ -211,6 +214,21 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               },
             });
 
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'inventory.opening_balance',
+              entityType: 'JournalEntry',
+              entityId: je.id,
+              idempotencyKey,
+              correlationId,
+              metadata: {
+                warehouseId,
+                totalValue: totalValue.toString(),
+                linesCount: (body.lines ?? []).length,
+              },
+            });
+
             return { journalEntryId: je.id, totalValue: totalValue.toString(), warehouseId, _jeEventId: jeEventId };
           });
 
@@ -231,6 +249,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
   // POST /companies/:companyId/inventory/adjustments
   fastify.post('/companies/:companyId/inventory/adjustments', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
     const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
     if (!idempotencyKey) {
       reply.status(400);
@@ -430,6 +449,24 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                 aggregateId: String(je.id),
                 type: 'JournalEntryCreated',
                 payload: { journalEntryId: je.id, companyId },
+              },
+            });
+
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'inventory.adjustment',
+              entityType: 'JournalEntry',
+              entityId: je.id,
+              idempotencyKey,
+              correlationId,
+              metadata: {
+                warehouseId,
+                offsetAccountId,
+                referenceNumber: body.referenceNumber ?? null,
+                reason: body.reason ?? null,
+                linesCount: (body.lines ?? []).length,
+                netValue: net.toString(),
               },
             });
 

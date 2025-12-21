@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { ArrowLeft, Plus } from 'lucide-react';
+import { ArrowLeft, Plus, Trash2 } from 'lucide-react';
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getAccounts, getVendors, Account, Vendor } from '@/lib/api';
 import { Button } from '@/components/ui/button';
@@ -13,6 +13,8 @@ import { Label } from '@/components/ui/label';
 import { SelectNative } from '@/components/ui/select-native';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { todayInTimeZone } from '@/lib/utils';
+import { Textarea } from '@/components/ui/textarea';
+import { AccountPicker } from '@/components/account-picker';
 
 type Line = { itemId: string; accountId: string; quantity: string; unitCost: string; description: string };
 
@@ -83,31 +85,8 @@ export default function NewPurchaseBillPage() {
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!user?.companyId) return;
-    // Enforce account rules:
-    // - tracked inventory -> account must be Inventory Asset (locked)
-    // - non-inventory/service -> account must be EXPENSE (required)
-    for (const [idx, l] of lines.entries()) {
-      if (!l.itemId) continue;
-      const it = selectableItems.find((x) => String(x.id) === String(l.itemId));
-      if (!it) continue;
-      const isTracked = it.type === 'GOODS' && !!it.trackInventory;
-
-      if (isTracked) {
-        if (!inventoryAccountId) {
-          alert('Your company Inventory Asset account is not set. Please set it in Company Settings.');
-          return;
-        }
-        if (String(l.accountId || '') !== String(inventoryAccountId)) {
-          alert(`Line ${idx + 1}: tracked inventory must use Inventory Asset account.`);
-          return;
-        }
-      } else {
-        if (!l.accountId) {
-          alert(`Line ${idx + 1}: please select an Expense account.`);
-          return;
-        }
-      }
-    }
+    // Draft-friendly: allow saving even if some lines are missing account mapping.
+    // Posting (on the detail page) will enforce required account mappings.
 
     const payloadLines = lines
       .map((l) => ({
@@ -168,7 +147,7 @@ export default function NewPurchaseBillPage() {
           <form onSubmit={submit} className="space-y-4">
             <div className="grid gap-4 md:grid-cols-3">
               <div className="grid gap-2">
-                <Label>Vendor (optional)</Label>
+                <Label>Supplier</Label>
                 <SelectNative value={form.vendorId} onChange={(e) => setForm({ ...form, vendorId: e.target.value })}>
                   <option value="">—</option>
                   {vendors.map((v) => (
@@ -183,7 +162,7 @@ export default function NewPurchaseBillPage() {
                 <Input type="date" value={form.billDate} onChange={(e) => setForm({ ...form, billDate: e.target.value })} />
               </div>
               <div className="grid gap-2">
-                <Label>Due Date (optional)</Label>
+                <Label>Due Date</Label>
                 <Input type="date" value={form.dueDate} onChange={(e) => setForm({ ...form, dueDate: e.target.value })} />
               </div>
             </div>
@@ -205,105 +184,145 @@ export default function NewPurchaseBillPage() {
               <CardHeader className="flex flex-row items-center justify-between space-y-0">
                 <CardTitle className="text-base">Lines</CardTitle>
                 <Button type="button" variant="outline" onClick={addLine} className="gap-2">
-                  <Plus className="h-4 w-4" /> Add line
+                  <Plus className="h-4 w-4" /> Add Item
                 </Button>
               </CardHeader>
               <CardContent className="pt-0">
+                <div className="rounded-lg border">
                 <Table>
                   <TableHeader>
-                    <TableRow>
-                      <TableHead>Item</TableHead>
-                      <TableHead>Account</TableHead>
-                      <TableHead>Description</TableHead>
-                      <TableHead className="w-[140px] text-right">Qty</TableHead>
-                      <TableHead className="w-[180px] text-right">Unit Cost</TableHead>
-                      <TableHead className="w-[140px] text-right">Line Total</TableHead>
-                      <TableHead className="w-[110px]" />
+                      <TableRow className="bg-muted/40">
+                        <TableHead className="w-[420px]">ITEM / DESCRIPTION</TableHead>
+                        <TableHead className="w-[90px] text-right">QTY</TableHead>
+                        <TableHead className="w-[160px]">UNIT</TableHead>
+                        <TableHead className="w-[160px] text-right">PRICE</TableHead>
+                        <TableHead className="w-[160px] text-right">DISCOUNT</TableHead>
+                        <TableHead className="w-[160px] text-right">ITEM AMOUNT</TableHead>
+                        <TableHead className="w-[60px]" />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {lines.map((l, idx) => (
-                      <TableRow key={idx}>
-                        <TableCell>
+                      {lines.map((l, idx) => {
+                        const it = selectableItems.find((x) => String(x.id) === String(l.itemId));
+                        const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
+                        const lineTotal = Number(l.quantity || 0) * Number(l.unitCost || 0);
+                        return (
+                          <>
+                          <TableRow key={`main-${idx}`} className="border-b-0">
+                            <TableCell className="align-top">
+                              <div className="space-y-2">
                           <SelectNative
                             value={l.itemId}
                             onChange={(e) => {
                               const itemId = e.target.value;
-                              const it = selectableItems.find((x) => String(x.id) === String(itemId));
-                              const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
-                              const nextAccountId = isTracked
+                                    const picked = selectableItems.find((x) => String(x.id) === String(itemId));
+                                    const pickedTracked = picked?.type === 'GOODS' && !!picked?.trackInventory;
+                                    const nextAccountId = pickedTracked
                                 ? inventoryAccountId
                                   ? String(inventoryAccountId)
                                   : ''
-                                : it?.expenseAccountId
-                                  ? String(it.expenseAccountId)
+                                      : picked?.expenseAccountId
+                                        ? String(picked.expenseAccountId)
                                   : '';
                               updateLine(idx, { itemId, accountId: nextAccountId });
                             }}
                           >
-                            <option value="">Select item</option>
-                            {selectableItems.map((it) => (
-                              <option key={it.id} value={String(it.id)}>
-                                {it.name}
+                                  <option value="">Select item…</option>
+                                  {selectableItems.map((it2) => (
+                                    <option key={it2.id} value={String(it2.id)}>
+                                      {it2.name}
                               </option>
                             ))}
-                          </SelectNative>
-                        </TableCell>
-                        <TableCell>
-                          {(() => {
-                            const it = selectableItems.find((x) => String(x.id) === String(l.itemId));
-                            const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
-                            if (isTracked) {
-                              return (
-                                <SelectNative value={l.accountId} disabled>
-                                  <option value={inventoryAccount ? String(inventoryAccount.id) : ''}>
-                                    {inventoryAccount ? `${inventoryAccount.code} - ${inventoryAccount.name}` : 'Inventory (not set)'}
-                                  </option>
                                 </SelectNative>
-                              );
-                            }
-                            return (
-                              <SelectNative
-                                value={l.accountId}
-                                onChange={(e) => updateLine(idx, { accountId: e.target.value })}
-                                required={!!l.itemId}
-                              >
-                                <option value="">Select expense account</option>
-                                {expenseAccounts.map((a) => (
-                                  <option key={a.id} value={String(a.id)}>
-                                    {a.code} - {a.name}
-                                  </option>
-                                ))}
-                              </SelectNative>
-                            );
-                          })()}
+
+                              </div>
                         </TableCell>
-                        <TableCell>
-                          <Input value={l.description} onChange={(e) => updateLine(idx, { description: e.target.value })} />
+                            <TableCell className="align-top">
+                          <Input
+                            type="number"
+                            inputMode="numeric"
+                            step="1"
+                            min="1"
+                                className="text-right"
+                            value={l.quantity}
+                            onChange={(e) => {
+                              const next = e.target.value;
+                              updateLine(idx, { quantity: next.includes('.') ? String(Math.trunc(Number(next))) : next });
+                            }}
+                          />
                         </TableCell>
-                        <TableCell className="text-right">
-                          <Input type="number" step="0.01" value={l.quantity} onChange={(e) => updateLine(idx, { quantity: e.target.value })} />
+                            <TableCell className="align-top">
+                              <Input disabled placeholder="Enter a Unit" />
+                            </TableCell>
+                            <TableCell className="align-top">
+                          <Input
+                            type="number"
+                            inputMode="decimal"
+                            step="1"
+                            min="0"
+                                className="text-right"
+                            value={l.unitCost}
+                            onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
+                          />
                         </TableCell>
-                        <TableCell className="text-right">
-                          <Input type="number" step="0.01" value={l.unitCost} onChange={(e) => updateLine(idx, { unitCost: e.target.value })} />
+                            <TableCell className="align-top">
+                              <Input disabled className="text-right" value="0.00" />
+                            </TableCell>
+                            <TableCell className="align-top text-right font-semibold tabular-nums">
+                              {lineTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </TableCell>
-                        <TableCell className="text-right font-medium tabular-nums">
-                          {(Number(l.quantity || 0) * Number(l.unitCost || 0)).toLocaleString()}
-                        </TableCell>
-                        <TableCell className="text-right">
-                          <Button type="button" variant="ghost" onClick={() => removeLine(idx)} disabled={lines.length === 1}>
-                            Remove
+                            <TableCell className="align-top text-right">
+                              <Button type="button" variant="ghost" size="icon" onClick={() => removeLine(idx)} disabled={lines.length === 1}>
+                                <Trash2 className="h-4 w-4 text-muted-foreground" />
                           </Button>
                         </TableCell>
                       </TableRow>
-                    ))}
+                          <TableRow key={`acct-${idx}`} className="bg-muted/10 border-t-0">
+                            <TableCell className="py-3">
+                              <Textarea
+                                value={l.description}
+                                onChange={(e) => updateLine(idx, { description: e.target.value })}
+                                placeholder="Enter name or description"
+                                className="min-h-[44px]"
+                              />
+                            </TableCell>
+                            <TableCell colSpan={2} className="py-3">
+                              {isTracked ? (
+                                <AccountPicker
+                                  accounts={inventoryAccount ? [inventoryAccount as any] : []}
+                                  value={inventoryAccount ? inventoryAccount.id : null}
+                                  onChange={() => {}}
+                                  placeholder={inventoryAccount ? inventoryAccount.name : 'Inventory (not set)'}
+                                  disabled
+                                  createHref="/accounts/new"
+                                />
+                              ) : (
+                                <AccountPicker
+                                  accounts={accounts}
+                                  value={l.accountId ? Number(l.accountId) : null}
+                                  onChange={(nextId) => updateLine(idx, { accountId: nextId ? String(nextId) : '' })}
+                                  placeholder="Select an account"
+                                  disabled={!accounts.length}
+                                  createHref="/accounts/new"
+                                />
+                              )}
+                              {!isTracked && l.itemId && !l.accountId ? (
+                                <div className="mt-1 text-xs text-orange-600">Missing account → you can save Draft, but you can’t Post until set.</div>
+                              ) : null}
+                            </TableCell>
+                            <TableCell colSpan={4} />
+                          </TableRow>
+                          </>
+                        );
+                      })}
                   </TableBody>
                 </Table>
+                </div>
                 <div className="flex justify-end pt-4 text-sm">
                   <div className="text-muted-foreground">
                     Total:{' '}
                     <span className="font-medium tabular-nums">
-                      {total.toLocaleString()}
+                      {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </span>
                   </div>
                 </div>
@@ -315,7 +334,7 @@ export default function NewPurchaseBillPage() {
                 Cancel
               </Button>
               <Button type="submit" disabled={loading}>
-                {loading ? 'Creating...' : 'Create Purchase Bill'}
+                {loading ? 'Saving...' : 'Save as Draft'}
               </Button>
             </div>
           </form>

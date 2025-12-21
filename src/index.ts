@@ -9,6 +9,9 @@ import { pitiRoutes } from './modules/integrations/piti.routes.js';
 import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
 import { apAgingRoutes } from './modules/reports/apAging.routes.js';
+import { dashboardRoutes } from './modules/reports/dashboard.routes.js';
+import { taxesRoutes } from './modules/taxes/taxes.routes.js';
+import { runWithTenant } from './infrastructure/tenantContext.js';
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -128,6 +131,16 @@ async function buildApp() {
   await fastify.register(inventoryRoutes);
   await fastify.register(purchaseBillsRoutes);
   await fastify.register(apAgingRoutes);
+  await fastify.register(dashboardRoutes);
+  await fastify.register(taxesRoutes);
+
+  // Tenant context (ALS) must be installed AFTER module-level auth hooks are registered,
+  // so it can wrap the actual route handler execution with a verified tenant id.
+  fastify.addHook('preHandler', ((request: any, _reply: any, done: any) => {
+    const companyId = Number(request?.user?.companyId);
+    if (!Number.isInteger(companyId) || companyId <= 0) return done();
+    return runWithTenant(companyId, done);
+  }) as any);
 
   return fastify;
 }

@@ -39,9 +39,15 @@ export async function companiesRoutes(fastify) {
             reply.status(404);
             return { error: 'company not found' };
         }
+        // Used for base currency immutability (fintech safety): once transactions exist, lock base currency.
+        const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
         return {
             companyId: company.id,
             name: company.name,
+            baseCurrency: company.baseCurrency ?? null,
+            timeZone: company.timeZone ?? null,
+            fiscalYearStartMonth: company.fiscalYearStartMonth ?? 1,
+            baseCurrencyLocked: transactionCount > 0,
             accountsReceivableAccountId: company.accountsReceivableAccountId,
             accountsReceivableAccount: company.accountsReceivableAccount
                 ? {
@@ -100,7 +106,10 @@ export async function companiesRoutes(fastify) {
     fastify.put('/companies/:companyId/settings', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
         const body = request.body;
-        if (!('accountsReceivableAccountId' in body) &&
+        if (!('baseCurrency' in body) &&
+            !('timeZone' in body) &&
+            !('fiscalYearStartMonth' in body) &&
+            !('accountsReceivableAccountId' in body) &&
             !('accountsPayableAccountId' in body) &&
             !('inventoryAssetAccountId' in body) &&
             !('cogsAccountId' in body) &&
@@ -108,7 +117,7 @@ export async function companiesRoutes(fastify) {
             !('defaultWarehouseId' in body)) {
             reply.status(400);
             return {
-                error: 'at least one setting field is required (accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultWarehouseId)',
+                error: 'at least one setting field is required (baseCurrency, timeZone, fiscalYearStartMonth, accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultWarehouseId)',
             };
         }
         const company = await prisma.company.findUnique({ where: { id: companyId } });
@@ -116,7 +125,49 @@ export async function companiesRoutes(fastify) {
             reply.status(404);
             return { error: 'company not found' };
         }
-        if (body.accountsReceivableAccountId !== null) {
+        // --- Validate and enforce company profile fields ---
+        if (body.baseCurrency !== undefined) {
+            const cur = body.baseCurrency;
+            if (cur === null) {
+                // allow clearing only if no transactions exist
+                const cnt = await prisma.journalEntry.count({ where: { companyId } });
+                if (cnt > 0) {
+                    reply.status(400);
+                    return { error: 'baseCurrency cannot be cleared after transactions exist' };
+                }
+            }
+            else {
+                const normalized = String(cur).trim().toUpperCase();
+                if (!/^[A-Z]{3}$/.test(normalized)) {
+                    reply.status(400);
+                    return { error: 'baseCurrency must be a 3-letter currency code (e.g. MMK, USD)' };
+                }
+                // lock base currency after any journal entries exist
+                const cnt = await prisma.journalEntry.count({ where: { companyId } });
+                const existing = (company.baseCurrency ?? null);
+                if (cnt > 0 && existing && existing !== normalized) {
+                    reply.status(400);
+                    return { error: 'baseCurrency cannot be changed after transactions exist' };
+                }
+                // mutate request payload to normalized value (so we store clean)
+                body.baseCurrency = normalized;
+            }
+        }
+        if (body.timeZone !== undefined && body.timeZone !== null) {
+            const tz = String(body.timeZone).trim();
+            if (tz.length < 3 || tz.length > 64) {
+                reply.status(400);
+                return { error: 'timeZone must be a valid IANA timezone name (e.g. Asia/Yangon)' };
+            }
+        }
+        if (body.fiscalYearStartMonth !== undefined && body.fiscalYearStartMonth !== null) {
+            const m = Number(body.fiscalYearStartMonth);
+            if (!Number.isInteger(m) || m < 1 || m > 12) {
+                reply.status(400);
+                return { error: 'fiscalYearStartMonth must be an integer between 1 and 12' };
+            }
+        }
+        if (body.accountsReceivableAccountId !== undefined && body.accountsReceivableAccountId !== null) {
             const arId = body.accountsReceivableAccountId;
             if (!arId || Number.isNaN(Number(arId))) {
                 reply.status(400);
@@ -201,6 +252,11 @@ export async function companiesRoutes(fastify) {
         const updated = await prisma.company.update({
             where: { id: companyId },
             data: {
+                ...(body.baseCurrency !== undefined ? { baseCurrency: body.baseCurrency } : {}),
+                ...(body.timeZone !== undefined ? { timeZone: body.timeZone } : {}),
+                ...(body.fiscalYearStartMonth !== undefined
+                    ? { fiscalYearStartMonth: body.fiscalYearStartMonth }
+                    : {}),
                 ...(body.accountsReceivableAccountId !== undefined
                     ? { accountsReceivableAccountId: body.accountsReceivableAccountId }
                     : {}),
@@ -225,9 +281,14 @@ export async function companiesRoutes(fastify) {
                 defaultWarehouse: true,
             },
         });
+        const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
         return {
             companyId: updated.id,
             name: updated.name,
+            baseCurrency: updated.baseCurrency ?? null,
+            timeZone: updated.timeZone ?? null,
+            fiscalYearStartMonth: updated.fiscalYearStartMonth ?? 1,
+            baseCurrencyLocked: transactionCount > 0,
             accountsReceivableAccountId: updated.accountsReceivableAccountId,
             accountsReceivableAccount: updated.accountsReceivableAccount
                 ? {

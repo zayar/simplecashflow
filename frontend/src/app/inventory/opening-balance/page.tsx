@@ -127,11 +127,20 @@ export default function OpeningBalancePage() {
         <CardContent className="grid gap-4 md:grid-cols-3">
           <div className="grid gap-2">
             <Label>Date</Label>
-            <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <Input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              disabled={loading}
+            />
           </div>
           <div className="grid gap-2">
             <Label>Warehouse</Label>
-            <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
+            <SelectNative
+              value={warehouseId}
+              onChange={(e) => setWarehouseId(e.target.value)}
+              disabled={loading}
+            >
               <option value="">Company default</option>
               {warehouses.map((w) => (
                 <option key={w.id} value={String(w.id)}>
@@ -142,8 +151,8 @@ export default function OpeningBalancePage() {
             </SelectNative>
           </div>
           <div className="md:col-span-3 flex justify-end">
-            <Button onClick={submit} disabled={loading}>
-              {loading ? 'Posting...' : 'Post Opening Stock'}
+            <Button onClick={submit} loading={loading} loadingText="Posting...">
+              Post Opening Stock
             </Button>
           </div>
         </CardContent>
@@ -153,7 +162,7 @@ export default function OpeningBalancePage() {
         <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-lg">Lines</CardTitle>
           {!isSingleItemMode ? (
-            <Button variant="outline" onClick={addLine}>
+            <Button variant="outline" onClick={addLine} disabled={loading}>
               Add line
             </Button>
           ) : (
@@ -192,24 +201,30 @@ export default function OpeningBalancePage() {
                   <TableCell className="text-right">
                     <Input
                       type="number"
-                      step="0.01"
+                      inputMode="numeric"
+                      step="1"
+                      min="1"
                       value={l.quantity}
                       onChange={(e) => updateLine(idx, { quantity: e.target.value })}
+                      disabled={loading}
                     />
                   </TableCell>
                   <TableCell className="text-right">
                     <Input
                       type="number"
-                      step="0.01"
+                      inputMode="numeric"
+                      step="1"
+                      min="0"
                       value={l.unitCost}
                       onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
+                      disabled={loading}
                     />
                   </TableCell>
                   <TableCell className="text-right">
                     <Button
                       variant="ghost"
                       onClick={() => removeLine(idx)}
-                      disabled={isSingleItemMode || lines.length === 1}
+                      disabled={loading || isSingleItemMode || lines.length === 1}
                     >
                       Remove
                     </Button>

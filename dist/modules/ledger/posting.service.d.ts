@@ -1,5 +1,5 @@
-import { Prisma, PrismaClient } from '@prisma/client';
-export type PrismaTx = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
+import { Prisma } from '@prisma/client';
+export type PrismaTx = any;
 export type PostingLineInput = {
     accountId: number;
     debit?: Prisma.Decimal;
@@ -25,25 +25,5 @@ export type PostJournalEntryInput = {
  * - Enforces no line has both debit and credit > 0
  * - Enforces all accounts belong to the company (multi-tenant safety)
  */
-export declare function postJournalEntry(tx: PrismaTx, input: PostJournalEntryInput): Promise<{
-    lines: {
-        companyId: number;
-        id: number;
-        debit: Prisma.Decimal;
-        credit: Prisma.Decimal;
-        journalEntryId: number;
-        accountId: number;
-    }[];
-} & {
-    companyId: number;
-    createdAt: Date;
-    updatedAt: Date;
-    id: number;
-    date: Date;
-    reversalReason: string | null;
-    description: string;
-    createdByUserId: number | null;
-    postedAt: Date;
-    reversalOfJournalEntryId: number | null;
-}>;
+export declare function postJournalEntry(tx: PrismaTx, input: PostJournalEntryInput): Promise<any>;
 //# sourceMappingURL=posting.service.d.ts.map

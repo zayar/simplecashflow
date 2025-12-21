@@ -243,11 +243,16 @@ export default function PayPurchaseBillPage() {
               </div>
 
               <div className="flex justify-end gap-3 pt-4">
-                <Button type="button" variant="outline" onClick={() => router.back()}>
+                <Button type="button" variant="outline" onClick={() => router.back()} disabled={loading}>
                   Cancel
                 </Button>
-                <Button type="submit" disabled={loading || !canPay || isFullyPaid || !form.bankAccountId}>
-                  {loading ? 'Paying...' : 'Pay Purchase Bill'}
+                <Button
+                  type="submit"
+                  loading={loading}
+                  loadingText="Paying..."
+                  disabled={!canPay || isFullyPaid || !form.bankAccountId}
+                >
+                  Pay Purchase Bill
                 </Button>
               </div>
             </form>

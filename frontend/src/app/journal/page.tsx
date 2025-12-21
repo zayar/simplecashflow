@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { ArrowRight } from "lucide-react"
+import { ArrowRight, Plus } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
 import { fetchApi } from "@/lib/api"
@@ -49,6 +49,12 @@ export default function JournalPage() {
             Recent journal entries (last 100).
           </p>
         </div>
+        <Link href="/journal/new">
+          <Button className="flex items-center gap-2">
+            <Plus className="h-4 w-4" />
+            New Journal Entry
+          </Button>
+        </Link>
       </div>
 
       <Card className="shadow-sm">

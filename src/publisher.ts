@@ -17,7 +17,12 @@ function backoffMs(attempt: number): number {
 }
 
 function buildEnvelopeFromEventRow(e: any): DomainEventEnvelopeV1 {
-  const companyId = e.companyId ?? 0;
+  const companyId = Number(e.companyId);
+  if (!Number.isInteger(companyId) || companyId <= 0) {
+    throw Object.assign(new Error('outbox event is missing a valid companyId (tenant)'), {
+      code: 'OUTBOX_TENANT_MISSING',
+    });
+  }
   const payload = e.payload ?? {};
 
   const aggregateId =
@@ -42,6 +47,20 @@ function buildEnvelopeFromEventRow(e: any): DomainEventEnvelopeV1 {
     source: e.source ?? 'cashflow-api',
     payload,
   };
+}
+
+async function deadLetterAndUnlock(eventId: string, reason: string) {
+  await prisma.event.update({
+    where: { eventId },
+    data: {
+      // Mark as "done" so it won't be retried forever. We keep the row for audit.
+      publishedAt: new Date(),
+      nextPublishAttemptAt: null,
+      lastPublishError: `dead-letter: ${reason}`,
+      lockId: null,
+      lockedAt: null,
+    },
+  });
 }
 
 async function claimBatch(lockId: string, now: Date) {
@@ -147,6 +166,19 @@ async function tick() {
         }
         await markPublishedAndUnlock(e.eventId);
       } catch (err) {
+        if ((err as any)?.code === 'OUTBOX_TENANT_MISSING') {
+          fastify.log.error(
+            { err, eventId: e.eventId, eventType: e.eventType },
+            'Dead-lettering outbox event due to missing tenant'
+          );
+          try {
+            await deadLetterAndUnlock(e.eventId, (err as Error).message);
+          } catch (e2) {
+            // If we can't dead-letter, fall back to retry scheduling.
+            await releaseLockAndScheduleRetry(e.eventId, e2);
+          }
+          continue;
+        }
         fastify.log.error(
           { err, eventId: e.eventId, eventType: e.eventType },
           'Failed to publish outbox event'
@@ -159,7 +191,16 @@ async function tick() {
   }
 }
 
-fastify.get('/health', async () => ({ status: 'ok' }));
+// Health check. Also triggers a best-effort tick so a scheduler ping can drive publishing
+// even if Cloud Run CPU is throttled while idle.
+fastify.get('/health', async () => {
+  try {
+    void tick();
+  } catch {
+    // best-effort
+  }
+  return { status: 'ok' };
+});
 
 const start = async () => {
   const port = Number(process.env.PORT) || 8080;
