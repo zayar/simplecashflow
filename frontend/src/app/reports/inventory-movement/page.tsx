@@ -89,14 +89,19 @@ export default function InventoryMovementReportPage() {
           <CardTitle className="text-lg">Inventory Movement</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
+          <div className="mb-3 text-xs text-muted-foreground">
+            Net Qty/Value is the movement inside the selected date range. Begin/End columns include all history before the range for context.
+          </div>
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>Item</TableHead>
                 <TableHead>Warehouse</TableHead>
+                <TableHead className="text-right">Begin Qty</TableHead>
                 <TableHead className="text-right">Qty In</TableHead>
                 <TableHead className="text-right">Qty Out</TableHead>
                 <TableHead className="text-right">Net Qty</TableHead>
+                <TableHead className="text-right">End Qty</TableHead>
                 <TableHead className="text-right">Net Value</TableHead>
               </TableRow>
             </TableHeader>
@@ -105,15 +110,17 @@ export default function InventoryMovementReportPage() {
                 <TableRow key={`${r.warehouseId}-${r.itemId}`}>
                   <TableCell className="font-medium">{r.itemName}</TableCell>
                   <TableCell className="text-muted-foreground">{r.warehouseName}</TableCell>
+                  <TableCell className="text-right tabular-nums">{Number(r.beginQty ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyIn ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyOut ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.netQty ?? 0).toLocaleString()}</TableCell>
+                  <TableCell className="text-right tabular-nums">{Number(r.endQty ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.netValue ?? 0).toLocaleString()}</TableCell>
                 </TableRow>
               ))}
               {(data?.rows ?? []).length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="py-10 text-center text-muted-foreground">
                     No movements found for this period.
                   </TableCell>
                 </TableRow>

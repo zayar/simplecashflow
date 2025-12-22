@@ -179,6 +179,17 @@ export default function ExpenseDetailPage() {
     }
   };
 
+  const deleteExpense = async () => {
+    if (!user?.companyId || !bill?.id) return;
+    if (!confirm('Delete this expense? This is only allowed for DRAFT/APPROVED expenses.')) return;
+    try {
+      await fetchApi(`/companies/${user.companyId}/expenses/${bill.id}`, { method: 'DELETE' });
+      if (typeof window !== 'undefined') window.location.assign('/expenses');
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to delete expense');
+    }
+  };
+
   if (loading) {
     return (
       <div className="space-y-6">
@@ -237,6 +248,11 @@ export default function ExpenseDetailPage() {
               Edit
             </Button>
           )}
+          {(bill.status === 'DRAFT' || bill.status === 'APPROVED') && !editMode && !bill.journalEntryId ? (
+            <Button variant="destructive" onClick={deleteExpense}>
+              Delete
+            </Button>
+          ) : null}
         {(bill.status === 'POSTED' || bill.status === 'PARTIAL') && (
           <Link href={`/expenses/${bill.id}/payment`}>
             <Button>Pay Expense</Button>

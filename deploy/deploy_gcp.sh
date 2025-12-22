@@ -57,6 +57,17 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 echo "Deploying from root: $ROOT_DIR"
 cd "$ROOT_DIR"
 
+# ---- Proxy workaround (common on corp networks / misconfigured shells) ----
+# If HTTPS_PROXY/HTTP_PROXY is set but the proxy is unreachable, gcloud will crash while uploading
+# the source archive to GCS (storage.googleapis.com). We default to bypassing proxy for Google APIs.
+# If you truly need a corporate proxy, set KEEP_HTTP_PROXY=true before running this script.
+if [[ "${KEEP_HTTP_PROXY:-}" != "true" ]]; then
+  # Preserve existing NO_PROXY and append common Google endpoints + localhost.
+  export NO_PROXY="${NO_PROXY:-},127.0.0.1,localhost,metadata.google.internal,googleapis.com,.googleapis.com,storage.googleapis.com,.storage.googleapis.com"
+  export no_proxy="${no_proxy:-},127.0.0.1,localhost,metadata.google.internal,googleapis.com,.googleapis.com,storage.googleapis.com,.storage.googleapis.com"
+  unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy || true
+fi
+
 gcloud builds submit --config deploy/cloudbuild.api.yaml .
 # Frontend is a separate Cloud Run service. Build it too so UI updates are deployed.
 gcloud builds submit --config deploy/cloudbuild.frontend.yaml .

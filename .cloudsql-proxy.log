@@ -1,0 +1,14 @@
+2025/12/22 20:00:41 Authorizing with Application Default Credentials
+2025/12/22 20:00:41 [aiaccount-1c845:asia-southeast1:cashflow-mysql] Listening on 127.0.0.1:3307
+2025/12/22 20:00:41 The proxy has started successfully and is ready for new connections!
+2025/12/22 20:00:42 [aiaccount-1c845:asia-southeast1:cashflow-mysql] Accepted connection from 127.0.0.1:54613
+2025/12/22 20:00:42 [aiaccount-1c845:asia-southeast1:cashflow-mysql] Accepted connection from 127.0.0.1:54614
+2025/12/22 20:00:43 [aiaccount-1c845:asia-southeast1:cashflow-mysql] client closed the connection
+2025/12/22 20:00:44 [aiaccount-1c845:asia-southeast1:cashflow-mysql] client closed the connection
+2025/12/22 20:00:45 [aiaccount-1c845:asia-southeast1:cashflow-mysql] Accepted connection from 127.0.0.1:54627
+2025/12/22 20:00:46 [aiaccount-1c845:asia-southeast1:cashflow-mysql] client closed the connection
+2025/12/22 20:00:46 [aiaccount-1c845:asia-southeast1:cashflow-mysql] Accepted connection from 127.0.0.1:54632
+2025/12/22 20:00:47 [aiaccount-1c845:asia-southeast1:cashflow-mysql] client closed the connection
+2025/12/22 20:03:54 Sending SIGTERM signal for proxy to shutdown.
+2025/12/22 20:03:54 SIGTERM signal received. Shutting down...
+2025/12/22 20:03:54 proxy server error: accept tcp 127.0.0.1:3307: use of closed network connection

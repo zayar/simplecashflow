@@ -58,21 +58,27 @@ enum ItemType {
 
 enum InvoiceStatus {
   DRAFT
+  APPROVED
   POSTED
   PAID
   PARTIAL
+  VOID
 }
 
 enum CreditNoteStatus {
   DRAFT
+  APPROVED
   POSTED
+  VOID
 }
 
 enum ExpenseStatus {
   DRAFT
+  APPROVED
   POSTED
   PARTIAL
   PAID
+  VOID
 }
 
 enum BankingAccountKind {
@@ -110,9 +116,11 @@ enum StockMoveDirection {
 
 enum PurchaseBillStatus {
   DRAFT
+  APPROVED
   POSTED
   PARTIAL
   PAID
+  VOID
 }
 
 model Company {
@@ -309,20 +317,37 @@ model JournalEntry {
   reversalEntry            JournalEntry? @relation("JournalEntry_Reversal")
   reversalReason           String?       @db.Text
 
+  // Soft-void metadata (does NOT modify lines; used to mark an entry as voided via reversal).
+  voidedAt       DateTime?
+  voidReason     String?   @db.Text
+  voidedByUserId Int?
+  voidedByUser   User?     @relation("User_VoidedJournalEntries", fields: [voidedByUserId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedJournalEntries", fields: [updatedByUserId], references: [id])
+
   lines JournalLine[]
 
   // Documents that created this journal entry (optional)
-  invoice                     Invoice?             @relation("Invoice_JournalEntry")
-  payment                     Payment?             @relation("Payment_JournalEntry")
-  paymentReversal             Payment?             @relation("Payment_ReversalJournalEntry")
-  expense                     Expense?             @relation("Expense_JournalEntry")
-  expensePayment              ExpensePayment?      @relation("ExpensePayment_JournalEntry")
-  expensePaymentReversal      ExpensePayment?      @relation("ExpensePayment_ReversalJournalEntry")
-  purchaseBill                PurchaseBill?
-  purchaseBillPayment         PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
-  purchaseBillPaymentReversal PurchaseBillPayment? @relation("PurchaseBillPayment_ReversalJournalEntry")
-  creditNote                  CreditNote?          @relation("CreditNote_JournalEntry")
-  periodClose                 PeriodClose?
+  invoice                       Invoice?             @relation("Invoice_JournalEntry")
+  invoiceVoidFor                Invoice?             @relation("Invoice_VoidJournalEntry")
+  invoiceLastAdjustmentFor      Invoice[]            @relation("Invoice_LastAdjustmentJournalEntry")
+  payment                       Payment?             @relation("Payment_JournalEntry")
+  paymentReversal               Payment?             @relation("Payment_ReversalJournalEntry")
+  expense                       Expense?             @relation("Expense_JournalEntry")
+  expenseVoidFor                Expense?             @relation("Expense_VoidJournalEntry")
+  expenseLastAdjustmentFor      Expense[]            @relation("Expense_LastAdjustmentJournalEntry")
+  expensePayment                ExpensePayment?      @relation("ExpensePayment_JournalEntry")
+  expensePaymentReversal        ExpensePayment?      @relation("ExpensePayment_ReversalJournalEntry")
+  purchaseBill                  PurchaseBill?
+  purchaseBillVoidFor           PurchaseBill?        @relation("PurchaseBill_VoidJournalEntry")
+  purchaseBillLastAdjustmentFor PurchaseBill[]       @relation("PurchaseBill_LastAdjustmentJournalEntry")
+  purchaseBillPayment           PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
+  purchaseBillPaymentReversal   PurchaseBillPayment? @relation("PurchaseBillPayment_ReversalJournalEntry")
+  creditNote                    CreditNote?          @relation("CreditNote_JournalEntry")
+  creditNoteVoidFor             CreditNote?          @relation("CreditNote_VoidJournalEntry")
+  creditNoteLastAdjustmentFor   CreditNote[]         @relation("CreditNote_LastAdjustmentJournalEntry")
+  periodClose                   PeriodClose?
 
   @@unique([companyId, entryNumber])
   @@index([companyId, date])
@@ -574,6 +599,21 @@ model Invoice {
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
 
+  // Void/cancel metadata (immutable ledger: void uses a reversal JE)
+  voidedAt           DateTime?
+  voidReason         String?       @db.Text
+  voidedByUserId     Int?
+  voidedByUser       User?         @relation("User_VoidedInvoices", fields: [voidedByUserId], references: [id])
+  voidJournalEntryId Int?          @unique
+  voidJournalEntry   JournalEntry? @relation("Invoice_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+
+  // Posted edit support: store the latest adjustment JE id (audit trail still lives in AuditLog).
+  lastAdjustmentJournalEntryId Int?
+  lastAdjustmentJournalEntry   JournalEntry? @relation("Invoice_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedInvoices", fields: [updatedByUserId], references: [id])
+
   lines       InvoiceLine[]
   payments    Payment[]
   creditNotes CreditNote[]
@@ -617,6 +657,19 @@ model CreditNote {
 
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("CreditNote_JournalEntry", fields: [journalEntryId], references: [id])
+
+  voidedAt           DateTime?
+  voidReason         String?       @db.Text
+  voidedByUserId     Int?
+  voidedByUser       User?         @relation("User_VoidedCreditNotes", fields: [voidedByUserId], references: [id])
+  voidJournalEntryId Int?          @unique
+  voidJournalEntry   JournalEntry? @relation("CreditNote_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+
+  lastAdjustmentJournalEntryId Int?
+  lastAdjustmentJournalEntry   JournalEntry? @relation("CreditNote_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedCreditNotes", fields: [updatedByUserId], references: [id])
 
   lines CreditNoteLine[]
 
@@ -768,6 +821,19 @@ model PurchaseBill {
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation(fields: [journalEntryId], references: [id])
 
+  voidedAt           DateTime?
+  voidReason         String?       @db.Text
+  voidedByUserId     Int?
+  voidedByUser       User?         @relation("User_VoidedPurchaseBills", fields: [voidedByUserId], references: [id])
+  voidJournalEntryId Int?          @unique
+  voidJournalEntry   JournalEntry? @relation("PurchaseBill_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+
+  lastAdjustmentJournalEntryId Int?
+  lastAdjustmentJournalEntry   JournalEntry? @relation("PurchaseBill_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedPurchaseBills", fields: [updatedByUserId], references: [id])
+
   lines    PurchaseBillLine[]
   payments PurchaseBillPayment[]
 
@@ -870,6 +936,19 @@ model Expense {
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Expense_JournalEntry", fields: [journalEntryId], references: [id])
 
+  voidedAt           DateTime?
+  voidReason         String?       @db.Text
+  voidedByUserId     Int?
+  voidedByUser       User?         @relation("User_VoidedExpenses", fields: [voidedByUserId], references: [id])
+  voidJournalEntryId Int?          @unique
+  voidJournalEntry   JournalEntry? @relation("Expense_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+
+  lastAdjustmentJournalEntryId Int?
+  lastAdjustmentJournalEntry   JournalEntry? @relation("Expense_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedExpenses", fields: [updatedByUserId], references: [id])
+
   payments ExpensePayment[]
 
   createdAt DateTime @default(now())
@@ -923,7 +1002,18 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  journalEntriesCreated        JournalEntry[]
+  journalEntriesCreated JournalEntry[]
+  voidedJournalEntries  JournalEntry[] @relation("User_VoidedJournalEntries")
+  updatedJournalEntries JournalEntry[] @relation("User_UpdatedJournalEntries")
+
+  voidedInvoices               Invoice[]             @relation("User_VoidedInvoices")
+  updatedInvoices              Invoice[]             @relation("User_UpdatedInvoices")
+  voidedCreditNotes            CreditNote[]          @relation("User_VoidedCreditNotes")
+  updatedCreditNotes           CreditNote[]          @relation("User_UpdatedCreditNotes")
+  voidedExpenses               Expense[]             @relation("User_VoidedExpenses")
+  updatedExpenses              Expense[]             @relation("User_UpdatedExpenses")
+  voidedPurchaseBills          PurchaseBill[]        @relation("User_VoidedPurchaseBills")
+  updatedPurchaseBills         PurchaseBill[]        @relation("User_UpdatedPurchaseBills")
   reversedPayments             Payment[]             @relation("User_ReversedPayments")
   reversedExpensePayments      ExpensePayment[]      @relation("User_ReversedExpensePayments")
   reversedPurchaseBillPayments PurchaseBillPayment[]

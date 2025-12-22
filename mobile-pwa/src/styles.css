@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Small mobile defaults */
+html, body {
+  height: 100%;
+}
+
+/* iOS safe-area support */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+

@@ -16,6 +16,13 @@ import { SelectNative } from '@/components/ui/select-native';
 import { Textarea } from '@/components/ui/textarea';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 type TaxOption = { id: number; name: string; ratePercent: number; type: 'rate' | 'group' };
 type Line = {
@@ -331,18 +338,20 @@ export default function EditCreditNotePage() {
                             />
                           </TableCell>
                           <TableCell className="align-top">
-                            <div className="relative">
-                              <Button
-                                type="button"
-                                variant="outline"
-                                className="w-full justify-between px-2"
-                                onClick={() => setOpenTaxIdx(openTaxIdx === idx ? null : idx)}
-                              >
+                        <DropdownMenu
+                          open={openTaxIdx === idx}
+                          onOpenChange={(open) => {
+                            setOpenTaxIdx(open ? idx : null);
+                            if (!open) setTaxSearchTerm('');
+                          }}
+                        >
+                          <DropdownMenuTrigger asChild>
+                            <Button type="button" variant="outline" className="w-full justify-between px-2">
                                 <span className="truncate text-xs">{l.taxLabel || 'Tax'}</span>
                                 <ChevronDown className="h-4 w-4" />
                               </Button>
-                              {openTaxIdx === idx ? (
-                                <div className="absolute right-0 z-50 mt-1 w-[280px] rounded-md border bg-background shadow">
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-[280px] p-0">
                                   <div className="p-2 border-b">
                                     <div className="relative">
                                       <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -358,28 +367,27 @@ export default function EditCreditNotePage() {
                                     {taxOptions
                                       .filter((t) => t.name.toLowerCase().includes(taxSearchTerm.toLowerCase()))
                                       .map((t) => (
-                                        <button
+                                  <DropdownMenuItem
                                           key={`${t.type}-${t.id}`}
-                                          type="button"
-                                          className="w-full rounded px-3 py-2 text-left text-sm hover:bg-muted"
-                                          onClick={() => {
+                                    onSelect={(e) => {
+                                      e.preventDefault();
                                             updateLine(idx, { taxRate: t.ratePercent / 100, taxLabel: t.name });
                                             setOpenTaxIdx(null);
                                             setTaxSearchTerm('');
                                           }}
                                         >
                                           {t.name}
-                                        </button>
+                                  </DropdownMenuItem>
                                       ))}
-                                    <div className="mt-2 border-t pt-2">
-                                      <Link href="/taxes" className="text-sm text-primary hover:underline">
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem asChild>
+                                <Link href="/taxes" className="text-sm text-primary">
                                         + New Tax
                                       </Link>
-                                    </div>
-                                  </div>
-                                </div>
-                              ) : null}
+                              </DropdownMenuItem>
                             </div>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                           </TableCell>
                           <TableCell className="align-top">
                             <Input disabled className="text-right" value="0.00" />

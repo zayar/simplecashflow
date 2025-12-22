@@ -29,6 +29,7 @@ export default function OpeningBalancePage() {
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [lines, setLines] = useState<Line[]>([{ itemId: '', quantity: '', unitCost: '' }]);
   const [loading, setLoading] = useState(false);
+  const [lastResult, setLastResult] = useState<any>(null);
 
   const lockedItemId = (searchParams?.get('itemId') ?? '').trim();
   const isSingleItemMode = Boolean(lockedItemId);
@@ -78,6 +79,7 @@ export default function OpeningBalancePage() {
   async function submit() {
     if (!user?.companyId) return;
     setLoading(true);
+    setLastResult(null);
     try {
       const payloadLines = lines
         .filter((l) => l.itemId && l.quantity && l.unitCost)
@@ -93,7 +95,7 @@ export default function OpeningBalancePage() {
         return;
       }
 
-      await fetchApi(`/companies/${user.companyId}/inventory/opening-balance`, {
+      const res = await fetchApi(`/companies/${user.companyId}/inventory/opening-balance`, {
         method: 'POST',
         body: JSON.stringify({
           date,
@@ -101,7 +103,8 @@ export default function OpeningBalancePage() {
           lines: payloadLines,
         }),
       });
-      alert('Opening stock posted');
+      setLastResult(res);
+      alert('Opening stock posted. See the confirmation card below for applied unit costs.');
     } catch (err) {
       console.error(err);
       alert(String(err));
@@ -157,6 +160,51 @@ export default function OpeningBalancePage() {
           </div>
         </CardContent>
       </Card>
+
+      {lastResult ? (
+        <Card className="shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-lg">Posted result (what the API actually applied)</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            <div>
+              <span className="text-muted-foreground">Journal Entry:</span>{' '}
+              <span className="font-medium">JE #{lastResult.journalEntryId}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Total value posted:</span>{' '}
+              <span className="font-medium tabular-nums">{Number(lastResult.totalValue ?? 0).toLocaleString()}</span>
+            </div>
+            <div className="rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Item</TableHead>
+                    <TableHead className="text-right w-[120px]">Qty</TableHead>
+                    <TableHead className="text-right w-[160px]">Unit cost applied</TableHead>
+                    <TableHead className="text-right w-[180px]">Line total</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(lastResult.lines ?? []).map((r: any, idx: number) => (
+                    <TableRow key={`${r.stockMoveId ?? idx}`}>
+                      <TableCell className="text-muted-foreground">
+                        #{r.itemId} (StockMove #{r.stockMoveId})
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">{Number(r.quantity ?? 0).toLocaleString()}</TableCell>
+                      <TableCell className="text-right tabular-nums">{Number(r.unitCostApplied ?? 0).toLocaleString()}</TableCell>
+                      <TableCell className="text-right tabular-nums">{Number(r.totalCostApplied ?? 0).toLocaleString()}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              If you typed 3000 but this shows 2999, the browser is sending 2999 in the request body (usually due to the input value).
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Card className="shadow-sm">
         <CardHeader className="flex flex-row items-center justify-between space-y-0">

@@ -8,6 +8,18 @@ function addDays(d, days) {
     x.setHours(0, 0, 0, 0);
     return x;
 }
+function startOfMonth(d) {
+    const x = new Date(d);
+    x.setDate(1);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+function endOfMonth(d) {
+    const x = new Date(d);
+    x.setMonth(x.getMonth() + 1, 0);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
 function fmtYmd(d) {
     return d.toISOString().slice(0, 10);
 }
@@ -95,6 +107,42 @@ export async function dashboardRoutes(fastify) {
             const net = new Prisma.Decimal(d._sum.debitTotal ?? 0).sub(new Prisma.Decimal(d._sum.creditTotal ?? 0)).toDecimalPlaces(2);
             return { date: fmtYmd(d.date), net: net.toString() };
         });
+        async function movementForAccounts(accountIds, from, to, normalBalance) {
+            if (accountIds.length === 0)
+                return new Prisma.Decimal(0);
+            const sums = await prisma.accountBalance.aggregate({
+                where: { companyId, accountId: { in: accountIds }, date: { gte: from, lte: to } },
+                _sum: { debitTotal: true, creditTotal: true },
+            });
+            const debit = new Prisma.Decimal(sums._sum.debitTotal ?? 0);
+            const credit = new Prisma.Decimal(sums._sum.creditTotal ?? 0);
+            return (normalBalance === 'DEBIT' ? debit.sub(credit) : credit.sub(debit)).toDecimalPlaces(2);
+        }
+        async function balanceAsOfForAccounts(accountIds, asOf, normalBalance) {
+            if (accountIds.length === 0)
+                return new Prisma.Decimal(0);
+            const sums = await prisma.accountBalance.aggregate({
+                where: { companyId, accountId: { in: accountIds }, date: { lte: asOf } },
+                _sum: { debitTotal: true, creditTotal: true },
+            });
+            const debit = new Prisma.Decimal(sums._sum.debitTotal ?? 0);
+            const credit = new Prisma.Decimal(sums._sum.creditTotal ?? 0);
+            return (normalBalance === 'DEBIT' ? debit.sub(credit) : credit.sub(debit)).toDecimalPlaces(2);
+        }
+        // --- KPI: Income / Expense / Net Profit (accrual, period movement) ---
+        const [incomeAccIds, expenseAccIds] = await Promise.all([
+            prisma.account.findMany({ where: { companyId, type: 'INCOME' }, select: { id: true } }),
+            prisma.account.findMany({ where: { companyId, type: 'EXPENSE' }, select: { id: true } }),
+        ]);
+        const incomeIds = incomeAccIds.map((a) => a.id);
+        const expenseIds = expenseAccIds.map((a) => a.id);
+        const [incomeTotal, expenseTotal] = await Promise.all([
+            movementForAccounts(incomeIds, fromDate, toDate, 'CREDIT'),
+            movementForAccounts(expenseIds, fromDate, toDate, 'DEBIT'),
+        ]);
+        const netProfit = incomeTotal.sub(expenseTotal).toDecimalPlaces(2);
+        // --- KPI: Cash balance as-of toDate ---
+        const cashBalance = await balanceAsOfForAccounts(cashAccountIds, toDate, 'DEBIT');
         // Bucket into 7-day chunks like "1-7", "8-14", ...
         const buckets = [];
         let cursor = new Date(fromDate);
@@ -142,6 +190,52 @@ export async function dashboardRoutes(fastify) {
         })
             .filter(Boolean);
         movements.sort((a, b) => b.abs.comparedTo(a.abs));
+        // --- Trend: Income vs Expense (last 12 months ending at toDate) ---
+        const trendMonths = [];
+        const anchor = startOfMonth(toDate);
+        for (let i = 11; i >= 0; i--) {
+            const m = new Date(anchor);
+            m.setMonth(m.getMonth() - i);
+            const mFrom = startOfMonth(m);
+            const mTo = endOfMonth(m);
+            const [inc, exp] = await Promise.all([
+                movementForAccounts(incomeIds, mFrom, mTo, 'CREDIT'),
+                movementForAccounts(expenseIds, mFrom, mTo, 'DEBIT'),
+            ]);
+            const label = mFrom.toLocaleString('en-US', { month: 'short' });
+            trendMonths.push({ label, from: fmtYmd(mFrom), to: fmtYmd(mTo), income: inc.toString(), expense: exp.toString() });
+        }
+        // --- Expense breakdown (top 5 expense accounts in period) ---
+        const expenseAgg = expenseIds.length
+            ? await prisma.accountBalance.groupBy({
+                by: ['accountId'],
+                where: { companyId, accountId: { in: expenseIds }, date: { gte: fromDate, lte: toDate } },
+                _sum: { debitTotal: true, creditTotal: true },
+            })
+            : [];
+        const expenseAggIds = expenseAgg.map((e) => e.accountId);
+        const expenseAccounts = expenseAggIds.length
+            ? await prisma.account.findMany({
+                where: { companyId, id: { in: expenseAggIds } },
+                select: { id: true, code: true, name: true },
+            })
+            : [];
+        const expAccById = new Map(expenseAccounts.map((a) => [a.id, a]));
+        const expRows = expenseAgg
+            .map((e) => {
+            const acc = expAccById.get(e.accountId);
+            if (!acc)
+                return null;
+            const debit = new Prisma.Decimal(e._sum.debitTotal ?? 0);
+            const credit = new Prisma.Decimal(e._sum.creditTotal ?? 0);
+            const amount = debit.sub(credit).toDecimalPlaces(2); // EXPENSE normal debit
+            return { accountId: acc.id, code: acc.code, name: acc.name, amount };
+        })
+            .filter(Boolean);
+        expRows.sort((a, b) => b.amount.comparedTo(a.amount));
+        const top = expRows.slice(0, 5);
+        const others = expRows.slice(5);
+        const othersAmount = others.reduce((sum, r) => sum.add(r.amount), new Prisma.Decimal(0)).toDecimalPlaces(2);
         return {
             companyId,
             from: fmtYmd(fromDate),
@@ -154,10 +248,21 @@ export async function dashboardRoutes(fastify) {
             kpis: {
                 receivable: arBalance.toString(),
                 payable: apBalance.toString(),
+                income: incomeTotal.toString(),
+                expense: expenseTotal.toString(),
+                netProfit: netProfit.toString(),
+                cashBalance: cashBalance.toString(),
             },
             cashflow: {
                 series: cashSeries,
                 buckets,
+            },
+            trend: {
+                incomeVsExpense: trendMonths,
+            },
+            expenses: {
+                top: top.map((r) => ({ accountId: r.accountId, code: r.code, name: r.name, amount: r.amount.toString() })),
+                othersAmount: othersAmount.toString(),
             },
             coa: {
                 topMovements: movements.slice(0, 6).map((m) => ({

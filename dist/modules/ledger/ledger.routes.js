@@ -420,6 +420,321 @@ export async function ledgerRoutes(fastify) {
             throw err;
         }
     });
+    // --- Void a posted journal entry (alias of reverse + void metadata on original) ---
+    // POST /companies/:companyId/journal-entries/:journalEntryId/void
+    // Body: { reason, date? }
+    fastify.post('/companies/:companyId/journal-entries/:journalEntryId/void', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const journalEntryId = Number(request.params?.journalEntryId);
+        if (!companyId || Number.isNaN(journalEntryId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or journalEntryId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        const reversalDate = parseDateInput(body.date) ?? new Date();
+        if (body.date && isNaN(reversalDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid date (must be ISO string)' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = new Date().toISOString();
+        const lockKey = `lock:journal-entry:void:${companyId}:${journalEntryId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const original = await tx.journalEntry.findFirst({
+                        where: { id: journalEntryId, companyId },
+                        include: { lines: true },
+                    });
+                    if (!original)
+                        throw Object.assign(new Error('journal entry not found'), { statusCode: 404 });
+                    if (original.reversalOfJournalEntryId)
+                        throw Object.assign(new Error('cannot void a reversal entry'), { statusCode: 400 });
+                    const existingReversal = await tx.journalEntry.findFirst({
+                        where: { companyId, reversalOfJournalEntryId: original.id },
+                        select: { id: true },
+                    });
+                    if (existingReversal) {
+                        throw Object.assign(new Error('journal entry already reversed'), { statusCode: 400 });
+                    }
+                    const reversalLines = original.lines.map((l) => ({
+                        accountId: l.accountId,
+                        debit: new Prisma.Decimal(l.credit).toDecimalPlaces(2),
+                        credit: new Prisma.Decimal(l.debit).toDecimalPlaces(2),
+                    }));
+                    const reversalEntry = await postJournalEntry(tx, {
+                        companyId,
+                        date: reversalDate,
+                        description: `VOID REVERSAL of JE ${original.id}: ${original.description}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        reversalOfJournalEntryId: original.id,
+                        reversalReason: String(body.reason).trim(),
+                        lines: reversalLines,
+                    });
+                    // Mark original as voided (metadata only; lines remain immutable)
+                    const voidedAt = new Date();
+                    await tx.journalEntry.updateMany({
+                        where: { id: original.id, companyId },
+                        data: {
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'journal_entry.void',
+                        entityType: 'JournalEntry',
+                        entityId: original.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            reason: String(body.reason).trim(),
+                            reversalDate,
+                            voidedAt,
+                            originalJournalEntryId: original.id,
+                            voidReversalJournalEntryId: reversalEntry.id,
+                        },
+                    });
+                    // Outbox events
+                    const createdEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: createdEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(original.id),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversalEntry.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: reversalEntry.id, companyId, reversalOfJournalEntryId: original.id },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: createdEventId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(original.id),
+                            type: 'JournalEntryReversed',
+                            payload: {
+                                originalJournalEntryId: original.id,
+                                reversalJournalEntryId: reversalEntry.id,
+                                companyId,
+                                reason: String(body.reason).trim(),
+                            },
+                        },
+                    });
+                    return { originalJournalEntryId: original.id, voidReversalJournalEntryId: reversalEntry.id };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { originalJournalEntryId: result.originalJournalEntryId, voidReversalJournalEntryId: result.voidReversalJournalEntryId };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // --- Adjust a posted journal entry (immutable ledger): reverse original and post corrected entry ---
+    // POST /companies/:companyId/journal-entries/:journalEntryId/adjust
+    // Body: { reason, date?, description?, lines:[{accountId,debit,credit}] }
+    fastify.post('/companies/:companyId/journal-entries/:journalEntryId/adjust', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const journalEntryId = Number(request.params?.journalEntryId);
+        if (!companyId || Number.isNaN(journalEntryId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or journalEntryId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        if (!body.lines?.length) {
+            reply.status(400);
+            return { error: 'lines is required' };
+        }
+        const newDate = parseDateInput(body.date) ?? new Date();
+        if (body.date && isNaN(newDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid date (must be ISO string)' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = new Date().toISOString();
+        const lockKey = `lock:journal-entry:adjust:${companyId}:${journalEntryId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    const original = await tx.journalEntry.findFirst({
+                        where: { id: journalEntryId, companyId },
+                        include: { lines: true },
+                    });
+                    if (!original)
+                        throw Object.assign(new Error('journal entry not found'), { statusCode: 404 });
+                    if (original.reversalOfJournalEntryId)
+                        throw Object.assign(new Error('cannot adjust a reversal entry'), { statusCode: 400 });
+                    const existingReversal = await tx.journalEntry.findFirst({
+                        where: { companyId, reversalOfJournalEntryId: original.id },
+                        select: { id: true },
+                    });
+                    if (existingReversal)
+                        throw Object.assign(new Error('journal entry already reversed (cannot adjust)'), { statusCode: 400 });
+                    const reversalLines = original.lines.map((l) => ({
+                        accountId: l.accountId,
+                        debit: new Prisma.Decimal(l.credit).toDecimalPlaces(2),
+                        credit: new Prisma.Decimal(l.debit).toDecimalPlaces(2),
+                    }));
+                    const reversalEntry = await postJournalEntry(tx, {
+                        companyId,
+                        date: newDate,
+                        description: `REVERSAL (ADJUST) of JE ${original.id}: ${original.description}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        reversalOfJournalEntryId: original.id,
+                        reversalReason: String(body.reason).trim(),
+                        lines: reversalLines,
+                    });
+                    const correctedEntry = await postJournalEntry(tx, {
+                        companyId,
+                        date: newDate,
+                        description: body.description ?? `CORRECTED for JE ${original.id}: ${String(body.reason).trim()}`,
+                        createdByUserId: request.user?.userId ?? null,
+                        lines: (body.lines ?? []).map((l) => ({
+                            accountId: Number(l.accountId),
+                            debit: new Prisma.Decimal((Number(l.debit ?? 0) || 0).toFixed(2)),
+                            credit: new Prisma.Decimal((Number(l.credit ?? 0) || 0).toFixed(2)),
+                        })),
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'journal_entry.adjust',
+                        entityType: 'JournalEntry',
+                        entityId: correctedEntry.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            reason: String(body.reason).trim(),
+                            date: newDate,
+                            originalJournalEntryId: original.id,
+                            reversalJournalEntryId: reversalEntry.id,
+                            correctedJournalEntryId: correctedEntry.id,
+                            linesCount: (body.lines ?? []).length,
+                        },
+                    });
+                    // Outbox events: reversal created + reversed semantic, and corrected entry created
+                    const reversalCreatedEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: reversalCreatedEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(original.id),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversalEntry.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: reversalEntry.id, companyId, reversalOfJournalEntryId: original.id },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: reversalCreatedEventId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(original.id),
+                            type: 'JournalEntryReversed',
+                            payload: {
+                                originalJournalEntryId: original.id,
+                                reversalJournalEntryId: reversalEntry.id,
+                                companyId,
+                                reason: String(body.reason).trim(),
+                            },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(reversalEntry.id),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(correctedEntry.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: correctedEntry.id, companyId, source: 'JournalEntryAdjustment', originalJournalEntryId: original.id },
+                        },
+                    });
+                    return {
+                        originalJournalEntryId: original.id,
+                        reversalJournalEntryId: reversalEntry.id,
+                        correctedJournalEntryId: correctedEntry.id,
+                    };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                originalJournalEntryId: result.originalJournalEntryId,
+                reversalJournalEntryId: result.reversalJournalEntryId,
+                correctedJournalEntryId: result.correctedJournalEntryId,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
     // --- Period Close (Month/Year End Close) ---
     // POST /companies/:companyId/period-close?from=YYYY-MM-DD&to=YYYY-MM-DD
     //

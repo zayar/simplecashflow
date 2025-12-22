@@ -12,7 +12,8 @@
     "start:worker": "node dist/worker.js",
     "start:publisher": "node dist/publisher.js",
     "db:truncate": "CONFIRM=YES tsx scripts/truncate_db.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "seed:fixed-assets": "tsx scripts/seed_fixed_asset_defaults.ts",
+    "test": "node --test --import tsx test/reversal.service.test.ts"
   },
   "keywords": [],
   "author": "",

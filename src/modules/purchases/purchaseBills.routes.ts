@@ -14,6 +14,7 @@ import { toMoneyDecimal } from '../../utils/money.js';
 import { nextPurchaseBillNumber } from '../sequence/sequence.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
+import { createReversalJournalEntry, computeNetByAccount, diffNets, buildAdjustmentLinesFromNets } from '../ledger/reversal.service.js';
 
 function generatePurchaseBillNumber(): string {
   // legacy fallback (should not be used in new code paths)
@@ -404,8 +405,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       if (!existing) {
         throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
       }
-      if (existing.status !== 'DRAFT' || existing.journalEntryId) {
-        throw Object.assign(new Error('only DRAFT purchase bills can be edited'), { statusCode: 400 });
+      if ((existing.status !== 'DRAFT' && existing.status !== 'APPROVED') || existing.journalEntryId) {
+        throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be edited'), { statusCode: 400 });
       }
 
       return await tx.purchaseBill.update({
@@ -431,6 +432,137 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
     });
 
     return updated;
+  });
+
+  // Delete purchase bill (DRAFT/APPROVED only)
+  fastify.delete('/companies/:companyId/purchase-bills/:purchaseBillId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const purchaseBillId = Number((request.params as any)?.purchaseBillId);
+    if (!companyId || Number.isNaN(purchaseBillId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or purchaseBillId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const correlationId = randomUUID();
+    const occurredAt = isoNow();
+    const lockKey = `lock:purchase-bill:delete:${companyId}:${purchaseBillId}`;
+
+    try {
+      const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () =>
+        runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+          const txResult = await prisma.$transaction(async (tx: any) => {
+            await tx.$queryRaw`
+              SELECT id FROM PurchaseBill
+              WHERE id = ${purchaseBillId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+
+            const bill = await tx.purchaseBill.findFirst({
+              where: { id: purchaseBillId, companyId },
+              select: { id: true, status: true, billNumber: true, journalEntryId: true },
+            });
+            if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+            if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
+              throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be deleted'), { statusCode: 400 });
+            }
+            if (bill.journalEntryId) {
+              throw Object.assign(new Error('cannot delete a purchase bill that already has a journal entry'), { statusCode: 400 });
+            }
+
+            const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id } });
+            if (payCount > 0) throw Object.assign(new Error('cannot delete a purchase bill that has payments'), { statusCode: 400 });
+
+            await tx.purchaseBillLine.deleteMany({ where: { companyId, purchaseBillId: bill.id } });
+            await tx.purchaseBill.delete({ where: { id: bill.id } });
+
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'purchase_bill.delete_unposted',
+              entityType: 'PurchaseBill',
+              entityId: bill.id,
+              idempotencyKey,
+              correlationId,
+              metadata: { billNumber: bill.billNumber, status: bill.status, occurredAt },
+            });
+
+            return { purchaseBillId: bill.id, deleted: true };
+          });
+          return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+        }, redis)
+      );
+
+      return { purchaseBillId: (result as any).purchaseBillId, deleted: true };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
+  });
+
+  // Approve purchase bill (DRAFT -> APPROVED)
+  fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/approve', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const purchaseBillId = Number((request.params as any)?.purchaseBillId);
+    if (!companyId || Number.isNaN(purchaseBillId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or purchaseBillId' };
+    }
+    const correlationId = randomUUID();
+    const occurredAt = isoNow();
+
+    try {
+      const updated = await prisma.$transaction(async (tx: any) => {
+        await tx.$queryRaw`
+          SELECT id FROM PurchaseBill
+          WHERE id = ${purchaseBillId} AND companyId = ${companyId}
+          FOR UPDATE
+        `;
+        const bill = await tx.purchaseBill.findFirst({
+          where: { id: purchaseBillId, companyId },
+          select: { id: true, status: true, journalEntryId: true, billNumber: true },
+        });
+        if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+        if (bill.status !== 'DRAFT') throw Object.assign(new Error('only DRAFT purchase bills can be approved'), { statusCode: 400 });
+        if (bill.journalEntryId) throw Object.assign(new Error('cannot approve a purchase bill that already has a journal entry'), { statusCode: 400 });
+
+        const upd = await tx.purchaseBill.update({
+          where: { id: bill.id },
+          data: { status: 'APPROVED', updatedByUserId: (request as any).user?.userId ?? null } as any,
+          select: { id: true, status: true, billNumber: true },
+        });
+
+        await writeAuditLog(tx as any, {
+          companyId,
+          userId: (request as any).user?.userId ?? null,
+          action: 'purchase_bill.approve',
+          entityType: 'PurchaseBill',
+          entityId: bill.id,
+          idempotencyKey: (request.headers as any)?.['idempotency-key'] ?? null,
+          correlationId,
+          metadata: { billNumber: bill.billNumber, fromStatus: 'DRAFT', toStatus: 'APPROVED', occurredAt },
+        });
+
+        return upd;
+      });
+      return updated;
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
   });
 
   // Post purchase bill: DRAFT -> POSTED (creates stock moves + JE Dr Inventory / Cr AP)
@@ -484,8 +616,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               include: { company: true, vendor: true, warehouse: true, lines: { include: { item: true } } },
             });
             if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
-            if (bill.status !== 'DRAFT') {
-              throw Object.assign(new Error('only DRAFT purchase bills can be posted'), { statusCode: 400 });
+            if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
+              throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be posted'), { statusCode: 400 });
             }
 
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
@@ -655,6 +787,528 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       journalEntryId: (result as any).journalEntryId,
       total: (result as any).total,
     };
+  });
+
+  // Adjust posted purchase bill (immutable ledger): only supported for non-inventory bills (no stock moves).
+  // POST /companies/:companyId/purchase-bills/:purchaseBillId/adjust
+  fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/adjust', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const purchaseBillId = Number((request.params as any)?.purchaseBillId);
+    if (!companyId || Number.isNaN(purchaseBillId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or purchaseBillId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const body = (request.body ?? {}) as {
+      reason?: string;
+      adjustmentDate?: string;
+      lines?: { itemId?: number; quantity?: number; unitCost?: number; description?: string; accountId?: number }[];
+    };
+    if (!body.reason || !String(body.reason).trim()) {
+      reply.status(400);
+      return { error: 'reason is required' };
+    }
+    if (!body.lines?.length) {
+      reply.status(400);
+      return { error: 'lines is required' };
+    }
+    const adjustmentDate = parseDateInput(body.adjustmentDate) ?? new Date();
+    if (body.adjustmentDate && isNaN(adjustmentDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid adjustmentDate' };
+    }
+
+    const correlationId = randomUUID();
+    const occurredAt = isoNow();
+    const lockKey = `lock:purchase-bill:adjust:${companyId}:${purchaseBillId}`;
+
+    try {
+      const preMoves = await prisma.stockMove.findMany({
+        where: { companyId, referenceType: 'PurchaseBill', referenceId: String(purchaseBillId) },
+        select: { id: true },
+      });
+      if ((preMoves ?? []).length > 0) {
+        reply.status(400);
+        return { error: 'cannot adjust an inventory-affecting purchase bill (void + recreate)' };
+      }
+
+      const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () =>
+        runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+          const txResult = await prisma.$transaction(async (tx: any) => {
+            await tx.$queryRaw`
+              SELECT id FROM PurchaseBill
+              WHERE id = ${purchaseBillId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+
+            const bill = await tx.purchaseBill.findFirst({
+              where: { id: purchaseBillId, companyId },
+              include: { company: true, lines: { include: { item: true } }, journalEntry: { include: { lines: true } } },
+            });
+            if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+            if (bill.status !== 'POSTED') throw Object.assign(new Error('only POSTED purchase bills can be adjusted'), { statusCode: 400 });
+            if (!bill.journalEntryId || !(bill as any).journalEntry) {
+              throw Object.assign(new Error('purchase bill is POSTED but missing journal entry link'), { statusCode: 500 });
+            }
+
+            const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
+            if (payCount > 0) throw Object.assign(new Error('cannot adjust a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
+
+            const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
+            const apId = (bill.company as any).accountsPayableAccountId;
+            if (!apId) throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
+
+            // Compute new lines + total (non-inventory only)
+            let total = new Prisma.Decimal(0);
+            const computedLines: any[] = [];
+            const debitByAccount = new Map<number, Prisma.Decimal>();
+
+            for (const [idx, l] of (body.lines ?? []).entries()) {
+              const itemId = Number(l.itemId);
+              const qty = Number(l.quantity ?? 0);
+              const unitCost = Number(l.unitCost ?? 0);
+              if (!itemId || Number.isNaN(itemId)) throw Object.assign(new Error(`lines[${idx}].itemId is required`), { statusCode: 400 });
+              if (!qty || qty <= 0) throw Object.assign(new Error(`lines[${idx}].quantity must be > 0`), { statusCode: 400 });
+              if (!unitCost || unitCost <= 0) throw Object.assign(new Error(`lines[${idx}].unitCost must be > 0`), { statusCode: 400 });
+
+              const item = await tx.item.findFirst({
+                where: { id: itemId, companyId },
+                select: { id: true, type: true, trackInventory: true, expenseAccountId: true, name: true },
+              });
+              if (!item) throw Object.assign(new Error(`lines[${idx}].itemId not found in this company`), { statusCode: 400 });
+              if (item.type === 'GOODS' && !!item.trackInventory) {
+                throw Object.assign(new Error('cannot adjust an inventory-tracked purchase bill (void + recreate)'), { statusCode: 400 });
+              }
+
+              const accountId = Number(l.accountId ?? item.expenseAccountId ?? 0) || null;
+              if (!accountId) throw Object.assign(new Error(`lines[${idx}].accountId is required for non-inventory items`), { statusCode: 400 });
+              const acc = await tx.account.findFirst({ where: { id: accountId, companyId, type: AccountType.EXPENSE } });
+              if (!acc) throw Object.assign(new Error(`lines[${idx}].accountId must be an EXPENSE account in this company`), { statusCode: 400 });
+
+              const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
+              const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
+              const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
+              total = total.add(lineTotal);
+              computedLines.push({
+                companyId,
+                warehouseId: bill.warehouseId,
+                itemId,
+                accountId,
+                description: l.description ?? null,
+                quantity: qtyDec,
+                unitCost: unitDec,
+                lineTotal,
+              });
+              const prev = debitByAccount.get(accountId) ?? new Prisma.Decimal(0);
+              debitByAccount.set(accountId, prev.add(lineTotal).toDecimalPlaces(2));
+            }
+            total = total.toDecimalPlaces(2);
+
+            const desiredPostingLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
+              ...Array.from(debitByAccount.entries()).map(([accountId, amt]) => ({
+                accountId,
+                debit: amt.toDecimalPlaces(2),
+                credit: new Prisma.Decimal(0),
+              })),
+              { accountId: apId, debit: new Prisma.Decimal(0), credit: total },
+            ];
+
+            const originalNet = computeNetByAccount(((bill as any).journalEntry.lines ?? []).map((l: any) => ({
+              accountId: l.accountId,
+              debit: l.debit,
+              credit: l.credit,
+            })));
+            const desiredNet = computeNetByAccount(desiredPostingLines);
+            const deltaNet = diffNets(originalNet, desiredNet);
+            const adjustmentLines = buildAdjustmentLinesFromNets(deltaNet);
+
+            const priorAdjId = Number((bill as any).lastAdjustmentJournalEntryId ?? 0) || null;
+            let reversedPriorAdjustmentJournalEntryId: number | null = null;
+            if (priorAdjId) {
+              const { reversal } = await createReversalJournalEntry(tx, {
+                companyId,
+                originalJournalEntryId: priorAdjId,
+                reversalDate: adjustmentDate,
+                reason: `superseded by purchase bill adjustment: ${String(body.reason).trim()}`,
+                createdByUserId: (request as any).user?.userId ?? null,
+              });
+              reversedPriorAdjustmentJournalEntryId = reversal.id;
+              const createdEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: createdEventId,
+                  eventType: 'journal.entry.created',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  causationId: String(priorAdjId),
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(reversal.id),
+                  type: 'JournalEntryCreated',
+                  payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                },
+              });
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: randomUUID(),
+                  eventType: 'journal.entry.reversed',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  causationId: createdEventId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(priorAdjId),
+                  type: 'JournalEntryReversed',
+                  payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'superseded' },
+                },
+              });
+            }
+
+            let adjustmentJournalEntryId: number | null = null;
+            if (adjustmentLines.length > 0) {
+              if (adjustmentLines.length < 2) throw Object.assign(new Error('adjustment resulted in an invalid journal entry (needs >=2 lines)'), { statusCode: 400 });
+              const je = await postJournalEntry(tx, {
+                companyId,
+                date: adjustmentDate,
+                description: `ADJUSTMENT for Purchase Bill ${(bill as any).billNumber}: ${String(body.reason).trim()}`,
+                createdByUserId: (request as any).user?.userId ?? null,
+                skipAccountValidation: true,
+                lines: adjustmentLines,
+              });
+              adjustmentJournalEntryId = je.id;
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: randomUUID(),
+                  eventType: 'journal.entry.created',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(je.id),
+                  type: 'JournalEntryCreated',
+                  payload: { journalEntryId: je.id, companyId, source: 'PurchaseBillAdjustment', purchaseBillId: bill.id },
+                },
+              });
+            }
+
+            await tx.purchaseBill.update({
+              where: { id: bill.id },
+              data: {
+                total,
+                lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
+                updatedByUserId: (request as any).user?.userId ?? null,
+                lines: { deleteMany: {}, create: computedLines },
+              } as any,
+            });
+
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'purchase_bill.adjust_posted',
+              entityType: 'PurchaseBill',
+              entityId: bill.id,
+              idempotencyKey,
+              correlationId,
+              metadata: {
+                billNumber: (bill as any).billNumber,
+                reason: String(body.reason).trim(),
+                adjustmentDate,
+                priorAdjustmentJournalEntryId: priorAdjId,
+                reversedPriorAdjustmentJournalEntryId,
+                adjustmentJournalEntryId,
+                total: total.toString(),
+              },
+            });
+
+            return { purchaseBillId: bill.id, status: bill.status, adjustmentJournalEntryId, reversedPriorAdjustmentJournalEntryId, total: total.toString() };
+          });
+
+          return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+        }, redis)
+      );
+
+      return {
+        purchaseBillId: (result as any).purchaseBillId,
+        status: (result as any).status,
+        adjustmentJournalEntryId: (result as any).adjustmentJournalEntryId ?? null,
+        reversedPriorAdjustmentJournalEntryId: (result as any).reversedPriorAdjustmentJournalEntryId ?? null,
+        total: (result as any).total,
+      };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
+  });
+
+  // Void posted purchase bill (immutable ledger): marks purchase bill VOID and posts a reversal journal entry.
+  // Also reverses any inventory moves created by posting the purchase bill.
+  // POST /companies/:companyId/purchase-bills/:purchaseBillId/void
+  fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/void', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const purchaseBillId = Number((request.params as any)?.purchaseBillId);
+    if (!companyId || Number.isNaN(purchaseBillId)) {
+      reply.status(400);
+      return { error: 'invalid companyId or purchaseBillId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const body = (request.body ?? {}) as { reason?: string; voidDate?: string };
+    if (!body.reason || !String(body.reason).trim()) {
+      reply.status(400);
+      return { error: 'reason is required' };
+    }
+    const voidDate = parseDateInput(body.voidDate) ?? new Date();
+    if (body.voidDate && isNaN(voidDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid voidDate' };
+    }
+
+    const correlationId = randomUUID();
+    const occurredAt = isoNow();
+    const lockKey = `lock:purchase-bill:void:${companyId}:${purchaseBillId}`;
+
+    try {
+      const preMoves = await prisma.stockMove.findMany({
+        where: { companyId, referenceType: 'PurchaseBill', referenceId: String(purchaseBillId) },
+        select: { warehouseId: true, itemId: true },
+      });
+      const stockLockKeys = Array.from(
+        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`))
+      );
+      const wrapped = async (fn: () => Promise<any>) =>
+        stockLockKeys.length > 0
+          ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
+          : withLockBestEffort(redis, lockKey, 30_000, fn);
+
+      const { response: result } = await wrapped(async () =>
+        runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+          const txResult = await prisma.$transaction(async (tx: any) => {
+            await tx.$queryRaw`
+              SELECT id FROM PurchaseBill
+              WHERE id = ${purchaseBillId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+
+            const bill = await tx.purchaseBill.findFirst({
+              where: { id: purchaseBillId, companyId },
+              include: { journalEntry: { include: { lines: true } } },
+            });
+            if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+            if (bill.status === 'VOID') {
+              return { purchaseBillId: bill.id, status: bill.status, voidJournalEntryId: (bill as any).voidJournalEntryId ?? null, alreadyVoided: true };
+            }
+            if (bill.status !== 'POSTED') throw Object.assign(new Error('only POSTED purchase bills can be voided'), { statusCode: 400 });
+            if (!bill.journalEntryId || !(bill as any).journalEntry) throw Object.assign(new Error('purchase bill is POSTED but missing journal entry link'), { statusCode: 500 });
+
+            const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
+            if (payCount > 0) throw Object.assign(new Error('cannot void a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
+
+            const priorAdjId = Number((bill as any).lastAdjustmentJournalEntryId ?? 0) || null;
+            let reversedPriorAdjustmentJournalEntryId: number | null = null;
+            if (priorAdjId) {
+              const { reversal } = await createReversalJournalEntry(tx, {
+                companyId,
+                originalJournalEntryId: priorAdjId,
+                reversalDate: voidDate,
+                reason: `void purchase bill: ${String(body.reason).trim()}`,
+                createdByUserId: (request as any).user?.userId ?? null,
+              });
+              reversedPriorAdjustmentJournalEntryId = reversal.id;
+              const createdEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: createdEventId,
+                  eventType: 'journal.entry.created',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  causationId: String(priorAdjId),
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(reversal.id),
+                  type: 'JournalEntryCreated',
+                  payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                },
+              });
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: randomUUID(),
+                  eventType: 'journal.entry.reversed',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  causationId: createdEventId,
+                  aggregateType: 'JournalEntry',
+                  aggregateId: String(priorAdjId),
+                  type: 'JournalEntryReversed',
+                  payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'void purchase bill' },
+                },
+              });
+            }
+
+            const origMoves = await tx.stockMove.findMany({
+              where: { companyId, referenceType: 'PurchaseBill', referenceId: String(bill.id) },
+              select: { warehouseId: true, itemId: true, quantity: true, totalCostApplied: true },
+            });
+
+            const { reversal } = await createReversalJournalEntry(tx, {
+              companyId,
+              originalJournalEntryId: bill.journalEntryId,
+              reversalDate: voidDate,
+              reason: String(body.reason).trim(),
+              createdByUserId: (request as any).user?.userId ?? null,
+            });
+
+            if ((origMoves ?? []).length > 0) {
+              for (const m of origMoves as any[]) {
+                await applyStockMoveWac(tx as any, {
+                  companyId,
+                  warehouseId: m.warehouseId,
+                  itemId: m.itemId,
+                  date: voidDate,
+                  type: 'ADJUSTMENT',
+                  direction: 'OUT',
+                  quantity: new Prisma.Decimal(m.quantity).toDecimalPlaces(2),
+                  unitCostApplied: new Prisma.Decimal(0),
+                  totalCostApplied: new Prisma.Decimal(m.totalCostApplied).toDecimalPlaces(2),
+                  referenceType: 'PurchaseBillVoid',
+                  referenceId: String(bill.id),
+                  correlationId,
+                  createdByUserId: (request as any).user?.userId ?? null,
+                  journalEntryId: null,
+                });
+              }
+              await tx.stockMove.updateMany({
+                where: { companyId, correlationId, journalEntryId: null, referenceType: 'PurchaseBillVoid', referenceId: String(bill.id) },
+                data: { journalEntryId: reversal.id },
+              });
+            }
+
+            const createdEventId = randomUUID();
+            await tx.event.create({
+              data: {
+                companyId,
+                eventId: createdEventId,
+                eventType: 'journal.entry.created',
+                schemaVersion: 'v1',
+                occurredAt: new Date(occurredAt),
+                source: 'cashflow-api',
+                partitionKey: String(companyId),
+                correlationId,
+                causationId: String(bill.journalEntryId),
+                aggregateType: 'JournalEntry',
+                aggregateId: String(reversal.id),
+                type: 'JournalEntryCreated',
+                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: bill.journalEntryId, source: 'PurchaseBillVoid', purchaseBillId: bill.id },
+              },
+            });
+            await tx.event.create({
+              data: {
+                companyId,
+                eventId: randomUUID(),
+                eventType: 'journal.entry.reversed',
+                schemaVersion: 'v1',
+                occurredAt: new Date(occurredAt),
+                source: 'cashflow-api',
+                partitionKey: String(companyId),
+                correlationId,
+                causationId: createdEventId,
+                aggregateType: 'JournalEntry',
+                aggregateId: String(bill.journalEntryId),
+                type: 'JournalEntryReversed',
+                payload: { originalJournalEntryId: bill.journalEntryId, reversalJournalEntryId: reversal.id, companyId, reason: String(body.reason).trim() },
+              },
+            });
+
+            const voidedAt = new Date();
+            await tx.purchaseBill.update({
+              where: { id: bill.id },
+              data: {
+                status: 'VOID',
+                voidedAt,
+                voidReason: String(body.reason).trim(),
+                voidedByUserId: (request as any).user?.userId ?? null,
+                voidJournalEntryId: reversal.id,
+                lastAdjustmentJournalEntryId: null,
+                updatedByUserId: (request as any).user?.userId ?? null,
+              } as any,
+            });
+
+            await tx.journalEntry.updateMany({
+              where: { id: bill.journalEntryId, companyId },
+              data: {
+                voidedAt,
+                voidReason: String(body.reason).trim(),
+                voidedByUserId: (request as any).user?.userId ?? null,
+                updatedByUserId: (request as any).user?.userId ?? null,
+              } as any,
+            });
+
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'purchase_bill.void',
+              entityType: 'PurchaseBill',
+              entityId: bill.id,
+              idempotencyKey,
+              correlationId,
+              metadata: {
+                reason: String(body.reason).trim(),
+                voidDate,
+                voidedAt,
+                originalJournalEntryId: bill.journalEntryId,
+                voidJournalEntryId: reversal.id,
+                priorAdjustmentJournalEntryId: priorAdjId,
+                reversedPriorAdjustmentJournalEntryId,
+                inventoryMovesReversed: (origMoves ?? []).length,
+              },
+            });
+
+            return { purchaseBillId: bill.id, status: 'VOID', voidJournalEntryId: reversal.id };
+          });
+
+          return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+        }, redis)
+      );
+
+      return { purchaseBillId: (result as any).purchaseBillId, status: (result as any).status, voidJournalEntryId: (result as any).voidJournalEntryId };
+    } catch (err: any) {
+      if (err?.statusCode) {
+        reply.status(err.statusCode);
+        return { error: err.message };
+      }
+      throw err;
+    }
   });
 
   // Record purchase bill payment: Dr AP / Cr Cash-Bank

@@ -2,7 +2,7 @@ import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { randomUUID } from 'node:crypto';
-import { AccountType, ItemType, Prisma } from '@prisma/client';
+import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
@@ -14,6 +14,7 @@ import { ensureInventoryCompanyDefaults, ensureInventoryItem, getStockBalanceFor
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { nextCreditNoteNumber } from '../sequence/sequence.service.js';
+import { buildAdjustmentLinesFromNets, computeNetByAccount, createReversalJournalEntry, diffNets, } from '../ledger/reversal.service.js';
 function generateInvoiceNumber() {
     // Beginner-friendly and “good enough” for now.
     // Later we can make this per-company sequential numbers (INV-0001).
@@ -51,6 +52,39 @@ export async function booksRoutes(fastify) {
             throw Object.assign(new Error(`currency mismatch: document currency ${docCurrency} must equal company baseCurrency ${companyBaseCurrency}`), { statusCode: 400 });
         }
     }
+    async function ensureSalesIncomeAccount(tx, companyId) {
+        // Default revenue mapping for invoices when user doesn't care about accounting.
+        // Code 4000 is our canonical "Sales Income" (seeded at company creation, but we also self-heal here).
+        const existing = await tx.account.findFirst({
+            where: { companyId, code: '4000', type: AccountType.INCOME },
+            select: { id: true },
+        });
+        if (existing?.id)
+            return existing.id;
+        const created = await tx.account.create({
+            data: {
+                companyId,
+                code: '4000',
+                name: 'Sales Income',
+                type: AccountType.INCOME,
+                normalBalance: 'CREDIT',
+                reportGroup: AccountReportGroup.SALES_REVENUE,
+                cashflowActivity: CashflowActivity.OPERATING,
+                isActive: true,
+            },
+            select: { id: true },
+        });
+        return created.id;
+    }
+    // Prisma client types in dev environments require `prisma generate` after schema changes.
+    // We keep this include typed as `any` to avoid blocking builds in environments where the generated client
+    // hasn't been refreshed yet (CI/local will regenerate and still work correctly).
+    const invoiceLinesIncludeWithIncomeAccount = {
+        include: { item: true, incomeAccount: { select: { id: true, code: true, name: true, type: true } } },
+    };
+    const creditNoteLinesIncludeWithIncomeAccount = {
+        include: { item: true, incomeAccount: { select: { id: true, code: true, name: true, type: true } } },
+    };
     // --- Books: Customers ---
     fastify.get('/companies/:companyId/customers', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -226,7 +260,7 @@ export async function booksRoutes(fastify) {
             where: { id: invoiceId, companyId },
             include: {
                 customer: true,
-                lines: { include: { item: true } },
+                lines: invoiceLinesIncludeWithIncomeAccount,
                 journalEntry: {
                     include: {
                         lines: {
@@ -369,6 +403,22 @@ export async function booksRoutes(fastify) {
         }
         const invoiceDate = parseDateInput(body.invoiceDate) ?? new Date();
         const dueDate = body.dueDate ? parseDateInput(body.dueDate) : null;
+        // Validate optional income accounts (tenant-safe) and determine Sales Income default.
+        const requestedIncomeAccountIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+        const incomeAccounts = requestedIncomeAccountIds.length === 0
+            ? []
+            : await prisma.account.findMany({
+                where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                select: { id: true },
+            });
+        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+        for (const id of requestedIncomeAccountIds) {
+            if (!incomeIdSet.has(id)) {
+                reply.status(400);
+                return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+            }
+        }
+        const salesIncomeAccountId = await prisma.$transaction(async (tx) => ensureSalesIncomeAccount(tx, companyId));
         // Compute totals using Decimal (money-safe).
         let subtotal = new Prisma.Decimal(0);
         let taxAmount = new Prisma.Decimal(0);
@@ -398,6 +448,7 @@ export async function booksRoutes(fastify) {
                 lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
                 taxRate: rate,
                 taxAmount: lineTax,
+                incomeAccountId: Number(line.incomeAccountId ?? 0) || salesIncomeAccountId,
             };
         });
         const invoice = await prisma.invoice.create({
@@ -422,7 +473,7 @@ export async function booksRoutes(fastify) {
             },
             include: {
                 customer: true,
-                lines: { include: { item: true } },
+                lines: invoiceLinesIncludeWithIncomeAccount,
             },
         });
         return invoice;
@@ -484,6 +535,22 @@ export async function booksRoutes(fastify) {
                 return { error: `itemId ${line.itemId} not found in this company` };
             }
         }
+        // Validate optional income accounts (tenant-safe) and determine Sales Income default.
+        const requestedIncomeAccountIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+        const incomeAccounts = requestedIncomeAccountIds.length === 0
+            ? []
+            : await prisma.account.findMany({
+                where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                select: { id: true },
+            });
+        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+        for (const id of requestedIncomeAccountIds) {
+            if (!incomeIdSet.has(id)) {
+                reply.status(400);
+                return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+            }
+        }
+        const salesIncomeAccountId = await prisma.$transaction(async (tx) => ensureSalesIncomeAccount(tx, companyId));
         // Compute totals using Decimal (money-safe).
         let subtotal = new Prisma.Decimal(0);
         let taxAmount = new Prisma.Decimal(0);
@@ -513,6 +580,7 @@ export async function booksRoutes(fastify) {
                 lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
                 taxRate: rate,
                 taxAmount: lineTax,
+                incomeAccountId: Number(line.incomeAccountId ?? 0) || salesIncomeAccountId,
             };
         });
         const updated = await prisma.$transaction(async (tx) => {
@@ -551,10 +619,740 @@ export async function booksRoutes(fastify) {
                         create: computedLines,
                     },
                 },
-                include: { customer: true, lines: { include: { item: true } } },
+                include: { customer: true, lines: invoiceLinesIncludeWithIncomeAccount },
             });
         });
         return updated;
+    });
+    // Delete invoice (DRAFT/APPROVED only)
+    fastify.delete('/companies/:companyId/invoices/:invoiceId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:invoice:delete:${companyId}:${invoiceId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Invoice
+              WHERE id = ${invoiceId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const inv = await tx.invoice.findFirst({
+                        where: { id: invoiceId, companyId },
+                        select: { id: true, status: true, invoiceNumber: true, journalEntryId: true },
+                    });
+                    if (!inv)
+                        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                    if (inv.status !== 'DRAFT' && inv.status !== 'APPROVED') {
+                        throw Object.assign(new Error('only DRAFT/APPROVED invoices can be deleted'), { statusCode: 400 });
+                    }
+                    if (inv.journalEntryId) {
+                        throw Object.assign(new Error('cannot delete an invoice that already has a journal entry'), { statusCode: 400 });
+                    }
+                    const payCount = await tx.payment.count({ where: { companyId, invoiceId: inv.id } });
+                    if (payCount > 0) {
+                        throw Object.assign(new Error('cannot delete an invoice that has payments'), { statusCode: 400 });
+                    }
+                    await tx.invoiceLine.deleteMany({ where: { companyId, invoiceId: inv.id } });
+                    await tx.invoice.delete({ where: { id: inv.id } });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'invoice.delete_unposted',
+                        entityType: 'Invoice',
+                        entityId: inv.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: { invoiceNumber: inv.invoiceNumber, status: inv.status, occurredAt },
+                    });
+                    return { invoiceId: inv.id, deleted: true };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { invoiceId: result.invoiceId, deleted: true };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Approve invoice (DRAFT -> APPROVED)
+    fastify.post('/companies/:companyId/invoices/:invoiceId/approve', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const updated = await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw `
+        SELECT id FROM Invoice
+        WHERE id = ${invoiceId} AND companyId = ${companyId}
+        FOR UPDATE
+      `;
+            const inv = await tx.invoice.findFirst({
+                where: { id: invoiceId, companyId },
+                select: { id: true, status: true, journalEntryId: true, invoiceNumber: true },
+            });
+            if (!inv)
+                throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+            if (inv.status !== 'DRAFT')
+                throw Object.assign(new Error('only DRAFT invoices can be approved'), { statusCode: 400 });
+            if (inv.journalEntryId)
+                throw Object.assign(new Error('cannot approve an invoice that already has a journal entry'), { statusCode: 400 });
+            const upd = await tx.invoice.update({
+                where: { id: inv.id },
+                data: { status: 'APPROVED', updatedByUserId: request.user?.userId ?? null },
+                select: { id: true, status: true, invoiceNumber: true },
+            });
+            await writeAuditLog(tx, {
+                companyId,
+                userId: request.user?.userId ?? null,
+                action: 'invoice.approve',
+                entityType: 'Invoice',
+                entityId: inv.id,
+                idempotencyKey: request.headers?.['idempotency-key'] ?? null,
+                correlationId,
+                metadata: { invoiceNumber: inv.invoiceNumber, fromStatus: 'DRAFT', toStatus: 'APPROVED', occurredAt },
+            });
+            return upd;
+        });
+        return updated;
+    });
+    // Adjust posted invoice (immutable ledger): updates the document and posts an ADJUSTMENT journal entry (delta vs original posting).
+    // POST /companies/:companyId/invoices/:invoiceId/adjust
+    fastify.post('/companies/:companyId/invoices/:invoiceId/adjust', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        if (!body.lines?.length) {
+            reply.status(400);
+            return { error: 'lines is required' };
+        }
+        const lines = body.lines;
+        const adjustmentDate = parseDateInput(body.adjustmentDate) ?? new Date();
+        if (body.adjustmentDate && isNaN(adjustmentDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid adjustmentDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:invoice:adjust:${companyId}:${invoiceId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Invoice
+              WHERE id = ${invoiceId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const inv = await tx.invoice.findFirst({
+                        where: { id: invoiceId, companyId },
+                        include: {
+                            company: true,
+                            customer: true,
+                            lines: { include: { item: true } },
+                            journalEntry: { include: { lines: true } },
+                        },
+                    });
+                    if (!inv)
+                        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                    if (inv.status !== 'POSTED') {
+                        throw Object.assign(new Error('only POSTED invoices can be adjusted'), { statusCode: 400 });
+                    }
+                    const payCount = await tx.payment.count({
+                        where: { companyId, invoiceId: inv.id, reversedAt: null },
+                    });
+                    if (payCount > 0) {
+                        throw Object.assign(new Error('cannot adjust an invoice that has payments (reverse payments first)'), {
+                            statusCode: 400,
+                        });
+                    }
+                    const postedCreditNotes = await tx.creditNote.count({
+                        where: { companyId, invoiceId: inv.id, status: 'POSTED' },
+                    });
+                    if (postedCreditNotes > 0) {
+                        throw Object.assign(new Error('cannot adjust an invoice that has POSTED credit notes (void credit notes first)'), {
+                            statusCode: 400,
+                        });
+                    }
+                    // Safety: inventory-backed invoices require stock moves; we force void+reissue for now.
+                    const hasTracked = (inv.lines ?? []).some((l) => l.item?.type === 'GOODS' && !!l.item?.trackInventory);
+                    if (hasTracked) {
+                        throw Object.assign(new Error('cannot adjust an inventory-tracked invoice (use credit note / void + reissue)'), { statusCode: 400 });
+                    }
+                    if (!inv.journalEntryId || !inv.journalEntry) {
+                        throw Object.assign(new Error('invoice is POSTED but missing journal entry link'), { statusCode: 500 });
+                    }
+                    // Validate items and optional income accounts (tenant-safe) using the same rules as draft update.
+                    const itemIds = lines.map((l) => l.itemId);
+                    const items = (await tx.item.findMany({
+                        where: { companyId, id: { in: itemIds } },
+                        select: { id: true, name: true, sellingPrice: true },
+                    }));
+                    const itemById = new Map(items.map((i) => [i.id, i]));
+                    for (const line of lines) {
+                        if (!line.quantity || line.quantity <= 0) {
+                            throw Object.assign(new Error('each line must have quantity > 0'), { statusCode: 400 });
+                        }
+                        if (!itemById.get(line.itemId)) {
+                            throw Object.assign(new Error(`itemId ${line.itemId} not found in this company`), { statusCode: 400 });
+                        }
+                    }
+                    const requestedIncomeAccountIds = Array.from(new Set(lines.map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+                    if (requestedIncomeAccountIds.length > 0) {
+                        const incomeAccounts = await tx.account.findMany({
+                            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                            select: { id: true },
+                        });
+                        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+                        for (const id of requestedIncomeAccountIds) {
+                            if (!incomeIdSet.has(id)) {
+                                throw Object.assign(new Error(`incomeAccountId ${id} must be an INCOME account in this company`), { statusCode: 400 });
+                            }
+                        }
+                    }
+                    const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
+                    // Compute totals (money-safe) and build new invoice lines.
+                    let subtotal = new Prisma.Decimal(0);
+                    let taxAmount = new Prisma.Decimal(0);
+                    let total = new Prisma.Decimal(0);
+                    const computedLines = lines.map((line) => {
+                        const item = itemById.get(line.itemId);
+                        const qty = toMoneyDecimal(line.quantity);
+                        const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
+                        const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+                        const rate = new Prisma.Decimal(Number(line.taxRate ?? 0)).toDecimalPlaces(4);
+                        if (rate.lessThan(0) || rate.greaterThan(1)) {
+                            throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), { statusCode: 400 });
+                        }
+                        const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+                        const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+                        subtotal = subtotal.add(lineSubtotal);
+                        taxAmount = taxAmount.add(lineTax);
+                        total = total.add(lineTotal);
+                        return {
+                            companyId,
+                            itemId: line.itemId,
+                            description: line.description ?? null,
+                            quantity: qty,
+                            unitPrice: unit,
+                            lineTotal: lineSubtotal, // keep backwards compat
+                            taxRate: rate,
+                            taxAmount: lineTax,
+                            incomeAccountId: Number(line.incomeAccountId ?? 0) || salesIncomeAccountId,
+                        };
+                    });
+                    subtotal = subtotal.toDecimalPlaces(2);
+                    taxAmount = taxAmount.toDecimalPlaces(2);
+                    total = total.toDecimalPlaces(2);
+                    // Build "desired" posting lines (no inventory/COGS in adjustment endpoint).
+                    const arId = inv.company.accountsReceivableAccountId;
+                    if (!arId)
+                        throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+                    const arAccount = await tx.account.findFirst({ where: { id: arId, companyId, type: AccountType.ASSET } });
+                    if (!arAccount)
+                        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), { statusCode: 400 });
+                    const incomeBuckets = new Map();
+                    for (const l of computedLines) {
+                        const prev = incomeBuckets.get(l.incomeAccountId) ?? new Prisma.Decimal(0);
+                        incomeBuckets.set(l.incomeAccountId, prev.add(new Prisma.Decimal(l.lineTotal)).toDecimalPlaces(2));
+                    }
+                    // Ensure Tax Payable exists when needed
+                    let taxPayableAccountId = null;
+                    if (taxAmount.greaterThan(0)) {
+                        const existing = await tx.account.findFirst({
+                            where: { companyId, type: AccountType.LIABILITY, code: '2100' },
+                            select: { id: true },
+                        });
+                        taxPayableAccountId = existing?.id ?? null;
+                        if (!taxPayableAccountId) {
+                            const created = await tx.account.create({
+                                data: {
+                                    companyId,
+                                    code: '2100',
+                                    name: 'Tax Payable',
+                                    type: AccountType.LIABILITY,
+                                    normalBalance: 'CREDIT',
+                                    reportGroup: 'OTHER_CURRENT_LIABILITY',
+                                    cashflowActivity: 'OPERATING',
+                                },
+                                select: { id: true },
+                            });
+                            taxPayableAccountId = created.id;
+                        }
+                    }
+                    const desiredPostingLines = [
+                        { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
+                        ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amt]) => ({
+                            accountId: incomeAccountId,
+                            debit: new Prisma.Decimal(0),
+                            credit: amt.toDecimalPlaces(2),
+                        })),
+                    ];
+                    if (taxAmount.greaterThan(0)) {
+                        desiredPostingLines.push({
+                            accountId: taxPayableAccountId,
+                            debit: new Prisma.Decimal(0),
+                            credit: taxAmount,
+                        });
+                    }
+                    const originalNet = computeNetByAccount((inv.journalEntry.lines ?? []).map((l) => ({
+                        accountId: l.accountId,
+                        debit: l.debit,
+                        credit: l.credit,
+                    })));
+                    const desiredNet = computeNetByAccount(desiredPostingLines);
+                    const deltaNet = diffNets(originalNet, desiredNet);
+                    const adjustmentLines = buildAdjustmentLinesFromNets(deltaNet);
+                    // Reverse any existing active adjustment (we keep at most 1 active adjustment per invoice).
+                    const priorAdjId = Number(inv.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: adjustmentDate,
+                            reason: `superseded by invoice adjustment: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        // Outbox events for reversal entry (and reversed semantic event)
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: {
+                                    originalJournalEntryId: priorAdjId,
+                                    reversalJournalEntryId: reversal.id,
+                                    companyId,
+                                    reason: `superseded by invoice adjustment`,
+                                },
+                            },
+                        });
+                    }
+                    let adjustmentJournalEntryId = null;
+                    if (adjustmentLines.length > 0) {
+                        if (adjustmentLines.length < 2) {
+                            throw Object.assign(new Error('adjustment resulted in an invalid journal entry (needs >=2 lines)'), { statusCode: 400 });
+                        }
+                        const je = await postJournalEntry(tx, {
+                            companyId,
+                            date: adjustmentDate,
+                            description: `ADJUSTMENT for Invoice ${inv.invoiceNumber}: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                            lines: adjustmentLines,
+                        });
+                        adjustmentJournalEntryId = je.id;
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(je.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: je.id, companyId, source: 'InvoiceAdjustment', invoiceId: inv.id },
+                            },
+                        });
+                    }
+                    // Update the invoice document (keeps UI consistent with correction) + track last adjustment JE.
+                    const before = { subtotal: inv.subtotal?.toString?.() ?? null, taxAmount: inv.taxAmount?.toString?.() ?? null, total: inv.total?.toString?.() ?? null };
+                    await tx.invoice.update({
+                        where: { id: inv.id },
+                        data: {
+                            dueDate: body.dueDate === undefined ? inv.dueDate : body.dueDate ? parseDateInput(body.dueDate) : null,
+                            customerNotes: body.customerNotes === undefined ? inv.customerNotes ?? null : body.customerNotes,
+                            termsAndConditions: body.termsAndConditions === undefined ? inv.termsAndConditions ?? null : body.termsAndConditions,
+                            subtotal,
+                            taxAmount,
+                            total,
+                            lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
+                            updatedByUserId: request.user?.userId ?? null,
+                            lines: { deleteMany: {}, create: computedLines },
+                        },
+                    });
+                    const after = { subtotal: subtotal.toString(), taxAmount: taxAmount.toString(), total: total.toString() };
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'invoice.adjust_posted',
+                        entityType: 'Invoice',
+                        entityId: inv.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            invoiceNumber: inv.invoiceNumber,
+                            reason: String(body.reason).trim(),
+                            adjustmentDate,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                            adjustmentJournalEntryId,
+                            before,
+                            after,
+                        },
+                    });
+                    return {
+                        invoiceId: inv.id,
+                        status: inv.status,
+                        adjustmentJournalEntryId,
+                        reversedPriorAdjustmentJournalEntryId,
+                        total: total.toString(),
+                    };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                invoiceId: result.invoiceId,
+                status: result.status,
+                adjustmentJournalEntryId: result.adjustmentJournalEntryId ?? null,
+                reversedPriorAdjustmentJournalEntryId: result.reversedPriorAdjustmentJournalEntryId ?? null,
+                total: result.total,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Void posted invoice (immutable ledger): marks invoice VOID and posts a reversal journal entry.
+    // POST /companies/:companyId/invoices/:invoiceId/void
+    fastify.post('/companies/:companyId/invoices/:invoiceId/void', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const invoiceId = Number(request.params?.invoiceId);
+        if (!companyId || Number.isNaN(invoiceId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or invoiceId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        const voidDate = parseDateInput(body.voidDate) ?? new Date();
+        if (body.voidDate && isNaN(voidDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid voidDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:invoice:void:${companyId}:${invoiceId}`;
+        try {
+            // If invoice posting touched inventory, we must lock per-item stock keys during void to avoid WAC races.
+            const preMoves = await prisma.stockMove.findMany({
+                where: { companyId, referenceType: 'Invoice', referenceId: String(invoiceId) },
+                select: { warehouseId: true, itemId: true },
+            });
+            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`)));
+            const wrapped = async (fn) => stockLockKeys.length > 0
+                ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
+                : withLockBestEffort(redis, lockKey, 30_000, fn);
+            const { response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Invoice
+              WHERE id = ${invoiceId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const inv = await tx.invoice.findFirst({
+                        where: { id: invoiceId, companyId },
+                        include: { journalEntry: { include: { lines: true } } },
+                    });
+                    if (!inv)
+                        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                    if (inv.status === 'VOID') {
+                        return { invoiceId: inv.id, status: inv.status, voidJournalEntryId: inv.voidJournalEntryId ?? null, alreadyVoided: true };
+                    }
+                    if (inv.status !== 'POSTED') {
+                        throw Object.assign(new Error('only POSTED invoices can be voided'), { statusCode: 400 });
+                    }
+                    if (!inv.journalEntryId || !inv.journalEntry) {
+                        throw Object.assign(new Error('invoice is POSTED but missing journal entry link'), { statusCode: 500 });
+                    }
+                    const payCount = await tx.payment.count({ where: { companyId, invoiceId: inv.id, reversedAt: null } });
+                    if (payCount > 0) {
+                        throw Object.assign(new Error('cannot void an invoice that has payments (reverse payments first)'), { statusCode: 400 });
+                    }
+                    const postedCreditNotes = await tx.creditNote.count({
+                        where: { companyId, invoiceId: inv.id, status: 'POSTED' },
+                    });
+                    if (postedCreditNotes > 0) {
+                        throw Object.assign(new Error('cannot void an invoice that has POSTED credit notes (void credit notes first)'), {
+                            statusCode: 400,
+                        });
+                    }
+                    // Inventory reversal: reverse stock issues created by invoice posting.
+                    const origIssueMoves = await tx.stockMove.findMany({
+                        where: {
+                            companyId,
+                            referenceType: 'Invoice',
+                            referenceId: String(inv.id),
+                            type: 'SALE_ISSUE',
+                            direction: 'OUT',
+                        },
+                        select: {
+                            warehouseId: true,
+                            itemId: true,
+                            quantity: true,
+                            unitCostApplied: true,
+                        },
+                    });
+                    // Reverse active adjustment first (if any)
+                    const priorAdjId = Number(inv.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: voidDate,
+                            reason: `void invoice: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: {
+                                    originalJournalEntryId: priorAdjId,
+                                    reversalJournalEntryId: reversal.id,
+                                    companyId,
+                                    reason: `void invoice`,
+                                },
+                            },
+                        });
+                    }
+                    const { reversal } = await createReversalJournalEntry(tx, {
+                        companyId,
+                        originalJournalEntryId: inv.journalEntryId,
+                        reversalDate: voidDate,
+                        reason: String(body.reason).trim(),
+                        createdByUserId: request.user?.userId ?? null,
+                    });
+                    // Apply stock returns at the SAME unit cost applied on the original sale issue moves (audit-friendly).
+                    if ((origIssueMoves ?? []).length > 0) {
+                        for (const m of origIssueMoves) {
+                            await applyStockMoveWac(tx, {
+                                companyId,
+                                warehouseId: m.warehouseId,
+                                itemId: m.itemId,
+                                date: voidDate,
+                                type: 'SALE_RETURN',
+                                direction: 'IN',
+                                quantity: new Prisma.Decimal(m.quantity).toDecimalPlaces(2),
+                                unitCostApplied: new Prisma.Decimal(m.unitCostApplied).toDecimalPlaces(2),
+                                referenceType: 'InvoiceVoid',
+                                referenceId: String(inv.id),
+                                correlationId,
+                                createdByUserId: request.user?.userId ?? null,
+                                journalEntryId: null,
+                            });
+                        }
+                        await tx.stockMove.updateMany({
+                            where: { companyId, correlationId, journalEntryId: null, referenceType: 'InvoiceVoid', referenceId: String(inv.id) },
+                            data: { journalEntryId: reversal.id },
+                        });
+                    }
+                    // Outbox events (created + reversed semantic)
+                    const createdEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: createdEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(inv.journalEntryId),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversal.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: inv.journalEntryId, source: 'InvoiceVoid', invoiceId: inv.id },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: createdEventId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(inv.journalEntryId),
+                            type: 'JournalEntryReversed',
+                            payload: {
+                                originalJournalEntryId: inv.journalEntryId,
+                                reversalJournalEntryId: reversal.id,
+                                companyId,
+                                reason: String(body.reason).trim(),
+                            },
+                        },
+                    });
+                    const voidedAt = new Date();
+                    await tx.invoice.update({
+                        where: { id: inv.id },
+                        data: {
+                            status: 'VOID',
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            voidJournalEntryId: reversal.id,
+                            lastAdjustmentJournalEntryId: null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await tx.journalEntry.updateMany({
+                        where: { id: inv.journalEntryId, companyId },
+                        data: {
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'invoice.void',
+                        entityType: 'Invoice',
+                        entityId: inv.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            reason: String(body.reason).trim(),
+                            voidDate,
+                            voidedAt,
+                            originalJournalEntryId: inv.journalEntryId,
+                            voidJournalEntryId: reversal.id,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                        },
+                    });
+                    return { invoiceId: inv.id, status: 'VOID', voidJournalEntryId: reversal.id };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                invoiceId: result.invoiceId,
+                status: result.status,
+                voidJournalEntryId: result.voidJournalEntryId,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
     });
     // POST (confirm) an invoice: DRAFT -> POSTED creates journal entry
     fastify.post('/companies/:companyId/invoices/:invoiceId/post', async (request, reply) => {
@@ -630,8 +1428,8 @@ export async function booksRoutes(fastify) {
                 if (!invoice) {
                     throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                 }
-                if (invoice.status !== 'DRAFT') {
-                    throw Object.assign(new Error('only DRAFT invoices can be posted'), { statusCode: 400 });
+                if (invoice.status !== 'DRAFT' && invoice.status !== 'APPROVED') {
+                    throw Object.assign(new Error('only DRAFT/APPROVED invoices can be posted'), { statusCode: 400 });
                 }
                 // Currency policy: if company has baseCurrency, invoice currency must match it.
                 const baseCurrency = normalizeCurrencyOrNull(invoice.company.baseCurrency ?? null);
@@ -670,7 +1468,10 @@ export async function booksRoutes(fastify) {
                     }
                     const lineTax = lineSubtotal.mul(taxRate).toDecimalPlaces(2);
                     taxAmount = taxAmount.add(lineTax);
-                    const incomeAccountId = line.item.incomeAccountId;
+                    const incomeAccountId = line.incomeAccountId ?? line.item?.incomeAccountId;
+                    if (!incomeAccountId) {
+                        throw Object.assign(new Error('invoice line is missing income account mapping'), { statusCode: 400 });
+                    }
                     const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
                     incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal)); // Revenue excludes tax
                 }
@@ -1364,6 +2165,158 @@ export async function booksRoutes(fastify) {
     // - Draft creation (lines based on Items)
     // - Post: creates JE that reverses revenue: Dr INCOME, Cr AR
     // - Inventory restock is NOT applied in v1 (can be added later).
+    // --- Payments list (for UI) ---
+    // Sales: Payments received (customer payments against invoices)
+    fastify.get('/companies/:companyId/sales/payments', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const rows = await prisma.payment.findMany({
+            where: { companyId },
+            orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+            take: 200,
+            include: {
+                invoice: { select: { id: true, invoiceNumber: true, customer: { select: { id: true, name: true } } } },
+                bankAccount: { select: { id: true, code: true, name: true } },
+            },
+        });
+        return rows.map((p) => ({
+            id: p.id,
+            paymentDate: p.paymentDate,
+            amount: p.amount.toString(),
+            invoiceId: p.invoiceId,
+            invoiceNumber: p.invoice?.invoiceNumber ?? null,
+            customerId: p.invoice?.customer?.id ?? null,
+            customerName: p.invoice?.customer?.name ?? null,
+            bankAccountId: p.bankAccountId,
+            bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
+            journalEntryId: p.journalEntryId ?? null,
+            reversedAt: p.reversedAt ?? null,
+        }));
+    });
+    fastify.get('/companies/:companyId/sales/payments/:paymentId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const paymentId = Number(request.params?.paymentId);
+        if (Number.isNaN(paymentId)) {
+            reply.status(400);
+            return { error: 'invalid paymentId' };
+        }
+        const p = await prisma.payment.findFirst({
+            where: { id: paymentId, companyId },
+            include: {
+                invoice: { include: { customer: true } },
+                bankAccount: true,
+                journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+                reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+            },
+        });
+        if (!p) {
+            reply.status(404);
+            return { error: 'payment not found' };
+        }
+        return p;
+    });
+    // Purchases: Payments made (vendor payments against Expenses and Purchase Bills)
+    fastify.get('/companies/:companyId/purchases/payments', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const [expensePays, pbPays] = await Promise.all([
+            prisma.expensePayment.findMany({
+                where: { companyId },
+                orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+                take: 200,
+                include: {
+                    expense: { include: { vendor: true } },
+                    bankAccount: { select: { id: true, code: true, name: true } },
+                },
+            }),
+            prisma.purchaseBillPayment.findMany({
+                where: { companyId },
+                orderBy: [{ paymentDate: 'desc' }, { id: 'desc' }],
+                take: 200,
+                include: {
+                    purchaseBill: { include: { vendor: true } },
+                    bankAccount: { select: { id: true, code: true, name: true } },
+                },
+            }),
+        ]);
+        const mapped = [
+            ...(expensePays ?? []).map((p) => ({
+                type: 'expense',
+                id: p.id,
+                paymentDate: p.paymentDate,
+                amount: p.amount?.toString?.() ?? String(p.amount ?? '0'),
+                bankAccountId: p.bankAccountId,
+                bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
+                referenceId: p.expenseId,
+                referenceNumber: p.expense?.expenseNumber ?? null,
+                vendorName: p.expense?.vendor?.name ?? null,
+                journalEntryId: p.journalEntryId ?? null,
+                reversedAt: p.reversedAt ?? null,
+            })),
+            ...(pbPays ?? []).map((p) => ({
+                type: 'purchase-bill',
+                id: p.id,
+                paymentDate: p.paymentDate,
+                amount: p.amount?.toString?.() ?? String(p.amount ?? '0'),
+                bankAccountId: p.bankAccountId,
+                bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
+                referenceId: p.purchaseBillId,
+                referenceNumber: p.purchaseBill?.billNumber ?? null,
+                vendorName: p.purchaseBill?.vendor?.name ?? null,
+                journalEntryId: p.journalEntryId ?? null,
+                reversedAt: p.reversedAt ?? null,
+            })),
+        ];
+        mapped.sort((a, b) => {
+            const ad = new Date(a.paymentDate).getTime();
+            const bd = new Date(b.paymentDate).getTime();
+            if (bd !== ad)
+                return bd - ad;
+            return Number(b.id) - Number(a.id);
+        });
+        return mapped.slice(0, 200);
+    });
+    fastify.get('/companies/:companyId/purchases/payments/:paymentType/:paymentId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const paymentType = String(request.params?.paymentType ?? '').toLowerCase();
+        const paymentId = Number(request.params?.paymentId);
+        if (Number.isNaN(paymentId)) {
+            reply.status(400);
+            return { error: 'invalid paymentId' };
+        }
+        if (paymentType === 'expense') {
+            const p = await prisma.expensePayment.findFirst({
+                where: { id: paymentId, companyId },
+                include: {
+                    expense: { include: { vendor: true } },
+                    bankAccount: true,
+                    journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+                    reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+                },
+            });
+            if (!p) {
+                reply.status(404);
+                return { error: 'payment not found' };
+            }
+            return { type: 'expense', payment: p };
+        }
+        if (paymentType === 'purchase-bill') {
+            const p = await prisma.purchaseBillPayment.findFirst({
+                where: { id: paymentId, companyId },
+                include: {
+                    purchaseBill: { include: { vendor: true, warehouse: true } },
+                    bankAccount: true,
+                    journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+                    reversalJournalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
+                },
+            });
+            if (!p) {
+                reply.status(404);
+                return { error: 'payment not found' };
+            }
+            return { type: 'purchase-bill', payment: p };
+        }
+        reply.status(400);
+        return { error: 'invalid paymentType (use expense or purchase-bill)' };
+    });
     // List credit notes
     fastify.get('/companies/:companyId/credit-notes', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -1413,6 +2366,20 @@ export async function booksRoutes(fastify) {
             select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
         });
         const itemById = new Map(items.map((i) => [i.id, i]));
+        const requestedIncomeAccountIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+        const incomeAccounts = requestedIncomeAccountIds.length === 0
+            ? []
+            : await prisma.account.findMany({
+                where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                select: { id: true },
+            });
+        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+        for (const id of requestedIncomeAccountIds) {
+            if (!incomeIdSet.has(id)) {
+                reply.status(400);
+                return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+            }
+        }
         let subtotal = new Prisma.Decimal(0);
         let taxAmount = new Prisma.Decimal(0);
         let total = new Prisma.Decimal(0);
@@ -1458,12 +2425,14 @@ export async function booksRoutes(fastify) {
                 lineTotal, // subtotal + tax
                 taxRate: rate,
                 taxAmount: lineTax,
+                incomeAccountId: Number(l.incomeAccountId ?? 0) || null,
             });
         }
         subtotal = subtotal.toDecimalPlaces(2);
         taxAmount = taxAmount.toDecimalPlaces(2);
         total = total.toDecimalPlaces(2);
         const created = await prisma.$transaction(async (tx) => {
+            const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
             const creditNoteNumber = await nextCreditNoteNumber(tx, companyId);
             return await tx.creditNote.create({
                 data: {
@@ -1485,10 +2454,11 @@ export async function booksRoutes(fastify) {
                         create: computedLines.map((l, idx) => ({
                             ...l,
                             invoiceLineId: Number((body.lines ?? [])[idx]?.invoiceLineId ?? 0) || null,
+                            incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
                         })),
                     },
                 },
-                include: { customer: true, lines: { include: { item: true } } },
+                include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
             });
         });
         return created;
@@ -1528,6 +2498,20 @@ export async function booksRoutes(fastify) {
             select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
         });
         const itemById = new Map(items.map((i) => [i.id, i]));
+        const requestedIncomeAccountIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+        const incomeAccounts = requestedIncomeAccountIds.length === 0
+            ? []
+            : await prisma.account.findMany({
+                where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                select: { id: true },
+            });
+        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+        for (const id of requestedIncomeAccountIds) {
+            if (!incomeIdSet.has(id)) {
+                reply.status(400);
+                return { error: `incomeAccountId ${id} must be an INCOME account in this company` };
+            }
+        }
         let subtotal = new Prisma.Decimal(0);
         let taxAmount = new Prisma.Decimal(0);
         let total = new Prisma.Decimal(0);
@@ -1574,12 +2558,14 @@ export async function booksRoutes(fastify) {
                 taxRate: rate,
                 taxAmount: lineTax,
                 invoiceLineId: Number(l.invoiceLineId ?? 0) || null,
+                incomeAccountId: Number(l.incomeAccountId ?? 0) || null,
             });
         }
         subtotal = subtotal.toDecimalPlaces(2);
         taxAmount = taxAmount.toDecimalPlaces(2);
         total = total.toDecimalPlaces(2);
         const updated = await prisma.$transaction(async (tx) => {
+            const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
             await tx.$queryRaw `
         SELECT id FROM CreditNote
         WHERE id = ${creditNoteId} AND companyId = ${companyId}
@@ -1616,13 +2602,679 @@ export async function booksRoutes(fastify) {
                         : null,
                     lines: {
                         deleteMany: {},
-                        create: computedLines,
+                        create: computedLines.map((l) => ({
+                            ...l,
+                            incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
+                        })),
                     },
                 },
-                include: { customer: true, lines: { include: { item: true } } },
+                include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
             });
         });
         return updated;
+    });
+    // Delete credit note (DRAFT/APPROVED only)
+    fastify.delete('/companies/:companyId/credit-notes/:creditNoteId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const creditNoteId = Number(request.params?.creditNoteId);
+        if (!companyId || Number.isNaN(creditNoteId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or creditNoteId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:credit-note:delete:${companyId}:${creditNoteId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM CreditNote
+              WHERE id = ${creditNoteId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const cn = await tx.creditNote.findFirst({
+                        where: { id: creditNoteId, companyId },
+                        select: { id: true, status: true, creditNoteNumber: true, journalEntryId: true },
+                    });
+                    if (!cn)
+                        throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+                    if (cn.status !== 'DRAFT' && cn.status !== 'APPROVED') {
+                        throw Object.assign(new Error('only DRAFT/APPROVED credit notes can be deleted'), { statusCode: 400 });
+                    }
+                    if (cn.journalEntryId) {
+                        throw Object.assign(new Error('cannot delete a credit note that already has a journal entry'), { statusCode: 400 });
+                    }
+                    await tx.creditNoteLine.deleteMany({ where: { companyId, creditNoteId: cn.id } });
+                    await tx.creditNote.delete({ where: { id: cn.id } });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'credit_note.delete_unposted',
+                        entityType: 'CreditNote',
+                        entityId: cn.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: { creditNoteNumber: cn.creditNoteNumber, status: cn.status, occurredAt },
+                    });
+                    return { creditNoteId: cn.id, deleted: true };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { creditNoteId: result.creditNoteId, deleted: true };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Approve credit note (DRAFT -> APPROVED)
+    fastify.post('/companies/:companyId/credit-notes/:creditNoteId/approve', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const creditNoteId = Number(request.params?.creditNoteId);
+        if (!companyId || Number.isNaN(creditNoteId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or creditNoteId' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const updated = await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw `
+        SELECT id FROM CreditNote
+        WHERE id = ${creditNoteId} AND companyId = ${companyId}
+        FOR UPDATE
+      `;
+            const cn = await tx.creditNote.findFirst({
+                where: { id: creditNoteId, companyId },
+                select: { id: true, status: true, journalEntryId: true, creditNoteNumber: true },
+            });
+            if (!cn)
+                throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+            if (cn.status !== 'DRAFT')
+                throw Object.assign(new Error('only DRAFT credit notes can be approved'), { statusCode: 400 });
+            if (cn.journalEntryId)
+                throw Object.assign(new Error('cannot approve a credit note that already has a journal entry'), { statusCode: 400 });
+            const upd = await tx.creditNote.update({
+                where: { id: cn.id },
+                data: { status: 'APPROVED', updatedByUserId: request.user?.userId ?? null },
+                select: { id: true, status: true, creditNoteNumber: true },
+            });
+            await writeAuditLog(tx, {
+                companyId,
+                userId: request.user?.userId ?? null,
+                action: 'credit_note.approve',
+                entityType: 'CreditNote',
+                entityId: cn.id,
+                idempotencyKey: request.headers?.['idempotency-key'] ?? null,
+                correlationId,
+                metadata: { creditNoteNumber: cn.creditNoteNumber, fromStatus: 'DRAFT', toStatus: 'APPROVED', occurredAt },
+            });
+            return upd;
+        });
+        return updated;
+    });
+    // Adjust posted credit note (immutable ledger): updates the document and posts an ADJUSTMENT journal entry (delta vs original posting).
+    // POST /companies/:companyId/credit-notes/:creditNoteId/adjust
+    fastify.post('/companies/:companyId/credit-notes/:creditNoteId/adjust', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const creditNoteId = Number(request.params?.creditNoteId);
+        if (!companyId || Number.isNaN(creditNoteId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or creditNoteId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        if (!body.lines?.length) {
+            reply.status(400);
+            return { error: 'lines is required' };
+        }
+        const lines = body.lines;
+        const adjustmentDate = parseDateInput(body.adjustmentDate) ?? new Date();
+        if (body.adjustmentDate && isNaN(adjustmentDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid adjustmentDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:credit-note:adjust:${companyId}:${creditNoteId}`;
+        try {
+            const preMoves = await prisma.stockMove.findMany({
+                where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
+                select: { warehouseId: true, itemId: true },
+            });
+            if ((preMoves ?? []).length > 0) {
+                reply.status(400);
+                return { error: 'cannot adjust an inventory-affecting credit note (void + recreate)' };
+            }
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM CreditNote
+              WHERE id = ${creditNoteId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const cn = await tx.creditNote.findFirst({
+                        where: { id: creditNoteId, companyId },
+                        include: { company: true, customer: true, journalEntry: { include: { lines: true } } },
+                    });
+                    if (!cn)
+                        throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+                    if (cn.status !== 'POSTED')
+                        throw Object.assign(new Error('only POSTED credit notes can be adjusted'), { statusCode: 400 });
+                    if (!cn.journalEntryId || !cn.journalEntry) {
+                        throw Object.assign(new Error('credit note is POSTED but missing journal entry link'), { statusCode: 500 });
+                    }
+                    // Validate items and optional income accounts (tenant-safe)
+                    const itemIds = Array.from(new Set(lines.map((l) => Number(l.itemId)).filter(Boolean)));
+                    const items = (await tx.item.findMany({
+                        where: { companyId, id: { in: itemIds } },
+                        select: { id: true, name: true },
+                    }));
+                    const itemById = new Map(items.map((i) => [i.id, i]));
+                    for (const [idx, l] of lines.entries()) {
+                        const itemId = Number(l.itemId);
+                        if (!itemId || Number.isNaN(itemId))
+                            throw Object.assign(new Error(`lines[${idx}].itemId is required`), { statusCode: 400 });
+                        if (!itemById.get(itemId))
+                            throw Object.assign(new Error(`lines[${idx}].itemId not found in this company`), { statusCode: 400 });
+                        const qty = Number(l.quantity ?? 0);
+                        if (!qty || qty <= 0)
+                            throw Object.assign(new Error(`lines[${idx}].quantity must be > 0`), { statusCode: 400 });
+                        const unit = Number(l.unitPrice ?? 0);
+                        if (!unit || unit <= 0)
+                            throw Object.assign(new Error(`lines[${idx}].unitPrice must be > 0`), { statusCode: 400 });
+                    }
+                    const requestedIncomeAccountIds = Array.from(new Set(lines.map((l) => Number(l.incomeAccountId ?? 0)).filter((x) => x > 0)));
+                    if (requestedIncomeAccountIds.length > 0) {
+                        const incomeAccounts = await tx.account.findMany({
+                            where: { companyId, id: { in: requestedIncomeAccountIds }, type: AccountType.INCOME },
+                            select: { id: true },
+                        });
+                        const incomeIdSet = new Set(incomeAccounts.map((a) => a.id));
+                        for (const id of requestedIncomeAccountIds) {
+                            if (!incomeIdSet.has(id)) {
+                                throw Object.assign(new Error(`incomeAccountId ${id} must be an INCOME account in this company`), { statusCode: 400 });
+                            }
+                        }
+                    }
+                    const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
+                    let subtotal = new Prisma.Decimal(0);
+                    let taxAmount = new Prisma.Decimal(0);
+                    let total = new Prisma.Decimal(0);
+                    const computedLines = [];
+                    const incomeBuckets = new Map();
+                    for (const [idx, l] of lines.entries()) {
+                        const itemId = Number(l.itemId);
+                        const item = itemById.get(itemId);
+                        const qty = toMoneyDecimal(Number(l.quantity ?? 0));
+                        const unit = toMoneyDecimal(Number(l.unitPrice ?? 0));
+                        const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+                        const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+                        if (rate.lessThan(0) || rate.greaterThan(1)) {
+                            throw Object.assign(new Error(`lines[${idx}].taxRate must be between 0 and 1`), { statusCode: 400 });
+                        }
+                        const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
+                        const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+                        subtotal = subtotal.add(lineSubtotal);
+                        taxAmount = taxAmount.add(lineTax);
+                        total = total.add(lineTotal);
+                        const incomeAccountId = Number(l.incomeAccountId ?? 0) || salesIncomeAccountId;
+                        const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
+                        incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal).toDecimalPlaces(2)); // subtotal only (exclude tax)
+                        computedLines.push({
+                            companyId,
+                            itemId,
+                            invoiceLineId: Number(l.invoiceLineId ?? 0) || null,
+                            description: l.description ?? item?.name ?? null,
+                            quantity: qty,
+                            unitPrice: unit,
+                            lineTotal, // credit note stores subtotal+tax
+                            taxRate: rate,
+                            taxAmount: lineTax,
+                            incomeAccountId,
+                        });
+                    }
+                    subtotal = subtotal.toDecimalPlaces(2);
+                    taxAmount = taxAmount.toDecimalPlaces(2);
+                    total = total.toDecimalPlaces(2);
+                    const arId = cn.company.accountsReceivableAccountId;
+                    if (!arId)
+                        throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+                    const arAccount = await tx.account.findFirst({ where: { id: arId, companyId, type: AccountType.ASSET } });
+                    if (!arAccount)
+                        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), { statusCode: 400 });
+                    let taxPayableAccountId = null;
+                    if (taxAmount.greaterThan(0)) {
+                        const existing = await tx.account.findFirst({
+                            where: { companyId, type: AccountType.LIABILITY, code: '2100' },
+                            select: { id: true },
+                        });
+                        taxPayableAccountId = existing?.id ?? null;
+                        if (!taxPayableAccountId) {
+                            const created = await tx.account.create({
+                                data: {
+                                    companyId,
+                                    code: '2100',
+                                    name: 'Tax Payable',
+                                    type: AccountType.LIABILITY,
+                                    normalBalance: 'CREDIT',
+                                    reportGroup: 'OTHER_CURRENT_LIABILITY',
+                                    cashflowActivity: 'OPERATING',
+                                },
+                                select: { id: true },
+                            });
+                            taxPayableAccountId = created.id;
+                        }
+                    }
+                    // Desired posting JE for credit note: Dr Income(subtotal), Dr Tax Payable(tax), Cr AR(total)
+                    const desiredPostingLines = [
+                        ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amt]) => ({
+                            accountId: incomeAccountId,
+                            debit: amt.toDecimalPlaces(2),
+                            credit: new Prisma.Decimal(0),
+                        })),
+                        ...(taxAmount.greaterThan(0)
+                            ? [{ accountId: taxPayableAccountId, debit: taxAmount, credit: new Prisma.Decimal(0) }]
+                            : []),
+                        { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: total },
+                    ];
+                    const originalNet = computeNetByAccount((cn.journalEntry.lines ?? []).map((l) => ({
+                        accountId: l.accountId,
+                        debit: l.debit,
+                        credit: l.credit,
+                    })));
+                    const desiredNet = computeNetByAccount(desiredPostingLines);
+                    const deltaNet = diffNets(originalNet, desiredNet);
+                    const adjustmentLines = buildAdjustmentLinesFromNets(deltaNet);
+                    const priorAdjId = Number(cn.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: adjustmentDate,
+                            reason: `superseded by credit note adjustment: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'superseded' },
+                            },
+                        });
+                    }
+                    let adjustmentJournalEntryId = null;
+                    if (adjustmentLines.length > 0) {
+                        if (adjustmentLines.length < 2) {
+                            throw Object.assign(new Error('adjustment resulted in an invalid journal entry (needs >=2 lines)'), { statusCode: 400 });
+                        }
+                        const je = await postJournalEntry(tx, {
+                            companyId,
+                            date: adjustmentDate,
+                            description: `ADJUSTMENT for Credit Note ${cn.creditNoteNumber}: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                            lines: adjustmentLines,
+                        });
+                        adjustmentJournalEntryId = je.id;
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(je.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: je.id, companyId, source: 'CreditNoteAdjustment', creditNoteId: cn.id },
+                            },
+                        });
+                    }
+                    const before = { subtotal: cn.subtotal?.toString?.() ?? null, taxAmount: cn.taxAmount?.toString?.() ?? null, total: cn.total?.toString?.() ?? null };
+                    await tx.creditNote.update({
+                        where: { id: cn.id },
+                        data: {
+                            customerNotes: body.customerNotes === undefined ? cn.customerNotes ?? null : body.customerNotes,
+                            termsAndConditions: body.termsAndConditions === undefined ? cn.termsAndConditions ?? null : body.termsAndConditions,
+                            subtotal,
+                            taxAmount,
+                            total,
+                            lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
+                            updatedByUserId: request.user?.userId ?? null,
+                            lines: { deleteMany: {}, create: computedLines },
+                        },
+                    });
+                    const after = { subtotal: subtotal.toString(), taxAmount: taxAmount.toString(), total: total.toString() };
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'credit_note.adjust_posted',
+                        entityType: 'CreditNote',
+                        entityId: cn.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            creditNoteNumber: cn.creditNoteNumber,
+                            reason: String(body.reason).trim(),
+                            adjustmentDate,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                            adjustmentJournalEntryId,
+                            before,
+                            after,
+                        },
+                    });
+                    return {
+                        creditNoteId: cn.id,
+                        status: cn.status,
+                        adjustmentJournalEntryId,
+                        reversedPriorAdjustmentJournalEntryId,
+                        total: total.toString(),
+                    };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                creditNoteId: result.creditNoteId,
+                status: result.status,
+                adjustmentJournalEntryId: result.adjustmentJournalEntryId ?? null,
+                reversedPriorAdjustmentJournalEntryId: result.reversedPriorAdjustmentJournalEntryId ?? null,
+                total: result.total,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Void posted credit note (immutable ledger): marks credit note VOID and posts a reversal journal entry.
+    // Also reverses any inventory moves created by posting the credit note.
+    // POST /companies/:companyId/credit-notes/:creditNoteId/void
+    fastify.post('/companies/:companyId/credit-notes/:creditNoteId/void', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const creditNoteId = Number(request.params?.creditNoteId);
+        if (!companyId || Number.isNaN(creditNoteId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or creditNoteId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        const voidDate = parseDateInput(body.voidDate) ?? new Date();
+        if (body.voidDate && isNaN(voidDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid voidDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:credit-note:void:${companyId}:${creditNoteId}`;
+        try {
+            const preMoves = await prisma.stockMove.findMany({
+                where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
+                select: { warehouseId: true, itemId: true },
+            });
+            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`)));
+            const wrapped = async (fn) => stockLockKeys.length > 0
+                ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
+                : withLockBestEffort(redis, lockKey, 30_000, fn);
+            const { response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM CreditNote
+              WHERE id = ${creditNoteId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const cn = await tx.creditNote.findFirst({
+                        where: { id: creditNoteId, companyId },
+                        include: { journalEntry: { include: { lines: true } } },
+                    });
+                    if (!cn)
+                        throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+                    if (cn.status === 'VOID') {
+                        return { creditNoteId: cn.id, status: cn.status, voidJournalEntryId: cn.voidJournalEntryId ?? null, alreadyVoided: true };
+                    }
+                    if (cn.status !== 'POSTED')
+                        throw Object.assign(new Error('only POSTED credit notes can be voided'), { statusCode: 400 });
+                    if (!cn.journalEntryId || !cn.journalEntry) {
+                        throw Object.assign(new Error('credit note is POSTED but missing journal entry link'), { statusCode: 500 });
+                    }
+                    // Reverse active adjustment first (if any)
+                    const priorAdjId = Number(cn.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: voidDate,
+                            reason: `void credit note: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'void credit note' },
+                            },
+                        });
+                    }
+                    // Capture original inventory moves (if any) before we post reversal JE.
+                    const origMoves = await tx.stockMove.findMany({
+                        where: { companyId, referenceType: 'CreditNote', referenceId: String(cn.id) },
+                        select: { warehouseId: true, itemId: true, quantity: true, totalCostApplied: true },
+                    });
+                    const { reversal } = await createReversalJournalEntry(tx, {
+                        companyId,
+                        originalJournalEntryId: cn.journalEntryId,
+                        reversalDate: voidDate,
+                        reason: String(body.reason).trim(),
+                        createdByUserId: request.user?.userId ?? null,
+                    });
+                    // Reverse inventory moves exactly (same totalCostApplied) using OUT overrides.
+                    if ((origMoves ?? []).length > 0) {
+                        for (const m of origMoves) {
+                            await applyStockMoveWac(tx, {
+                                companyId,
+                                warehouseId: m.warehouseId,
+                                itemId: m.itemId,
+                                date: voidDate,
+                                type: 'ADJUSTMENT',
+                                direction: 'OUT',
+                                quantity: new Prisma.Decimal(m.quantity).toDecimalPlaces(2),
+                                unitCostApplied: new Prisma.Decimal(0),
+                                totalCostApplied: new Prisma.Decimal(m.totalCostApplied).toDecimalPlaces(2),
+                                referenceType: 'CreditNoteVoid',
+                                referenceId: String(cn.id),
+                                correlationId,
+                                createdByUserId: request.user?.userId ?? null,
+                                journalEntryId: null,
+                            });
+                        }
+                        await tx.stockMove.updateMany({
+                            where: { companyId, correlationId, journalEntryId: null, referenceType: 'CreditNoteVoid', referenceId: String(cn.id) },
+                            data: { journalEntryId: reversal.id },
+                        });
+                    }
+                    // Outbox events (created + reversed semantic)
+                    const createdEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: createdEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(cn.journalEntryId),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversal.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: cn.journalEntryId, source: 'CreditNoteVoid', creditNoteId: cn.id },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: createdEventId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(cn.journalEntryId),
+                            type: 'JournalEntryReversed',
+                            payload: { originalJournalEntryId: cn.journalEntryId, reversalJournalEntryId: reversal.id, companyId, reason: String(body.reason).trim() },
+                        },
+                    });
+                    const voidedAt = new Date();
+                    await tx.creditNote.update({
+                        where: { id: cn.id },
+                        data: {
+                            status: 'VOID',
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            voidJournalEntryId: reversal.id,
+                            lastAdjustmentJournalEntryId: null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await tx.journalEntry.updateMany({
+                        where: { id: cn.journalEntryId, companyId },
+                        data: {
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'credit_note.void',
+                        entityType: 'CreditNote',
+                        entityId: cn.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            reason: String(body.reason).trim(),
+                            voidDate,
+                            voidedAt,
+                            originalJournalEntryId: cn.journalEntryId,
+                            voidJournalEntryId: reversal.id,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                            inventoryMovesReversed: (origMoves ?? []).length,
+                        },
+                    });
+                    return { creditNoteId: cn.id, status: 'VOID', voidJournalEntryId: reversal.id };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { creditNoteId: result.creditNoteId, status: result.status, voidJournalEntryId: result.voidJournalEntryId };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
     });
     // Cleanest returns: create credit note directly from an invoice.
     // POST /companies/:companyId/invoices/:invoiceId/credit-notes
@@ -1647,7 +3299,7 @@ export async function booksRoutes(fastify) {
         }
         const inv = await prisma.invoice.findFirst({
             where: { id: invoiceId, companyId },
-            include: { customer: true, lines: { include: { item: true } }, company: true },
+            include: { customer: true, lines: invoiceLinesIncludeWithIncomeAccount, company: true },
         });
         if (!inv) {
             reply.status(404);
@@ -1720,12 +3372,14 @@ export async function booksRoutes(fastify) {
                 lineTotal,
                 taxRate: rate,
                 taxAmount: lineTax,
+                incomeAccountId: Number(r.invoiceLine.incomeAccountId ?? 0) || null,
             });
         }
         subtotal = subtotal.toDecimalPlaces(2);
         taxAmount = taxAmount.toDecimalPlaces(2);
         total = total.toDecimalPlaces(2);
         const created = await prisma.$transaction(async (tx) => {
+            const salesIncomeAccountId = await ensureSalesIncomeAccount(tx, companyId);
             const creditNoteNumber = await nextCreditNoteNumber(tx, companyId);
             return await tx.creditNote.create({
                 data: {
@@ -1739,9 +3393,14 @@ export async function booksRoutes(fastify) {
                     subtotal,
                     taxAmount,
                     total,
-                    lines: { create: computedLines },
+                    lines: {
+                        create: computedLines.map((l) => ({
+                            ...l,
+                            incomeAccountId: l.incomeAccountId ?? salesIncomeAccountId,
+                        })),
+                    },
                 },
-                include: { customer: true, lines: { include: { item: true } } },
+                include: { customer: true, lines: creditNoteLinesIncludeWithIncomeAccount },
             });
         });
         return created;
@@ -1758,7 +3417,7 @@ export async function booksRoutes(fastify) {
             where: { id: creditNoteId, companyId },
             include: {
                 customer: true,
-                lines: { include: { item: true } },
+                lines: creditNoteLinesIncludeWithIncomeAccount,
                 journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
             },
         });
@@ -1837,8 +3496,8 @@ export async function booksRoutes(fastify) {
                     });
                     if (!cn)
                         throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
-                    if (cn.status !== 'DRAFT') {
-                        throw Object.assign(new Error('only DRAFT credit notes can be posted'), { statusCode: 400 });
+                    if (cn.status !== 'DRAFT' && cn.status !== 'APPROVED') {
+                        throw Object.assign(new Error('only DRAFT/APPROVED credit notes can be posted'), { statusCode: 400 });
                     }
                     // CRITICAL FIX #1: Currency validation - ensure credit note currency matches company baseCurrency
                     const baseCurrency = (cn.company.baseCurrency ?? '').trim().toUpperCase() || null;
@@ -1881,7 +3540,10 @@ export async function booksRoutes(fastify) {
                         subtotal = subtotal.add(lineSubtotal);
                         taxAmount = taxAmount.add(lineTax);
                         total = total.add(lineTotal);
-                        const incomeAccountId = line.item?.incomeAccountId;
+                        const incomeAccountId = line.incomeAccountId ?? line.item?.incomeAccountId;
+                        if (!incomeAccountId) {
+                            throw Object.assign(new Error('credit note line is missing income account mapping'), { statusCode: 400 });
+                        }
                         const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
                         incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal));
                         const item = line.item;
@@ -2427,6 +4089,546 @@ export async function booksRoutes(fastify) {
             throw err;
         }
     });
+    // Delete expense (DRAFT/APPROVED only)
+    fastify.delete('/companies/:companyId/expenses/:expenseId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const expenseId = Number(request.params?.expenseId);
+        if (Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid expenseId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:expense:delete:${companyId}:${expenseId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Expense
+              WHERE id = ${expenseId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const ex = await tx.expense.findFirst({
+                        where: { id: expenseId, companyId },
+                        select: { id: true, status: true, expenseNumber: true, journalEntryId: true },
+                    });
+                    if (!ex)
+                        throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+                    if (ex.status !== 'DRAFT' && ex.status !== 'APPROVED') {
+                        throw Object.assign(new Error('only DRAFT/APPROVED expenses can be deleted'), { statusCode: 400 });
+                    }
+                    if (ex.journalEntryId) {
+                        throw Object.assign(new Error('cannot delete an expense that already has a journal entry'), { statusCode: 400 });
+                    }
+                    const payCount = await tx.expensePayment.count({ where: { companyId, expenseId: ex.id } });
+                    if (payCount > 0)
+                        throw Object.assign(new Error('cannot delete an expense that has payments'), { statusCode: 400 });
+                    await tx.expense.delete({ where: { id: ex.id } });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'expense.delete_unposted',
+                        entityType: 'Expense',
+                        entityId: ex.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: { expenseNumber: ex.expenseNumber, status: ex.status, occurredAt },
+                    });
+                    return { expenseId: ex.id, deleted: true };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { expenseId: result.expenseId, deleted: true };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Approve expense (DRAFT -> APPROVED)
+    fastify.post('/companies/:companyId/expenses/:expenseId/approve', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const expenseId = Number(request.params?.expenseId);
+        if (Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid expenseId' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const updated = await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw `
+        SELECT id FROM Expense
+        WHERE id = ${expenseId} AND companyId = ${companyId}
+        FOR UPDATE
+      `;
+            const ex = await tx.expense.findFirst({
+                where: { id: expenseId, companyId },
+                select: { id: true, status: true, journalEntryId: true, expenseNumber: true },
+            });
+            if (!ex)
+                throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+            if (ex.status !== 'DRAFT')
+                throw Object.assign(new Error('only DRAFT expenses can be approved'), { statusCode: 400 });
+            if (ex.journalEntryId)
+                throw Object.assign(new Error('cannot approve an expense that already has a journal entry'), { statusCode: 400 });
+            const upd = await tx.expense.update({
+                where: { id: ex.id },
+                data: { status: 'APPROVED', updatedByUserId: request.user?.userId ?? null },
+                select: { id: true, status: true, expenseNumber: true },
+            });
+            await writeAuditLog(tx, {
+                companyId,
+                userId: request.user?.userId ?? null,
+                action: 'expense.approve',
+                entityType: 'Expense',
+                entityId: ex.id,
+                idempotencyKey: request.headers?.['idempotency-key'] ?? null,
+                correlationId,
+                metadata: { expenseNumber: ex.expenseNumber, fromStatus: 'DRAFT', toStatus: 'APPROVED', occurredAt },
+            });
+            return upd;
+        });
+        return updated;
+    });
+    // Adjust posted expense (immutable ledger): updates the document and posts an ADJUSTMENT journal entry (delta vs original posting).
+    // POST /companies/:companyId/expenses/:expenseId/adjust
+    fastify.post('/companies/:companyId/expenses/:expenseId/adjust', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const expenseId = Number(request.params?.expenseId);
+        if (Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid expenseId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        if (body.amount === undefined || body.amount === null || Number(body.amount) <= 0) {
+            reply.status(400);
+            return { error: 'amount (>0) is required' };
+        }
+        if (!body.description || !String(body.description).trim()) {
+            reply.status(400);
+            return { error: 'description is required' };
+        }
+        const adjustmentDate = parseDateInput(body.adjustmentDate) ?? new Date();
+        if (body.adjustmentDate && isNaN(adjustmentDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid adjustmentDate' };
+        }
+        const dueDate = body.dueDate === undefined ? undefined : body.dueDate === null ? null : parseDateInput(body.dueDate);
+        if (body.dueDate && dueDate && isNaN(dueDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid dueDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:expense:adjust:${companyId}:${expenseId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Expense
+              WHERE id = ${expenseId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const ex = await tx.expense.findFirst({
+                        where: { id: expenseId, companyId },
+                        include: { company: true, journalEntry: { include: { lines: true } } },
+                    });
+                    if (!ex)
+                        throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+                    if (ex.status !== 'POSTED') {
+                        throw Object.assign(new Error('only POSTED expenses can be adjusted'), { statusCode: 400 });
+                    }
+                    if (!ex.journalEntryId || !ex.journalEntry) {
+                        throw Object.assign(new Error('expense is POSTED but missing journal entry link'), { statusCode: 500 });
+                    }
+                    const payCount = await tx.expensePayment.count({ where: { companyId, expenseId: ex.id, reversedAt: null } });
+                    if (payCount > 0) {
+                        throw Object.assign(new Error('cannot adjust an expense that has payments (reverse payments first)'), { statusCode: 400 });
+                    }
+                    // Tenant-safe validations for referenced entities.
+                    if (body.vendorId) {
+                        const vendor = await tx.vendor.findFirst({ where: { id: body.vendorId, companyId } });
+                        if (!vendor)
+                            throw Object.assign(new Error('vendorId not found in this company'), { statusCode: 400 });
+                    }
+                    if (body.expenseAccountId) {
+                        const expAcc = await tx.account.findFirst({
+                            where: { id: body.expenseAccountId, companyId, type: AccountType.EXPENSE },
+                        });
+                        if (!expAcc)
+                            throw Object.assign(new Error('expenseAccountId must be an EXPENSE account in this company'), { statusCode: 400 });
+                    }
+                    // Only support AP-style posting for adjustment (Dr Expense / Cr AP). If this was paid immediately (Cr Bank),
+                    // require void + recreate (keeps cash audit clean).
+                    const apId = ex.company.accountsPayableAccountId;
+                    if (!apId)
+                        throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
+                    const apLine = (ex.journalEntry.lines ?? []).find((l) => l.accountId === apId);
+                    if (!apLine) {
+                        throw Object.assign(new Error('cannot adjust a cash-paid expense (void + recreate)'), { statusCode: 400 });
+                    }
+                    const desiredAmount = toMoneyDecimal(Number(body.amount));
+                    const desiredExpenseAccountId = Number(body.expenseAccountId ?? ex.expenseAccountId ?? 0) || null;
+                    if (!desiredExpenseAccountId) {
+                        throw Object.assign(new Error('expenseAccountId is required to adjust a posted expense'), { statusCode: 400 });
+                    }
+                    const desiredPostingLines = [
+                        { accountId: desiredExpenseAccountId, debit: desiredAmount, credit: new Prisma.Decimal(0) },
+                        { accountId: apId, debit: new Prisma.Decimal(0), credit: desiredAmount },
+                    ];
+                    const originalNet = computeNetByAccount((ex.journalEntry.lines ?? []).map((l) => ({
+                        accountId: l.accountId,
+                        debit: l.debit,
+                        credit: l.credit,
+                    })));
+                    const desiredNet = computeNetByAccount(desiredPostingLines);
+                    const deltaNet = diffNets(originalNet, desiredNet);
+                    const adjustmentLines = buildAdjustmentLinesFromNets(deltaNet);
+                    const priorAdjId = Number(ex.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: adjustmentDate,
+                            reason: `superseded by expense adjustment: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'superseded' },
+                            },
+                        });
+                    }
+                    let adjustmentJournalEntryId = null;
+                    if (adjustmentLines.length > 0) {
+                        if (adjustmentLines.length < 2) {
+                            throw Object.assign(new Error('adjustment resulted in an invalid journal entry (needs >=2 lines)'), { statusCode: 400 });
+                        }
+                        const je = await postJournalEntry(tx, {
+                            companyId,
+                            date: adjustmentDate,
+                            description: `ADJUSTMENT for Expense ${ex.expenseNumber}: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                            lines: adjustmentLines,
+                        });
+                        adjustmentJournalEntryId = je.id;
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(je.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: je.id, companyId, source: 'ExpenseAdjustment', expenseId: ex.id },
+                            },
+                        });
+                    }
+                    const before = { amount: new Prisma.Decimal(ex.amount).toDecimalPlaces(2).toString(), expenseAccountId: ex.expenseAccountId ?? null };
+                    await tx.expense.update({
+                        where: { id: ex.id },
+                        data: {
+                            vendorId: body.vendorId === undefined ? ex.vendorId ?? null : body.vendorId ?? null,
+                            dueDate: dueDate === undefined ? ex.dueDate ?? null : dueDate,
+                            description: String(body.description).trim(),
+                            amount: desiredAmount,
+                            expenseAccountId: desiredExpenseAccountId,
+                            lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    const after = { amount: desiredAmount.toString(), expenseAccountId: desiredExpenseAccountId };
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'expense.adjust_posted',
+                        entityType: 'Expense',
+                        entityId: ex.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            expenseNumber: ex.expenseNumber,
+                            reason: String(body.reason).trim(),
+                            adjustmentDate,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                            adjustmentJournalEntryId,
+                            before,
+                            after,
+                        },
+                    });
+                    return { expenseId: ex.id, status: ex.status, adjustmentJournalEntryId, reversedPriorAdjustmentJournalEntryId, amount: desiredAmount.toString() };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                expenseId: result.expenseId,
+                status: result.status,
+                adjustmentJournalEntryId: result.adjustmentJournalEntryId ?? null,
+                reversedPriorAdjustmentJournalEntryId: result.reversedPriorAdjustmentJournalEntryId ?? null,
+                amount: result.amount,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Void posted expense (immutable ledger): marks expense VOID and posts a reversal journal entry.
+    // POST /companies/:companyId/expenses/:expenseId/void
+    fastify.post('/companies/:companyId/expenses/:expenseId/void', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const expenseId = Number(request.params?.expenseId);
+        if (Number.isNaN(expenseId)) {
+            reply.status(400);
+            return { error: 'invalid expenseId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.reason || !String(body.reason).trim()) {
+            reply.status(400);
+            return { error: 'reason is required' };
+        }
+        const voidDate = parseDateInput(body.voidDate) ?? new Date();
+        if (body.voidDate && isNaN(voidDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid voidDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:expense:void:${companyId}:${expenseId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM Expense
+              WHERE id = ${expenseId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const ex = await tx.expense.findFirst({
+                        where: { id: expenseId, companyId },
+                        include: { journalEntry: { include: { lines: true } } },
+                    });
+                    if (!ex)
+                        throw Object.assign(new Error('expense not found'), { statusCode: 404 });
+                    if (ex.status === 'VOID') {
+                        return { expenseId: ex.id, status: ex.status, voidJournalEntryId: ex.voidJournalEntryId ?? null, alreadyVoided: true };
+                    }
+                    if (ex.status !== 'POSTED')
+                        throw Object.assign(new Error('only POSTED expenses can be voided'), { statusCode: 400 });
+                    if (!ex.journalEntryId || !ex.journalEntry)
+                        throw Object.assign(new Error('expense is POSTED but missing journal entry link'), { statusCode: 500 });
+                    const payCount = await tx.expensePayment.count({ where: { companyId, expenseId: ex.id, reversedAt: null } });
+                    if (payCount > 0)
+                        throw Object.assign(new Error('cannot void an expense that has payments (reverse payments first)'), { statusCode: 400 });
+                    const priorAdjId = Number(ex.lastAdjustmentJournalEntryId ?? 0) || null;
+                    let reversedPriorAdjustmentJournalEntryId = null;
+                    if (priorAdjId) {
+                        const { reversal } = await createReversalJournalEntry(tx, {
+                            companyId,
+                            originalJournalEntryId: priorAdjId,
+                            reversalDate: voidDate,
+                            reason: `void expense: ${String(body.reason).trim()}`,
+                            createdByUserId: request.user?.userId ?? null,
+                        });
+                        reversedPriorAdjustmentJournalEntryId = reversal.id;
+                        const createdEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: createdEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: String(priorAdjId),
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(reversal.id),
+                                type: 'JournalEntryCreated',
+                                payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: priorAdjId },
+                            },
+                        });
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: randomUUID(),
+                                eventType: 'journal.entry.reversed',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                causationId: createdEventId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(priorAdjId),
+                                type: 'JournalEntryReversed',
+                                payload: { originalJournalEntryId: priorAdjId, reversalJournalEntryId: reversal.id, companyId, reason: 'void expense' },
+                            },
+                        });
+                    }
+                    const { reversal } = await createReversalJournalEntry(tx, {
+                        companyId,
+                        originalJournalEntryId: ex.journalEntryId,
+                        reversalDate: voidDate,
+                        reason: String(body.reason).trim(),
+                        createdByUserId: request.user?.userId ?? null,
+                    });
+                    const createdEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: createdEventId,
+                            eventType: 'journal.entry.created',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: String(ex.journalEntryId),
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversal.id),
+                            type: 'JournalEntryCreated',
+                            payload: { journalEntryId: reversal.id, companyId, reversalOfJournalEntryId: ex.journalEntryId, source: 'ExpenseVoid', expenseId: ex.id },
+                        },
+                    });
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: randomUUID(),
+                            eventType: 'journal.entry.reversed',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: createdEventId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(ex.journalEntryId),
+                            type: 'JournalEntryReversed',
+                            payload: { originalJournalEntryId: ex.journalEntryId, reversalJournalEntryId: reversal.id, companyId, reason: String(body.reason).trim() },
+                        },
+                    });
+                    const voidedAt = new Date();
+                    await tx.expense.update({
+                        where: { id: ex.id },
+                        data: {
+                            status: 'VOID',
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            voidJournalEntryId: reversal.id,
+                            lastAdjustmentJournalEntryId: null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await tx.journalEntry.updateMany({
+                        where: { id: ex.journalEntryId, companyId },
+                        data: {
+                            voidedAt,
+                            voidReason: String(body.reason).trim(),
+                            voidedByUserId: request.user?.userId ?? null,
+                            updatedByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'expense.void',
+                        entityType: 'Expense',
+                        entityId: ex.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            reason: String(body.reason).trim(),
+                            voidDate,
+                            voidedAt,
+                            originalJournalEntryId: ex.journalEntryId,
+                            voidJournalEntryId: reversal.id,
+                            priorAdjustmentJournalEntryId: priorAdjId,
+                            reversedPriorAdjustmentJournalEntryId,
+                        },
+                    });
+                    return { expenseId: ex.id, status: 'VOID', voidJournalEntryId: reversal.id };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return { expenseId: result.expenseId, status: result.status, voidJournalEntryId: result.voidJournalEntryId };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
     // Create bill (DRAFT)
     fastify.post('/companies/:companyId/expenses', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -2513,8 +4715,8 @@ export async function booksRoutes(fastify) {
                     });
                     if (!bill)
                         throw Object.assign(new Error('expense not found'), { statusCode: 404 });
-                    if (bill.status !== 'DRAFT') {
-                        throw Object.assign(new Error('only DRAFT bills can be posted'), { statusCode: 400 });
+                    if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
+                        throw Object.assign(new Error('only DRAFT/APPROVED bills can be posted'), { statusCode: 400 });
                     }
                     if (!bill.expenseAccountId) {
                         throw Object.assign(new Error('expenseAccountId is required to post a bill'), { statusCode: 400 });

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Maskable icons should keep important content away from edges -->
+  <rect width="512" height="512" fill="#020617"/>
+  <circle cx="256" cy="256" r="190" fill="#0f172a"/>
+  <path d="M140 312c0-72.902 59.098-132 132-132s132 59.098 132 132" fill="none" stroke="#38bdf8" stroke-width="44" stroke-linecap="round"/>
+  <path d="M186 312c0-47.497 38.503-86 86-86s86 38.503 86 86" fill="none" stroke="#e2e8f0" stroke-opacity="0.9" stroke-width="24" stroke-linecap="round"/>
+  <circle cx="272" cy="312" r="22" fill="#22c55e"/>
+</svg>
+
+

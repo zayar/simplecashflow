@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
 import { useParams } from "next/navigation"
 import { ArrowLeft } from "lucide-react"
@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatDateTimeInTimeZone } from "@/lib/utils"
+import { AddTransaction } from "@/components/banking/add-transaction"
 import {
   Table,
   TableBody,
@@ -36,13 +37,20 @@ export default function BankingAccountDetailPage() {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!user?.companyId || !id) return;
     setLoading(true);
-    fetchApi(`/companies/${user.companyId}/banking-accounts/${id}`)
-      .then(setData)
-      .finally(() => setLoading(false));
+    try {
+      const res = await fetchApi(`/companies/${user.companyId}/banking-accounts/${id}`);
+      setData(res);
+    } finally {
+      setLoading(false);
+    }
   }, [user?.companyId, id]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const balanceLabel = useMemo(() => {
     if (!data) return '';
@@ -114,20 +122,33 @@ export default function BankingAccountDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-4">
-        <Link href="/banking">
-          <Button variant="ghost" size="icon">
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-        </Link>
-        <div className="min-w-0 space-y-1">
-          <h1 className="truncate text-2xl font-semibold tracking-tight">
-            {data.account?.name}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {data.kind} • COA {data.account?.code} • {data.bankName ?? "—"}
-          </p>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-4">
+          <Link href="/banking">
+            <Button variant="ghost" size="icon">
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          </Link>
+          <div className="min-w-0 space-y-1">
+            <h1 className="truncate text-2xl font-semibold tracking-tight">
+              {data.account?.name}
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              {data.kind} • COA {data.account?.code} • {data.bankName ?? "—"}
+            </p>
+          </div>
         </div>
+
+        {user?.companyId && data?.account?.id ? (
+          <AddTransaction
+            companyId={user.companyId}
+            timeZone={tz}
+            bankKind={data.kind}
+            bankAccountCoaId={Number(data.account.id)}
+            bankAccountLabel={`${data.kind} • ${data.account.code} - ${data.account.name}`}
+            onDone={load}
+          />
+        ) : null}
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">

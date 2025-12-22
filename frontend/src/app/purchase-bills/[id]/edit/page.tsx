@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Loader2, Plus } from 'lucide-react';
+import { ArrowLeft, Loader2, Plus, Trash2 } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getAccounts, getVendors, Account, Vendor } from '@/lib/api';

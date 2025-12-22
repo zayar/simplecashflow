@@ -129,6 +129,20 @@ export default function InvoiceDetailPage() {
     }
   }
 
+  const deleteInvoice = async () => {
+    if (!user?.companyId || !invoiceId) return
+    if (!confirm("Delete this invoice? This is only allowed for DRAFT/APPROVED invoices.")) return
+    try {
+      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`, {
+        method: "DELETE",
+      })
+      router.push("/invoices")
+    } catch (err: any) {
+      console.error(err)
+      alert(err?.message ?? "Failed to delete invoice")
+    }
+  }
+
   const reversePayment = async (paymentId: number, reason?: string) => {
     if (!user?.companyId || !invoiceId) return
     setReversingPaymentId(paymentId)
@@ -324,6 +338,17 @@ export default function InvoiceDetailPage() {
               >
                 Create Credit Note (Return)
               </DropdownMenuItem>
+              {invoice.status !== "POSTED" &&
+              invoice.status !== "PAID" &&
+              invoice.status !== "PARTIAL" &&
+              !invoice.journalEntryId ? (
+                <DropdownMenuItem
+                  onClick={deleteInvoice}
+                  className="text-destructive focus:text-destructive"
+                >
+                  Delete invoice
+                </DropdownMenuItem>
+              ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

@@ -6,6 +6,14 @@ export type StockMoveInput = {
   warehouseId: number;
   itemId: number;
   date: Date;
+  /**
+   * Inventory engine v1 stores only the current StockBalance (not a dated ledger of balances).
+   * To keep WAC and "no oversell" correct, we must apply stock moves in chronological order.
+   *
+   * If allowBackdated is false (default), we reject moves dated earlier than the latest StockMove
+   * for the same (companyId, warehouseId, itemId).
+   */
+  allowBackdated?: boolean;
   type:
     | 'OPENING'
     | 'ADJUSTMENT'
@@ -234,6 +242,26 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
     itemId: input.itemId,
   });
 
+  // Prevent backdated stock moves (fixes "sell 7 after buying 4" when a sale is posted later but backdated).
+  // Without this, StockBalance represents "now", so a backdated sale can incorrectly pass the stock check
+  // after later purchases were already posted.
+  if (!input.allowBackdated) {
+    const lastMove = await (tx as any).stockMove.findFirst({
+      where: { companyId: input.companyId, warehouseId: input.warehouseId, itemId: input.itemId },
+      orderBy: [{ date: 'desc' }, { id: 'desc' }],
+      select: { date: true },
+    });
+    if (lastMove?.date && input.date.getTime() < new Date(lastMove.date).getTime()) {
+      throw Object.assign(
+        new Error(
+          `cannot backdate stock movement before latest movement date (${new Date(lastMove.date).toISOString().slice(0, 10)}). ` +
+            `Post documents in chronological order or use today's date.`
+        ),
+        { statusCode: 400, latestStockMoveDate: new Date(lastMove.date).toISOString() }
+      );
+    }
+  }
+
   const Q = existing ? new Prisma.Decimal(existing.qtyOnHand) : d0();
   const A = existing ? new Prisma.Decimal(existing.avgUnitCost) : d0();
   const V = existing ? new Prisma.Decimal(existing.inventoryValue) : d0();
@@ -249,8 +277,17 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
       });
     }
 
-    const unitCost = d2(A);
-    const outValue = d2(qty.mul(unitCost));
+    // Default WAC OUT: use current average cost.
+    // Optional override: allow caller to specify totalCostApplied for exact reversal flows
+    // (e.g., voiding a receipt/return at the originally applied unit cost).
+    const overrideOutValue = input.totalCostApplied !== undefined && input.totalCostApplied !== null;
+    const outValue = overrideOutValue
+      ? d2(new Prisma.Decimal(input.totalCostApplied!))
+      : d2(qty.mul(d2(A)));
+    if (outValue.lessThan(0)) {
+      throw Object.assign(new Error('totalCostApplied cannot be negative'), { statusCode: 400 });
+    }
+    const unitCost = qty.greaterThan(0) ? d2(outValue.div(qty)) : d2(A);
     const newQ = d2(Q.sub(qty));
     const newV = d2(V.sub(outValue));
     const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : unitCost;

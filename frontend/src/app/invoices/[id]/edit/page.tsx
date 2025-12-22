@@ -17,6 +17,13 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 type TaxOption = { id: number; name: string; ratePercent: number; type: 'rate' | 'group' };
 
@@ -359,18 +366,20 @@ export default function EditInvoicePage() {
                               />
                             </TableCell>
                             <TableCell className="align-top">
-                              <div className="relative">
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  className="w-full justify-between px-2"
-                                  onClick={() => setOpenTaxIdx(openTaxIdx === index ? null : index)}
-                                >
+                              <DropdownMenu
+                                open={openTaxIdx === index}
+                                onOpenChange={(open) => {
+                                  setOpenTaxIdx(open ? index : null);
+                                  if (!open) setTaxSearchTerm('');
+                                }}
+                              >
+                                <DropdownMenuTrigger asChild>
+                                  <Button type="button" variant="outline" className="w-full justify-between px-2">
                                   <span className="truncate text-xs">{(line as any).taxLabel || 'Tax'}</span>
                                   <ChevronDown className="h-4 w-4" />
                                 </Button>
-                                {openTaxIdx === index ? (
-                                  <div className="absolute right-0 z-50 mt-1 w-[280px] rounded-md border bg-background shadow">
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-[280px] p-0">
                                     <div className="p-2 border-b">
                                       <div className="relative">
                                         <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -388,11 +397,10 @@ export default function EditInvoicePage() {
                                         .filter((t) => t.type === 'rate')
                                         .filter((t) => t.name.toLowerCase().includes(taxSearchTerm.toLowerCase()))
                                         .map((t) => (
-                                          <button
+                                        <DropdownMenuItem
                                             key={`rate-${t.id}`}
-                                            type="button"
-                                            className="w-full rounded px-3 py-2 text-left text-sm hover:bg-muted"
-                                            onClick={() => {
+                                          onSelect={(e) => {
+                                            e.preventDefault();
                                               updateLine(index, 'taxRate', t.ratePercent / 100);
                                               updateLine(index, 'taxLabel', t.name);
                                               setOpenTaxIdx(null);
@@ -400,17 +408,17 @@ export default function EditInvoicePage() {
                                             }}
                                           >
                                             {t.name}
-                                          </button>
+                                        </DropdownMenuItem>
                                         ))}
-                                      <div className="mt-2 border-t pt-2">
-                                        <Link href="/taxes" className="text-sm text-primary hover:underline">
+                                    <DropdownMenuSeparator />
+                                    <DropdownMenuItem asChild>
+                                      <Link href="/taxes" className="text-sm text-primary">
                                           + New Tax
                                         </Link>
-                                      </div>
-                                    </div>
+                                    </DropdownMenuItem>
                                   </div>
-                                ) : null}
-                              </div>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </TableCell>
                             <TableCell className="align-top">
                               <Input disabled className="text-right" value="0.00" />

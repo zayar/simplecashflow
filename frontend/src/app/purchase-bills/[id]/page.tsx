@@ -102,6 +102,17 @@ export default function PurchaseBillDetailPage() {
     }
   };
 
+  const deleteBill = async () => {
+    if (!user?.companyId || !id || Number.isNaN(id)) return;
+    if (!confirm('Delete this purchase bill? This is only allowed for DRAFT/APPROVED bills.')) return;
+    try {
+      await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}`, { method: 'DELETE' });
+      if (typeof window !== 'undefined') window.location.assign('/purchase-bills');
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to delete purchase bill');
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-4">
@@ -132,6 +143,11 @@ export default function PurchaseBillDetailPage() {
                 <Pencil className="h-4 w-4" /> Edit
               </span>
             </Link>
+          ) : null}
+          {bill?.status === 'DRAFT' || bill?.status === 'APPROVED' ? (
+            <Button variant="destructive" onClick={deleteBill}>
+              Delete
+            </Button>
           ) : null}
           {bill?.status === 'DRAFT' ? (
             <Button

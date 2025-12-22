@@ -13,6 +13,13 @@ import { SelectNative } from '@/components/ui/select-native';
 import { Separator } from '@/components/ui/separator';
 import { todayInTimeZone } from '@/lib/utils';
 import Link from 'next/link';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 type TaxOption = {
   id: number
@@ -323,20 +330,21 @@ export default function NewInvoiceWithTaxPage() {
                         onChange={(e) => updateLine(index, 'unitPrice', Number(e.target.value) || 0)}
                       />
                     </div>
-                    <div className="col-span-2 relative">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="w-full justify-between text-sm"
-                        onClick={() => setShowTaxDropdown(showTaxDropdown === index ? null : index)}
+                    <div className="col-span-2">
+                      <DropdownMenu
+                        open={showTaxDropdown === index}
+                        onOpenChange={(open) => {
+                          setShowTaxDropdown(open ? index : null);
+                          if (!open) setTaxSearchTerm('');
+                        }}
                       >
+                        <DropdownMenuTrigger asChild>
+                          <Button type="button" variant="outline" size="sm" className="w-full justify-between text-sm">
                         <span className="truncate">{getTaxLabel(line)}</span>
                         <ChevronDown className="h-4 w-4 ml-1 flex-shrink-0" />
                       </Button>
-                      
-                      {showTaxDropdown === index && (
-                        <div className="absolute top-full left-0 mt-1 w-64 bg-white border rounded-md shadow-lg z-50">
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-64 p-0">
                           <div className="p-2 border-b">
                             <div className="relative">
                               <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -348,58 +356,50 @@ export default function NewInvoiceWithTaxPage() {
                               />
                             </div>
                           </div>
-                          <div className="max-h-64 overflow-y-auto">
-                            {/* Taxes Section */}
-                            <div className="p-2">
-                              <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
-                                Taxes
-                              </div>
+                          <div className="max-h-64 overflow-y-auto p-2">
+                            <div className="px-2 py-1 text-xs font-medium text-muted-foreground">Taxes</div>
                               {taxOptions
                                 .filter((opt) => opt.type === 'rate' && opt.name.toLowerCase().includes(taxSearchTerm.toLowerCase()))
                                 .map((opt) => (
-                                  <button
+                                <DropdownMenuItem
                                     key={`rate-${opt.id}`}
-                                    type="button"
-                                    onClick={() => selectTax(index, opt)}
-                                    className="w-full text-left px-3 py-2 hover:bg-primary hover:text-primary-foreground rounded text-sm"
+                                  onSelect={(e) => {
+                                    e.preventDefault();
+                                    selectTax(index, opt);
+                                  }}
                                   >
                                     {opt.name}
-                                  </button>
+                                </DropdownMenuItem>
                                 ))}
-                            </div>
 
-                            {/* Tax Group Section */}
-                            <div className="p-2 border-t">
-                              <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
-                                Tax Group
-                              </div>
+                            <DropdownMenuSeparator />
+                            <div className="px-2 py-1 text-xs font-medium text-muted-foreground">Tax Group</div>
                               {taxOptions
                                 .filter((opt) => opt.type === 'group' && opt.name.toLowerCase().includes(taxSearchTerm.toLowerCase()))
                                 .map((opt) => (
-                                  <button
+                                <DropdownMenuItem
                                     key={`group-${opt.id}`}
-                                    type="button"
-                                    onClick={() => selectTax(index, opt)}
-                                    className="w-full text-left px-3 py-2 hover:bg-primary hover:text-primary-foreground rounded text-sm"
+                                  onSelect={(e) => {
+                                    e.preventDefault();
+                                    selectTax(index, opt);
+                                  }}
                                   >
                                     {opt.name}
-                                  </button>
+                                </DropdownMenuItem>
                                 ))}
-                            </div>
 
-                            {/* New Tax Link */}
-                            <div className="p-2 border-t">
-                              <Link
-                                href="/taxes/new"
-                                className="flex items-center gap-2 px-3 py-2 text-sm text-primary hover:bg-muted rounded"
-                              >
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem asChild>
+                              <Link href="/taxes/new" className="text-sm text-primary">
+                                <span className="inline-flex items-center gap-2">
                                 <Plus className="h-4 w-4" />
                                 New Tax
+                                </span>
                               </Link>
-                            </div>
+                            </DropdownMenuItem>
                           </div>
-                        </div>
-                      )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                     <div className="col-span-3 text-right text-sm font-medium tabular-nums">
                       {lineTotal.toFixed(2)}

@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input';
 import { SelectNative } from '@/components/ui/select-native';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { todayInTimeZone } from '@/lib/utils';
+import Link from 'next/link';
 
 export default function InventoryValuationReportPage() {
   const { user, companySettings } = useAuth();
@@ -49,6 +50,11 @@ export default function InventoryValuationReportPage() {
   }, [user?.companyId]);
 
   const totals = useMemo(() => data?.totals ?? null, [data]);
+  const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const yearStart = useMemo(() => {
+    const d = new Date(`${asOf || todayInTimeZone(tz)}T00:00:00.000Z`);
+    return `${d.getUTCFullYear()}-01-01`;
+  }, [asOf, tz]);
 
   return (
     <div className="space-y-6">
@@ -97,7 +103,20 @@ export default function InventoryValuationReportPage() {
             <TableBody>
               {(data?.rows ?? []).map((r: any) => (
                 <TableRow key={`${r.warehouseId}-${r.itemId}`}>
-                  <TableCell className="font-medium">{r.itemName}</TableCell>
+                  <TableCell className="font-medium">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="truncate">{r.itemName}</span>
+                      <Link
+                        className="text-xs underline text-muted-foreground"
+                        href={`/reports/inventory-valuation/${r.itemId}?from=${encodeURIComponent(
+                          yearStart
+                        )}&to=${encodeURIComponent(asOf)}${warehouseId ? `&warehouseId=${encodeURIComponent(warehouseId)}` : `&warehouseId=${encodeURIComponent(String(r.warehouseId))}`}`}
+                        title="View item valuation details"
+                      >
+                        Details
+                      </Link>
+                    </div>
+                  </TableCell>
                   <TableCell className="text-muted-foreground">{r.warehouseName}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyOnHand ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.avgUnitCost ?? 0).toLocaleString()}</TableCell>

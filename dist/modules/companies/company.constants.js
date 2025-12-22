@@ -29,6 +29,20 @@ export const DEFAULT_ACCOUNTS = [
         cashflowActivity: CashflowActivity.OPERATING,
     },
     {
+        code: "1500",
+        name: "Equipment",
+        type: AccountType.ASSET,
+        reportGroup: AccountReportGroup.FIXED_ASSET,
+        cashflowActivity: CashflowActivity.INVESTING,
+    },
+    {
+        code: "1510",
+        name: "Furniture & Fixtures",
+        type: AccountType.ASSET,
+        reportGroup: AccountReportGroup.FIXED_ASSET,
+        cashflowActivity: CashflowActivity.INVESTING,
+    },
+    {
         code: "2000",
         name: "Accounts Payable",
         type: AccountType.LIABILITY,

@@ -5,6 +5,14 @@ export type StockMoveInput = {
     warehouseId: number;
     itemId: number;
     date: Date;
+    /**
+     * Inventory engine v1 stores only the current StockBalance (not a dated ledger of balances).
+     * To keep WAC and "no oversell" correct, we must apply stock moves in chronological order.
+     *
+     * If allowBackdated is false (default), we reject moves dated earlier than the latest StockMove
+     * for the same (companyId, warehouseId, itemId).
+     */
+    allowBackdated?: boolean;
     type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'SALE_RETURN' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
     direction: 'IN' | 'OUT';
     quantity: Prisma.Decimal;

@@ -135,12 +135,18 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
             await ensureWarehouse(tx as any, companyId, warehouseId);
 
             let totalValue = new Prisma.Decimal(0);
-            const moves: any[] = [];
+            const appliedLines: Array<{
+              itemId: number;
+              quantity: string;
+              unitCostApplied: string;
+              totalCostApplied: string;
+              stockMoveId: number;
+            }> = [];
 
             for (const [idx, l] of (body.lines ?? []).entries()) {
               const itemId = Number(l.itemId);
-              const qty = l.quantity ?? 0;
-              const unitCost = l.unitCost ?? 0;
+              const qty = Number(l.quantity ?? 0);
+              const unitCost = Number(l.unitCost ?? 0);
               if (!itemId || Number.isNaN(itemId)) {
                 throw Object.assign(new Error(`lines[${idx}].itemId is required`), { statusCode: 400 });
               }
@@ -170,7 +176,13 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               });
 
               totalValue = totalValue.add(new Prisma.Decimal(applied.totalCostApplied));
-              moves.push(applied.move);
+              appliedLines.push({
+                itemId,
+                quantity: new Prisma.Decimal(applied.move.quantity).toString(),
+                unitCostApplied: new Prisma.Decimal(applied.move.unitCostApplied).toString(),
+                totalCostApplied: new Prisma.Decimal(applied.move.totalCostApplied).toString(),
+                stockMoveId: applied.move.id,
+              });
             }
 
             totalValue = totalValue.toDecimalPlaces(2);
@@ -229,7 +241,13 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               },
             });
 
-            return { journalEntryId: je.id, totalValue: totalValue.toString(), warehouseId, _jeEventId: jeEventId };
+            return {
+              journalEntryId: je.id,
+              totalValue: totalValue.toString(),
+              warehouseId,
+              lines: appliedLines,
+              _jeEventId: jeEventId,
+            };
           });
 
           return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
@@ -242,6 +260,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       warehouseId: (result as any).warehouseId,
       journalEntryId: (result as any).journalEntryId,
       totalValue: (result as any).totalValue,
+      lines: (result as any).lines ?? [],
     };
   });
 
@@ -617,6 +636,180 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     };
   });
 
+  // Inventory valuation detail for a single item over a date range (ledger-style)
+  // GET /companies/:companyId/reports/inventory-valuation/items/:itemId?from=YYYY-MM-DD&to=YYYY-MM-DD&warehouseId=...
+  fastify.get('/companies/:companyId/reports/inventory-valuation/items/:itemId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const itemId = Number((request.params as any)?.itemId);
+    if (!Number.isInteger(itemId) || itemId <= 0) {
+      reply.status(400);
+      return { error: 'invalid itemId' };
+    }
+
+    const q = request.query as { from?: string; to?: string; warehouseId?: string };
+    const from = parseDateInput(q.from) ?? null;
+    const to = parseDateInput(q.to) ?? null;
+    if (!from) {
+      reply.status(400);
+      return { error: 'from is required (YYYY-MM-DD)' };
+    }
+    if (!to) {
+      reply.status(400);
+      return { error: 'to is required (YYYY-MM-DD)' };
+    }
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+      reply.status(400);
+      return { error: 'invalid from/to' };
+    }
+    if (to.getTime() < from.getTime()) {
+      reply.status(400);
+      return { error: 'to must be >= from' };
+    }
+
+    const toEnd = /^\d{4}-\d{2}-\d{2}$/.test(String(q.to ?? '').trim())
+      ? new Date(`${String(q.to).trim()}T23:59:59.999Z`)
+      : new Date(to.getTime());
+
+    const warehouseId = q.warehouseId ? Number(q.warehouseId) : null;
+    if (q.warehouseId && (Number.isNaN(warehouseId) || !warehouseId)) {
+      reply.status(400);
+      return { error: 'invalid warehouseId' };
+    }
+
+    const item = await prisma.item.findFirst({
+      where: { id: itemId, companyId },
+      select: { id: true, name: true, sku: true, trackInventory: true, type: true },
+    });
+    if (!item) {
+      reply.status(404);
+      return { error: 'item not found' };
+    }
+    if (item.type !== 'GOODS' || !item.trackInventory) {
+      reply.status(400);
+      return { error: 'item is not an inventoried GOODS item' };
+    }
+
+    const moves = await prisma.stockMove.findMany({
+      where: {
+        companyId,
+        itemId,
+        date: { lte: toEnd },
+        ...(warehouseId ? { warehouseId } : {}),
+      },
+      orderBy: [{ date: 'asc' }, { id: 'asc' }],
+      include: {
+        warehouse: { select: { id: true, name: true } },
+      },
+    });
+
+    let qty = new Prisma.Decimal(0);
+    let value = new Prisma.Decimal(0);
+
+    // Apply pre-range to get opening balances as-of `from`
+    for (const m of moves as any[]) {
+      if (new Date(m.date).getTime() >= from.getTime()) break;
+      const q2 = new Prisma.Decimal(m.quantity).toDecimalPlaces(2);
+      const v2 = new Prisma.Decimal(m.totalCostApplied).toDecimalPlaces(2);
+      if (m.direction === 'IN') {
+        qty = qty.add(q2);
+        value = value.add(v2);
+      } else {
+        qty = qty.sub(q2);
+        value = value.sub(v2);
+      }
+    }
+
+    function labelForMove(m: any): string {
+      switch (m.type) {
+        case 'OPENING':
+          return 'Opening Balance';
+        case 'PURCHASE_RECEIPT':
+          return 'Purchase Receipt';
+        case 'SALE_ISSUE':
+          return 'Sale (Issue)';
+        case 'SALE_RETURN':
+          return 'Sales Return';
+        case 'ADJUSTMENT':
+          return 'Adjustment';
+        case 'TRANSFER_IN':
+          return 'Transfer In';
+        case 'TRANSFER_OUT':
+          return 'Transfer Out';
+        default:
+          return String(m.type ?? 'Transaction');
+      }
+    }
+
+    const rows: any[] = [];
+    rows.push({
+      kind: 'OPENING',
+      date: from.toISOString(),
+      transactionDetails: '*** Opening Stock ***',
+      quantity: null,
+      unitCost: null,
+      totalCost: null,
+      stockOnHand: qty.toDecimalPlaces(2).toString(),
+      inventoryAssetValue: value.toDecimalPlaces(2).toString(),
+      warehouseName: warehouseId ? (moves?.[0]?.warehouse?.name ?? null) : null,
+    });
+
+    // Now apply and emit in-range moves
+    for (const m of moves as any[]) {
+      const dt = new Date(m.date).getTime();
+      if (dt < from.getTime()) continue;
+      if (dt > toEnd.getTime()) break;
+
+      const q2 = new Prisma.Decimal(m.quantity).toDecimalPlaces(2);
+      const unit = new Prisma.Decimal(m.unitCostApplied).toDecimalPlaces(2);
+      const total = new Prisma.Decimal(m.totalCostApplied).toDecimalPlaces(2);
+
+      if (m.direction === 'IN') {
+        qty = qty.add(q2);
+        value = value.add(total);
+      } else {
+        qty = qty.sub(q2);
+        value = value.sub(total);
+      }
+
+      rows.push({
+        kind: 'MOVE',
+        stockMoveId: m.id,
+        date: new Date(m.date).toISOString(),
+        transactionDetails: labelForMove(m),
+        type: m.type,
+        direction: m.direction,
+        warehouseId: m.warehouseId,
+        warehouseName: m.warehouse?.name ?? null,
+        quantity: q2.toString(),
+        unitCost: unit.toString(),
+        totalCost: total.toString(),
+        stockOnHand: qty.toDecimalPlaces(2).toString(),
+        inventoryAssetValue: value.toDecimalPlaces(2).toString(),
+        journalEntryId: m.journalEntryId ?? null,
+      });
+    }
+
+    rows.push({
+      kind: 'CLOSING',
+      date: toEnd.toISOString(),
+      transactionDetails: '*** Closing Stock ***',
+      quantity: null,
+      unitCost: null,
+      totalCost: null,
+      stockOnHand: qty.toDecimalPlaces(2).toString(),
+      inventoryAssetValue: value.toDecimalPlaces(2).toString(),
+    });
+
+    return {
+      companyId,
+      item: { id: item.id, name: item.name, sku: item.sku ?? null },
+      from: from.toISOString(),
+      to: toEnd.toISOString(),
+      warehouseId: warehouseId ?? null,
+      rows,
+    };
+  });
+
   // Inventory movement report (by item/warehouse, range)
   fastify.get('/companies/:companyId/reports/inventory-movement', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
@@ -646,6 +839,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       return { error: 'invalid itemId' };
     }
 
+    // Movement within range
     const rows = await prisma.stockMove.groupBy({
       by: ['warehouseId', 'itemId', 'direction'],
       where: {
@@ -658,6 +852,21 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       _sum: { quantity: true, totalCostApplied: true },
     });
 
+    // Beginning balance before range (for context; prevents confusion when net is negative within the window).
+    const beforeRows =
+      from
+        ? await prisma.stockMove.groupBy({
+            by: ['warehouseId', 'itemId', 'direction'],
+            where: {
+              companyId,
+              date: { lt: from },
+              ...(warehouseId ? { warehouseId } : {}),
+              ...(itemId ? { itemId } : {}),
+            },
+            _sum: { quantity: true, totalCostApplied: true },
+          })
+        : [];
+
     const ids = Array.from(new Set(rows.map((r) => r.itemId)));
     const whIds = Array.from(new Set(rows.map((r) => r.warehouseId)));
     const items = await prisma.item.findMany({ where: { companyId, id: { in: ids } }, select: { id: true, name: true, sku: true, trackInventory: true } });
@@ -667,17 +876,37 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     type Key = string; // `${warehouseId}:${itemId}`
     const agg = new Map<Key, any>();
+    const begin = new Map<Key, { qty: Prisma.Decimal; value: Prisma.Decimal }>();
+
+    for (const r of beforeRows as any[]) {
+      const key = `${r.warehouseId}:${r.itemId}`;
+      if (!begin.has(key)) begin.set(key, { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) });
+      const b = begin.get(key)!;
+      const qty = new Prisma.Decimal(r._sum.quantity ?? 0).toDecimalPlaces(2);
+      const val = new Prisma.Decimal(r._sum.totalCostApplied ?? 0).toDecimalPlaces(2);
+      if (r.direction === 'IN') {
+        b.qty = b.qty.add(qty);
+        b.value = b.value.add(val);
+      } else {
+        b.qty = b.qty.sub(qty);
+        b.value = b.value.sub(val);
+      }
+    }
+
     for (const r of rows as any[]) {
       const it = itemById.get(r.itemId);
       if (!it?.trackInventory) continue;
       const key = `${r.warehouseId}:${r.itemId}`;
       if (!agg.has(key)) {
+        const b = begin.get(key) ?? { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) };
         agg.set(key, {
           warehouseId: r.warehouseId,
           warehouseName: whById.get(r.warehouseId)?.name ?? '',
           itemId: r.itemId,
           itemName: it?.name ?? '',
           sku: it?.sku ?? null,
+          beginQty: b.qty.toDecimalPlaces(2),
+          beginValue: b.value.toDecimalPlaces(2),
           qtyIn: new Prisma.Decimal(0),
           valueIn: new Prisma.Decimal(0),
           qtyOut: new Prisma.Decimal(0),
@@ -696,19 +925,29 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       }
     }
 
-    const out = Array.from(agg.values()).map((a: any) => ({
-      warehouseId: a.warehouseId,
-      warehouseName: a.warehouseName,
-      itemId: a.itemId,
-      itemName: a.itemName,
-      sku: a.sku,
-      qtyIn: a.qtyIn.toDecimalPlaces(2).toString(),
-      valueIn: a.valueIn.toDecimalPlaces(2).toString(),
-      qtyOut: a.qtyOut.toDecimalPlaces(2).toString(),
-      valueOut: a.valueOut.toDecimalPlaces(2).toString(),
-      netQty: a.qtyIn.sub(a.qtyOut).toDecimalPlaces(2).toString(),
-      netValue: a.valueIn.sub(a.valueOut).toDecimalPlaces(2).toString(),
-    }));
+    const out = Array.from(agg.values()).map((a: any) => {
+      const netQty = a.qtyIn.sub(a.qtyOut).toDecimalPlaces(2);
+      const netValue = a.valueIn.sub(a.valueOut).toDecimalPlaces(2);
+      const endQty = a.beginQty.add(netQty).toDecimalPlaces(2);
+      const endValue = a.beginValue.add(netValue).toDecimalPlaces(2);
+      return {
+        warehouseId: a.warehouseId,
+        warehouseName: a.warehouseName,
+        itemId: a.itemId,
+        itemName: a.itemName,
+        sku: a.sku,
+        beginQty: a.beginQty.toString(),
+        beginValue: a.beginValue.toString(),
+        qtyIn: a.qtyIn.toDecimalPlaces(2).toString(),
+        valueIn: a.valueIn.toDecimalPlaces(2).toString(),
+        qtyOut: a.qtyOut.toDecimalPlaces(2).toString(),
+        valueOut: a.valueOut.toDecimalPlaces(2).toString(),
+        netQty: netQty.toString(),
+        netValue: netValue.toString(),
+        endQty: endQty.toString(),
+        endValue: endValue.toString(),
+      };
+    });
 
     return { companyId, from: from?.toISOString() ?? null, to: to?.toISOString() ?? null, rows: out };
   });

@@ -11,3 +11,7 @@ node_modules
 frontend/.next/
 frontend/node_modules/
 frontend/.env.local
+
+# npm cache (should never be committed)
+.npm-cache/
+**/.npm-cache/

@@ -19,6 +19,80 @@ import {
 
 type TabKey = 'overview' | 'locations' | 'transactions';
 
+function renderStockMoveSource(m: any) {
+  const type = String(m?.referenceType ?? '').trim();
+  const ref = m?.referenceId != null ? String(m.referenceId).trim() : '';
+  const isNumericId = ref && /^\d+$/.test(ref);
+
+  switch (type) {
+    case 'Invoice':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/invoices/${ref}`}>
+          Invoice #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Invoice</span>
+      );
+    case 'InvoiceVoid':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/invoices/${ref}`}>
+          Invoice void #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Invoice void</span>
+      );
+    case 'CreditNote':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/credit-notes/${ref}`}>
+          Credit note #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Credit note</span>
+      );
+    case 'CreditNoteVoid':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/credit-notes/${ref}`}>
+          Credit note void #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Credit note void</span>
+      );
+    case 'PurchaseBill':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/purchase-bills/${ref}`}>
+          Purchase bill #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Purchase bill</span>
+      );
+    case 'PurchaseBillVoid':
+      return isNumericId ? (
+        <Link className="text-sm underline" href={`/purchase-bills/${ref}`}>
+          Purchase bill void #{ref}
+        </Link>
+      ) : (
+        <span className="text-sm text-muted-foreground">Purchase bill void</span>
+      );
+    case 'InventoryAdjustment':
+      return (
+        <span className="text-sm text-muted-foreground">
+          Adjustment{ref ? ` (${ref})` : ''}
+        </span>
+      );
+    case 'OpeningBalance':
+      return <span className="text-sm text-muted-foreground">Opening balance</span>;
+    default:
+      return type ? (
+        <span className="text-sm text-muted-foreground">
+          {type}
+          {ref ? ` (${ref})` : ''}
+        </span>
+      ) : (
+        <span className="text-sm text-muted-foreground">—</span>
+      );
+  }
+}
+
 export default function ItemDetailPage() {
   const { user } = useAuth();
   const params = useParams<{ id: string }>();
@@ -217,6 +291,7 @@ export default function ItemDetailPage() {
                   <TableHead className="w-[120px] text-right">Qty</TableHead>
                   <TableHead className="w-[140px] text-right">Unit Cost</TableHead>
                   <TableHead className="w-[160px] text-right">Total</TableHead>
+                  <TableHead className="w-[200px]">Source</TableHead>
                   <TableHead className="w-[120px]">GL</TableHead>
                 </TableRow>
               </TableHeader>
@@ -236,6 +311,12 @@ export default function ItemDetailPage() {
                     <TableCell className="text-right tabular-nums">{Number(m.unitCostApplied ?? 0).toLocaleString()}</TableCell>
                     <TableCell className="text-right tabular-nums">{Number(m.totalCostApplied ?? 0).toLocaleString()}</TableCell>
                     <TableCell>
+                      <div className="space-y-0.5">
+                        {renderStockMoveSource(m)}
+                        <div className="text-[11px] text-muted-foreground">Move #{m.id}</div>
+                      </div>
+                    </TableCell>
+                    <TableCell>
                       {m.journalEntryId ? (
                         <Link className="text-sm underline" href={`/journal/${m.journalEntryId}`}>
                           JE #{m.journalEntryId}
@@ -248,7 +329,7 @@ export default function ItemDetailPage() {
                 ))}
                 {moves.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={8} className="py-10 text-center text-muted-foreground">
                       No stock moves for this item yet.
                     </TableCell>
                   </TableRow>

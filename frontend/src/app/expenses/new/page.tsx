@@ -203,7 +203,6 @@ export default function NewBillPage() {
                       name="tax_pref" 
                       checked={!form.isTaxExclusive} 
                       onChange={() => setForm({ ...form, isTaxExclusive: false })} 
-                      disabled 
                     />
                     <label htmlFor="tax_inc" className="text-muted-foreground">Tax Inclusive</label>
                   </div>
@@ -214,7 +213,6 @@ export default function NewBillPage() {
                       name="tax_pref" 
                       checked={form.isTaxExclusive} 
                       onChange={() => setForm({ ...form, isTaxExclusive: true })} 
-                      disabled 
                     />
                     <label htmlFor="tax_exc" className="text-muted-foreground">Tax Exclusive</label>
                   </div>

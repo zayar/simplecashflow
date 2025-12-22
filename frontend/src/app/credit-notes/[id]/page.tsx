@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
@@ -57,6 +57,19 @@ export default function CreditNoteDetailPage() {
       setError(e?.message ?? String(e));
     } finally {
       setPosting(false);
+    }
+  }
+
+  async function deleteDraft() {
+    if (!user?.companyId || !id) return;
+    if (!confirm('Delete this credit note? This is only allowed for DRAFT/APPROVED credit notes.')) return;
+    setError(null);
+    try {
+      await fetchApi(`/companies/${user.companyId}/credit-notes/${id}`, { method: 'DELETE' });
+      // back to list
+      if (typeof window !== 'undefined') window.location.assign('/credit-notes');
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
     }
   }
 
@@ -139,6 +152,9 @@ export default function CreditNoteDetailPage() {
             <Button onClick={post} disabled={posting || !canPost} title={!canPost ? 'Set an income account for all lines before posting.' : undefined}>
               {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Post Credit Note
+            </Button>
+            <Button variant="destructive" onClick={deleteDraft}>
+              Delete
             </Button>
             </>
           ) : null}
