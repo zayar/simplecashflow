@@ -150,4 +150,51 @@ curl -sS -X POST 'http://localhost:8080/login' \
 - **Write endpoints failing with “Idempotency-Key header is required”**:
   - Generate a UUID and send `Idempotency-Key` for posting/payment/reversal/close calls.
 
+### Cloud SQL Proxy (production/staging DB access from your laptop)
+
+When you need to run Prisma commands against Cloud SQL (production/staging), you typically connect through **Cloud SQL Auth Proxy**.
+
+Important beginner note:
+- If you paste commands into `zsh`, do **not** paste comment lines that start with `#` (zsh will treat it like a command if you paste it alone).
+
+#### Option A: You already have `cloud-sql-proxy` installed (recommended)
+
+Check:
+
+```bash
+command -v cloud-sql-proxy
+```
+
+If it prints a path (example: `/usr/local/bin/cloud-sql-proxy`), start the proxy:
+
+```bash
+cloud-sql-proxy --address 127.0.0.1 --port 3307 "aiaccount-1c845:asia-southeast1:cashflow-mysql"
+```
+
+Leave it running in that terminal.
+
+#### Option B: Use the repo-local proxy binary (what `deploy/deploy_gcp.sh` does)
+
+From repo root:
+
+```bash
+cd /Users/zayarmin/Development/cashflow-app
+./deploy/deploy_gcp.sh
+```
+
+During deploy, the script will:
+- download `cloud-sql-proxy` into the repo (if missing)
+- start it on `127.0.0.1:3307`
+- run `prisma migrate deploy`
+
+#### Running Prisma “resolve” with the proxy
+
+Open a new terminal while proxy is running and execute:
+
+```bash
+cd /Users/zayarmin/Development/cashflow-app
+export DATABASE_URL="mysql://root:<PASSWORD_URLENCODED>@127.0.0.1:3307/cashflow_prod"
+npx prisma migrate resolve --rolled-back <migration-name>
+```
+
 

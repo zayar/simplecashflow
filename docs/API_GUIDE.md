@@ -116,6 +116,20 @@ Notes:
   - Effect:
     - Reversal JE + audit events (`journal.entry.created`, `journal.entry.reversed`, `payment.reversed`)
 
+#### Integrations: Piti (POS → Finance)
+
+- `POST /integrations/piti/companies/:companyId/sales`
+  - Service-to-service auth: `X-Integration-Key`
+  - Idempotent: `Idempotency-Key`
+  - Creates **POSTED** invoice + JE and optionally records payments
+  - See `docs/PITI_INTEGRATION.md`
+
+- `POST /integrations/piti/companies/:companyId/refunds`
+  - Service-to-service auth: `X-Integration-Key`
+  - Idempotent: `Idempotency-Key`
+  - Creates **POSTED** credit note + JE
+  - See `docs/PITI_INTEGRATION.md`
+
 #### Bills / Expenses (AP) + payments
 
 - `GET /companies/:companyId/expenses`

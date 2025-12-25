@@ -193,6 +193,9 @@ model Company {
   documentSequences  DocumentSequence[]
   taxRates           TaxRate[]
   taxGroups          TaxGroup[]
+
+  // Integrations mapping (external IDs <-> internal IDs)
+  integrationEntityMaps IntegrationEntityMap[]
 }
 
 model Account {
@@ -702,10 +705,11 @@ model CreditNoteLine {
   incomeAccountId Int?
   incomeAccount   Account? @relation("CreditNoteLine_IncomeAccount", fields: [incomeAccountId], references: [id])
 
-  description String?
-  quantity    Decimal @db.Decimal(18, 2)
-  unitPrice   Decimal @db.Decimal(18, 2)
-  lineTotal   Decimal @db.Decimal(18, 2)
+  description    String?
+  quantity       Decimal @db.Decimal(18, 2)
+  unitPrice      Decimal @db.Decimal(18, 2)
+  discountAmount Decimal @default(0) @db.Decimal(18, 2)
+  lineTotal      Decimal @db.Decimal(18, 2)
 
   // Tax per line (tax-exclusive):
   // taxRate is stored as decimal (e.g., 0.0700 for 7%).
@@ -726,8 +730,9 @@ model InvoiceLine {
   invoiceId Int
   invoice   Invoice @relation(fields: [invoiceId], references: [id])
 
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
+  // Optional: allow free-text/custom lines without an Item (non-inventory).
+  itemId Int?
+  item   Item? @relation(fields: [itemId], references: [id])
 
   // Income account mapping (UI-friendly revenue mapping).
   // Default UX: Sales Income (code 4000). Optional for backward-compat; posting will enforce a valid income account.
@@ -737,6 +742,7 @@ model InvoiceLine {
   description     String?
   quantity        Decimal          @db.Decimal(18, 2)
   unitPrice       Decimal          @db.Decimal(18, 2)
+  discountAmount  Decimal          @default(0) @db.Decimal(18, 2)
   lineTotal       Decimal          @db.Decimal(18, 2)
   // Tax per line (tax-exclusive):
   // taxRate is stored as decimal (e.g., 0.0700 for 7%).
@@ -1163,4 +1169,35 @@ model TaxGroupMember {
   @@unique([groupId, taxRateId])
   @@index([groupId])
   @@index([taxRateId])
+}
+
+// --- Integrations (external system mappings) ---
+//
+// Purpose:
+// - Keep stable links between external IDs (e.g., Piti saleId/productId/customerId)
+//   and internal Cashflow IDs (Invoice/Item/Customer/etc).
+// - Prevent duplicates under retries even if callers accidentally change Idempotency-Key.
+model IntegrationEntityMap {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  // e.g. "piti"
+  integration String @db.VarChar(32)
+  // e.g. "Sale", "Refund", "Item", "Customer"
+  entityType  String @db.VarChar(32)
+
+  // External identifier (from the source system). Keep as string for flexibility.
+  externalId String @db.VarChar(128)
+  // Internal identifier (Cashflow). Stored as string because not all targets are ints (future-proof).
+  internalId String @db.VarChar(128)
+
+  // Optional debug metadata (safe to store non-sensitive info only).
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, integration, entityType, externalId])
+  @@index([companyId, integration, entityType])
 }

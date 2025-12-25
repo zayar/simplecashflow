@@ -1,0 +1,104 @@
+{
+  "info": {
+    "name": "Cashflow ↔ Piti Integration",
+    "_postman_id": "a5b1c9b7-4f68-4c52-9b62-9f9bd2f6a001",
+    "description": "Service-to-service integration endpoints for Piti POS to create finance records (invoice/credit note) in Cashflow.\n\nVariables:\n- baseUrl (e.g. http://localhost:8080)\n- companyId (e.g. 1)\n- integrationKey (Cashflow env: PITI_INTEGRATION_API_KEY)\n- saleId, refundId (optional)\n\nHeaders:\n- X-Integration-Key: {{integrationKey}}\n- Idempotency-Key: (generated per request below)\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "https://cashflow-api-291129507535.asia-southeast1.run.app" },
+    { "key": "companyId", "value": "1" },
+    { "key": "integrationKey", "value": "SET_ME" },
+    { "key": "saleId", "value": "12345" },
+    { "key": "refundId", "value": "r-9001" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [ "{{baseUrl}}" ],
+              "path": [ "health" ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Piti Integration",
+      "item": [
+        {
+          "name": "POST Sale Completed → Invoice (+ optional Payment)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const saleId = pm.variables.get('saleId') || '12345';",
+                  "pm.variables.set('idemKey', `piti:sale:${saleId}:completed`);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Integration-Key", "value": "{{integrationKey}}" },
+              { "key": "Idempotency-Key", "value": "{{idemKey}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/integrations/piti/companies/{{companyId}}/sales",
+              "host": [ "{{baseUrl}}" ],
+              "path": [ "integrations", "piti", "companies", "{{companyId}}", "sales" ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"saleId\": \"{{saleId}}\",\n  \"saleNumber\": \"SO-000123\",\n  \"saleDate\": \"2025-12-25T10:30:00.000Z\",\n  \"currency\": \"MMK\",\n  \"customer\": {\n    \"externalCustomerId\": \"c-7788\",\n    \"name\": \"Walk-in Customer\",\n    \"phone\": \"0991234567\",\n    \"email\": null\n  },\n  \"lines\": [\n    {\n      \"externalProductId\": \"p-100\",\n      \"sku\": \"SKU-100\",\n      \"name\": \"Coca Cola 330ml\",\n      \"quantity\": 2,\n      \"unitPrice\": 1500,\n      \"discountAmount\": 0,\n      \"taxRate\": 0.0\n    }\n  ],\n  \"payments\": [\n    {\n      \"cashflowAccountCode\": \"1000\",\n      \"amount\": 3000,\n      \"paidAt\": \"2025-12-25T10:30:00.000Z\"\n    }\n  ],\n  \"options\": {\n    \"autoCreateCustomer\": true,\n    \"autoCreateItems\": true,\n    \"recordPayment\": true\n  }\n}\n"
+            }
+          }
+        },
+        {
+          "name": "POST Refund/Return → Credit Note",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const refundId = pm.variables.get('refundId') || 'r-9001';",
+                  "pm.variables.set('idemKey', `piti:refund:${refundId}`);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Integration-Key", "value": "{{integrationKey}}" },
+              { "key": "Idempotency-Key", "value": "{{idemKey}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/integrations/piti/companies/{{companyId}}/refunds",
+              "host": [ "{{baseUrl}}" ],
+              "path": [ "integrations", "piti", "companies", "{{companyId}}", "refunds" ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refundId\": \"{{refundId}}\",\n  \"refundNumber\": \"RF-0001\",\n  \"refundDate\": \"2025-12-25T12:00:00.000Z\",\n  \"saleId\": \"{{saleId}}\",\n  \"currency\": \"MMK\",\n  \"customer\": {\n    \"externalCustomerId\": \"c-7788\",\n    \"name\": \"Walk-in Customer\",\n    \"phone\": \"0991234567\"\n  },\n  \"lines\": [\n    {\n      \"externalProductId\": \"p-100\",\n      \"sku\": \"SKU-100\",\n      \"name\": \"Coca Cola 330ml\",\n      \"quantity\": 1,\n      \"unitPrice\": 1500,\n      \"discountAmount\": 0,\n      \"taxRate\": 0.0\n    }\n  ]\n}\n"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+
+

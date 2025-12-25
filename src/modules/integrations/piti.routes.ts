@@ -6,12 +6,25 @@ import { postJournalEntry } from '../ledger/posting.service.js';
 import { forbidClientProvidedCompanyId } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
+import { requireIntegrationKey } from './integrationAuth.js';
+import { upsertPostedCreditNoteFromPitiRefund, upsertPostedInvoiceFromPitiSale } from './piti.service.js';
 
 export async function pitiRoutes(fastify: FastifyInstance) {
-  // Integration endpoints should be protected (JWT for now).
-  // Later: switch to signed webhooks / service-to-service auth.
-  fastify.addHook('preHandler', fastify.authenticate);
   const redis = getRedis();
+
+  // Integration auth:
+  // - Prefer service-to-service `X-Integration-Key` for Piti team
+  // - Allow JWT as fallback for internal testing
+  fastify.addHook('preHandler', async (request: any, reply: any) => {
+    const hasIntegrationKey = Boolean((request.headers as any)?.['x-integration-key']);
+    if (hasIntegrationKey) {
+      const ok = requireIntegrationKey(request, reply, 'PITI_INTEGRATION_API_KEY');
+      if (!ok) return;
+      return;
+    }
+    // fallback to JWT
+    return fastify.authenticate(request, reply);
+  });
 
   // --- Piti integration: simple cash sale ---
   // This simulates Piti sending a sale event to the ledger.
@@ -107,6 +120,95 @@ export async function pitiRoutes(fastify: FastifyInstance) {
       redis
     );
     return response as any;
+  });
+
+  /**
+   * Piti -> Cashflow: Sale Completed (Finance import)
+   *
+   * Creates a POSTED invoice (and optional payment) in Cashflow.
+   * IMPORTANT: Items created by this endpoint will have trackInventory=false.
+   */
+  fastify.post('/integrations/piti/companies/:companyId/sales', async (request, reply) => {
+    const companyId = Number((request.params as any)?.companyId);
+    if (!Number.isInteger(companyId) || companyId <= 0) {
+      reply.status(400);
+      return { error: 'invalid companyId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    try {
+      const { replay, response } = await runIdempotentRequest(
+        prisma,
+        companyId,
+        idempotencyKey,
+        async () => {
+          const payload = request.body as any;
+          const result = await upsertPostedInvoiceFromPitiSale({
+            prisma,
+            companyId,
+            idempotencyKey,
+            payload,
+            userId: (request as any).user?.userId ?? null,
+          });
+          return result;
+        },
+        redis
+      );
+
+      // Keep response stable (ignore replay flag for now)
+      return response as any;
+    } catch (err: any) {
+      reply.status(400);
+      return { error: err?.message ?? 'invalid payload' };
+    }
+  });
+
+  /**
+   * Piti -> Cashflow: Refund/Return (Finance import)
+   *
+   * Creates a POSTED credit note in Cashflow and posts the required journal entry.
+   * IMPORTANT: This is finance-only (no stock moves).
+   */
+  fastify.post('/integrations/piti/companies/:companyId/refunds', async (request, reply) => {
+    const companyId = Number((request.params as any)?.companyId);
+    if (!Number.isInteger(companyId) || companyId <= 0) {
+      reply.status(400);
+      return { error: 'invalid companyId' };
+    }
+
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    try {
+      const { response } = await runIdempotentRequest(
+        prisma,
+        companyId,
+        idempotencyKey,
+        async () => {
+          const payload = request.body as any;
+          return await upsertPostedCreditNoteFromPitiRefund({
+            prisma,
+            companyId,
+            idempotencyKey,
+            payload,
+            userId: (request as any).user?.userId ?? null,
+          });
+        },
+        redis
+      );
+      return response as any;
+    } catch (err: any) {
+      reply.status(400);
+      return { error: err?.message ?? 'invalid payload' };
+    }
   });
 }
 

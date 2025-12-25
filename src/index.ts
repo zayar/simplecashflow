@@ -36,6 +36,8 @@ async function buildApp() {
       'Content-Type',
       'Idempotency-Key',
       'idempotency-key',
+      'X-Integration-Key',
+      'x-integration-key',
     ],
   });
 
