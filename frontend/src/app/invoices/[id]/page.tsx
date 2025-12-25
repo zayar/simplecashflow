@@ -240,11 +240,15 @@ export default function InvoiceDetailPage() {
 
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
   const invoiceLines = (invoice.lines ?? []) as any[]
-  const linesSubtotal = invoiceLines.reduce((sum: number, l: any) => {
+  const grossSubtotal = invoiceLines.reduce((sum: number, l: any) => {
     const qty = Number(l.quantity ?? 0)
     const rate = Number(l.unitPrice ?? 0)
     return sum + qty * rate
   }, 0)
+  const discountTotal = invoiceLines.reduce((sum: number, l: any) => {
+    return sum + Math.max(0, Number(l.discountAmount ?? 0))
+  }, 0)
+  const netSubtotal = Math.max(0, grossSubtotal - discountTotal)
   const taxAmount = Number(invoice.taxAmount ?? 0)
 
   return (
@@ -409,6 +413,8 @@ export default function InvoiceDetailPage() {
                   <div className="font-medium">
                     {invoice.dueDate ? formatDateInTimeZone(invoice.dueDate, tz) : "—"}
                   </div>
+                  <div className="text-muted-foreground">Branch</div>
+                  <div className="font-medium">{invoice.warehouse?.name ?? "—"}</div>
                   <div className="text-muted-foreground">Terms</div>
                   <div className="font-medium">{invoice.dueDate ? "Net" : "—"}</div>
                 </div>
@@ -423,7 +429,7 @@ export default function InvoiceDetailPage() {
                 <thead className="bg-slate-50 text-slate-600">
                   <tr>
                     <th className="px-4 py-3 text-left font-medium">#</th>
-                    <th className="px-4 py-3 text-left font-medium">Item &amp; Description</th>
+                    <th className="px-4 py-3 text-left font-medium">Item</th>
                     <th className="px-4 py-3 text-right font-medium">Qty</th>
                     <th className="px-4 py-3 text-right font-medium">Rate</th>
                     <th className="px-4 py-3 text-right font-medium">Amount</th>
@@ -440,19 +446,21 @@ export default function InvoiceDetailPage() {
                     invoiceLines.map((l: any, idx: number) => {
                       const qty = Number(l.quantity ?? 0)
                       const rate = Number(l.unitPrice ?? 0)
-                      const amount = qty * rate
-                      const itemName = l.item?.name ?? l.description ?? "—"
-                      const description =
-                        l.item?.name && l.description && l.description !== l.item?.name
-                          ? l.description
-                          : l.item?.description ?? null
+                      const discount = Math.max(0, Number(l.discountAmount ?? 0))
+                      const amount = Math.max(0, qty * rate - discount)
+                      const itemName = l.item?.name ?? (l.description ?? "—")
+                      const desc = String(l.description ?? "").trim()
+                      const showDesc = Boolean(desc && l.item?.name && desc !== l.item.name)
                       return (
                         <tr key={l.id ?? idx} className={idx % 2 === 0 ? "bg-white" : "bg-slate-50/30"}>
                           <td className="px-4 py-3 text-muted-foreground">{idx + 1}</td>
                           <td className="px-4 py-3">
                             <div className="font-medium text-slate-900">{itemName}</div>
-                            {description ? (
-                              <div className="mt-1 text-xs text-muted-foreground">{description}</div>
+                            {showDesc ? <div className="mt-1 text-xs text-muted-foreground">{desc}</div> : null}
+                            {discount > 0 ? (
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                Discount: {formatMoneyWithCurrency(discount, invoice.currency)}
+                              </div>
                             ) : null}
                           </td>
                           <td className="px-4 py-3 text-right font-medium tabular-nums">{formatMoney(qty)}</td>
@@ -500,7 +508,13 @@ export default function InvoiceDetailPage() {
                   <div className="flex items-center justify-between">
                     <span className="text-muted-foreground">Sub Total</span>
                     <span className="font-medium tabular-nums">
-                      {formatMoneyWithCurrency(linesSubtotal, invoice.currency)}
+                      {formatMoneyWithCurrency(grossSubtotal, invoice.currency)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-muted-foreground">Discount</span>
+                    <span className="font-medium tabular-nums">
+                      {formatMoneyWithCurrency(discountTotal, invoice.currency)}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">

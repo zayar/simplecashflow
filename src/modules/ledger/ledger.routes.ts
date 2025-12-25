@@ -79,6 +79,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     const body = request.body as {
       date?: string; // ISO or YYYY-MM-DD
       description?: string;
+      warehouseId?: number;
       lines?: { accountId?: number; debit?: number; credit?: number }[];
     };
 
@@ -115,6 +116,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
               companyId,
               date,
               description: body.description ?? '',
+              warehouseId: body.warehouseId ? Number(body.warehouseId) : null,
               createdByUserId: (request as any).user?.userId ?? null,
               lines: (body.lines ?? []).map((line) => ({
                 accountId: Number(line.accountId),
@@ -331,6 +333,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
             metadata: {
               date,
               description: body.description ?? '',
+              warehouseId: (body as any).warehouseId ? Number((body as any).warehouseId) : null,
               totalDebit: Number(totalDebit),
               totalCredit: Number(totalCredit),
             },

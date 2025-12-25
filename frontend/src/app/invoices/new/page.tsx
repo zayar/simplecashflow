@@ -33,6 +33,9 @@ export default function NewInvoicePage() {
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
+  const [warehouses, setWarehouses] = useState<any[]>([]);
+  const [defaultWarehouseId, setDefaultWarehouseId] = useState<number | null>(null);
+  const [invoiceWarehouseId, setInvoiceWarehouseId] = useState<number | null>(null);
   const [defaultIncomeAccountId, setDefaultIncomeAccountId] = useState<number | null>(null);
   const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
   const [taxSearchTerm, setTaxSearchTerm] = useState('');
@@ -53,7 +56,17 @@ export default function NewInvoicePage() {
   });
 
   const [lines, setLines] = useState([
-    { itemId: '', description: '', quantity: 1, unitPrice: 0, taxRate: 0, taxLabel: '', incomeAccountId: '' }
+    {
+      itemId: '',
+      itemText: '',
+      description: '',
+      quantity: 1,
+      unitPrice: 0,
+      taxRate: 0,
+      taxLabel: '',
+      discount: 0,
+      incomeAccountId: '',
+    },
   ]);
 
   useEffect(() => {
@@ -63,8 +76,10 @@ export default function NewInvoicePage() {
         fetchApi(`/companies/${user.companyId}/items`),
         fetchApi(`/companies/${user.companyId}/taxes`),
         fetchApi(`/companies/${user.companyId}/accounts`),
+        fetchApi(`/companies/${user.companyId}/warehouses`),
+        fetchApi(`/companies/${user.companyId}/settings`),
       ])
-        .then(([cust, itm, taxes, accounts]) => {
+        .then(([cust, itm, taxes, accounts, whs, settings]) => {
           setCustomers(cust);
           setItems(itm);
           const activeAccounts = (accounts ?? []).filter((a: any) => a.isActive !== false);
@@ -90,6 +105,13 @@ export default function NewInvoicePage() {
             })),
           ];
           setTaxOptions(options);
+          setWarehouses(whs ?? []);
+          const defWhId =
+            settings && typeof settings === 'object' && 'defaultWarehouseId' in settings
+              ? Number((settings as any).defaultWarehouseId || 0) || null
+              : null;
+          setDefaultWarehouseId(defWhId);
+          setInvoiceWarehouseId((prev) => (prev !== null ? prev : defWhId));
         })
         .catch(console.error);
     }
@@ -103,13 +125,20 @@ export default function NewInvoicePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeZone]);
 
-  const handleItemChange = (index: number, itemId: string) => {
-    const item = items.find(i => i.id.toString() === itemId);
+  const handleItemTextChange = (index: number, text: string) => {
+    const normalized = String(text ?? '').trim();
+    const item = items.find((i) => String(i.name ?? '').trim().toLowerCase() === normalized.toLowerCase());
     const newLines = [...lines];
-    newLines[index].itemId = itemId;
+    (newLines[index] as any).itemText = text;
     if (item) {
+      (newLines[index] as any).itemText = item.name;
+      newLines[index].itemId = String(item.id);
       newLines[index].unitPrice = Number(item.sellingPrice);
       newLines[index].description = item.name;
+    } else {
+      newLines[index].itemId = '';
+      // For custom lines, keep the saved description always in sync with what the user typed.
+      newLines[index].description = text;
     }
     // Default income account is always Sales Income (business-owner friendly).
     if (!(newLines[index] as any).incomeAccountId && defaultIncomeAccountId) {
@@ -129,11 +158,13 @@ export default function NewInvoicePage() {
       ...lines,
       {
         itemId: '',
+        itemText: '',
         description: '',
         quantity: 1,
         unitPrice: 0,
         taxRate: 0,
         taxLabel: '',
+        discount: 0,
         incomeAccountId: defaultIncomeAccountId ? String(defaultIncomeAccountId) : '',
       } as any,
     ]);
@@ -146,12 +177,26 @@ export default function NewInvoicePage() {
   };
 
   const totals = useMemo(() => {
-    const subtotal = lines.reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.unitPrice || 0), 0);
-    const tax = lines.reduce((sum, line) => {
-      const lineSubtotal = Number(line.quantity || 0) * Number(line.unitPrice || 0);
-      return sum + lineSubtotal * Number((line as any).taxRate || 0);
+    const grossSubtotal = lines.reduce((sum, line) => {
+      const raw = Number(line.quantity || 0) * Number(line.unitPrice || 0);
+      return sum + Math.max(0, raw);
     }, 0);
-    return { subtotal, tax, total: subtotal + tax };
+    const discountTotal = lines.reduce((sum, line) => {
+      const discount = Math.max(0, Number((line as any).discount || 0));
+      return sum + discount;
+    }, 0);
+    const netSubtotal = lines.reduce((sum, line) => {
+      const raw = Number(line.quantity || 0) * Number(line.unitPrice || 0);
+      const discount = Math.max(0, Number((line as any).discount || 0));
+      return sum + Math.max(0, raw - discount);
+    }, 0);
+    const tax = lines.reduce((sum, line) => {
+      const raw = Number(line.quantity || 0) * Number(line.unitPrice || 0);
+      const discount = Math.max(0, Number((line as any).discount || 0));
+      const net = Math.max(0, raw - discount);
+      return sum + net * Number((line as any).taxRate || 0);
+    }, 0);
+    return { grossSubtotal, discountTotal, netSubtotal, tax, total: netSubtotal + tax };
   }, [lines]);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -164,21 +209,26 @@ export default function NewInvoicePage() {
         method: 'POST',
         body: JSON.stringify({
           customerId: Number(formData.customerId),
+          warehouseId: invoiceWarehouseId || undefined,
           invoiceDate: formData.invoiceDate,
           dueDate: formData.dueDate || undefined,
           customerNotes: formData.customerNotes || undefined,
           termsAndConditions: formData.termsAndConditions || undefined,
-          lines: lines.map(l => ({
-            itemId: Number(l.itemId),
-            description: l.description,
+          lines: lines.map((l: any) => {
+            const itemIdNum = Number(l.itemId || 0);
+            return {
+              ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
+              description: String(l.description ?? l.itemText ?? '').trim() || undefined,
             quantity: Number(l.quantity),
             unitPrice: Number(l.unitPrice),
             taxRate: Number((l as any).taxRate || 0),
+            discountAmount: Number((l as any).discount || 0),
             incomeAccountId:
               Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
                 ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
                 : undefined,
-          }))
+            };
+          }),
         }),
       });
       router.push('/invoices');
@@ -238,6 +288,51 @@ export default function NewInvoicePage() {
                   onChange={(e) => setFormData({ ...formData, dueDate: e.target.value })}
                 />
               </div>
+              <div className="grid gap-2 md:col-span-3">
+                <Label htmlFor="branch">Branch (Warehouse)</Label>
+                <div className="flex gap-2">
+                  <SelectNative
+                    id="branch"
+                    value={invoiceWarehouseId ? String(invoiceWarehouseId) : ''}
+                    onChange={(e) => {
+                      const nextId = e.target.value ? Number(e.target.value) : null;
+                      setInvoiceWarehouseId(nextId);
+                    }}
+                    className="flex-1"
+                  >
+                    <option value="">Select branch</option>
+                    {warehouses.map((w: any) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name}{w.isDefault ? ' (Default)' : ''}
+                      </option>
+                    ))}
+                  </SelectNative>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={async () => {
+                      if (!user?.companyId) return;
+                      try {
+                        await fetchApi(`/companies/${user.companyId}/settings`, {
+                          method: 'PUT',
+                          body: JSON.stringify({ defaultWarehouseId: invoiceWarehouseId }),
+                        });
+                        setDefaultWarehouseId(invoiceWarehouseId);
+                        alert('Company default warehouse updated.');
+                      } catch (err: any) {
+                        console.error(err);
+                        alert(err?.message ?? 'Failed to update company default warehouse');
+                      }
+                    }}
+                    disabled={!invoiceWarehouseId}
+                  >
+                    Set as default
+                  </Button>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  This branch is saved on the invoice (and used for tracked inventory posting). “Set as default” updates company settings.
+                </div>
+              </div>
             </CardContent>
           </Card>
 
@@ -254,11 +349,12 @@ export default function NewInvoicePage() {
                 <Table>
                   <TableHeader>
                     <TableRow className="bg-muted/40">
-                      <TableHead className="w-[420px]">ITEM / DESCRIPTION</TableHead>
-                      <TableHead className="w-[90px] text-right">QTY</TableHead>
+                      <TableHead className="w-[560px]">ITEM</TableHead>
+                      <TableHead className="w-[120px] text-right">QTY</TableHead>
                       <TableHead className="w-[160px]">UNIT</TableHead>
                       <TableHead className="w-[160px] text-right">PRICE</TableHead>
                       <TableHead className="w-[140px]">TAX</TableHead>
+                      <TableHead className="w-[220px]">INCOME ACCOUNT</TableHead>
                       <TableHead className="w-[160px] text-right">DISCOUNT</TableHead>
                       <TableHead className="w-[160px] text-right">ITEM AMOUNT</TableHead>
                       <TableHead className="w-[60px]" />
@@ -266,18 +362,37 @@ export default function NewInvoicePage() {
                   </TableHeader>
                   <TableBody>
                     {lines.map((line, index) => {
-                      const lineSubtotal = Number(line.quantity || 0) * Number(line.unitPrice || 0)
+                      const rawSubtotal = Number(line.quantity || 0) * Number(line.unitPrice || 0)
+                      const discount = Math.max(0, Number((line as any).discount || 0))
+                      const netSubtotal = Math.max(0, rawSubtotal - discount)
+                      const taxRate = Number((line as any).taxRate || 0)
+                      const lineTax = netSubtotal * taxRate
+                      const itemAmount = netSubtotal + lineTax
                       return (
                     <>
                     <TableRow key={`main-${index}`} className="border-b-0">
                       <TableCell className="align-top">
                             <div className="space-y-2">
-                              <SelectNative required value={line.itemId} onChange={(e) => handleItemChange(index, e.target.value)}>
-                                <option value="">Select item…</option>
-                      {items.map((i) => (
-                        <option key={i.id} value={i.id}>{i.name}</option>
-                      ))}
-                    </SelectNative>
+                              <div className="space-y-2">
+                                <Input
+                                  placeholder="Type or click to select an item…"
+                                  list={`invoice-items-${index}`}
+                                  className="h-12 px-4 text-base"
+                                  value={(line as any).itemText ?? (line.itemId ? (items.find((i) => String(i.id) === String(line.itemId))?.name ?? '') : '')}
+                                  onChange={(e) => handleItemTextChange(index, e.target.value)}
+                                />
+                                <datalist id={`invoice-items-${index}`}>
+                                  {items.map((i) => (
+                                    <option key={i.id} value={i.name} />
+                                  ))}
+                                </datalist>
+                                <Textarea
+                                  value={(line as any).description ?? ''}
+                                  onChange={(e) => updateLine(index, 'description', e.target.value)}
+                                  placeholder="Item description (will show on invoice)"
+                                  className="min-h-[64px]"
+                                />
+                              </div>
                   </div>
                           </TableCell>
                           <TableCell className="align-top">
@@ -285,7 +400,7 @@ export default function NewInvoicePage() {
                       type="number"
                       min="1"
                               inputMode="numeric"
-                      className="text-right"
+                      className="text-right min-w-[96px]"
                       value={line.quantity}
                       onChange={(e) => updateLine(index, 'quantity', Number(e.target.value))}
                     />
@@ -360,10 +475,30 @@ export default function NewInvoicePage() {
                               </DropdownMenu>
                       </TableCell>
                           <TableCell className="align-top">
-                            <Input disabled className="text-right" value="0.00" />
+                            <AccountPicker
+                              accounts={accounts}
+                              value={(line as any).incomeAccountId || defaultIncomeAccountId}
+                              onChange={(nextId) => updateLine(index, 'incomeAccountId', nextId ? String(nextId) : '')}
+                              placeholder="Select an account"
+                              disabled={!accounts.length}
+                              createHref="/accounts/new"
+                              isOptionDisabled={(a) => a.type !== 'INCOME'}
+                              getOptionDisabledReason={(a) => (a.type !== 'INCOME' ? 'Invoice lines must use an INCOME account' : undefined)}
+                            />
+                          </TableCell>
+                          <TableCell className="align-top">
+                            <Input
+                              type="number"
+                              inputMode="decimal"
+                              step="0.01"
+                              min="0"
+                              className="text-right"
+                              value={Number((line as any).discount || 0)}
+                              onChange={(e) => updateLine(index, "discount", Number(e.target.value || 0))}
+                            />
                           </TableCell>
                           <TableCell className="align-top text-right font-semibold tabular-nums">
-                            {lineSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {itemAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                           </TableCell>
                           <TableCell className="align-top text-right">
                             <Button type="button" variant="ghost" size="icon" onClick={() => removeLine(index)} disabled={lines.length === 1}>
@@ -371,29 +506,6 @@ export default function NewInvoicePage() {
                     </Button>
                           </TableCell>
                         </TableRow>
-                    <TableRow key={`acct-${index}`} className="bg-muted/10 border-t-0">
-                      <TableCell className="py-3">
-                        <Textarea
-                          value={line.description}
-                          onChange={(e) => updateLine(index, 'description', e.target.value)}
-                          placeholder="Enter name or description"
-                          className="min-h-[44px]"
-                        />
-                      </TableCell>
-                      <TableCell colSpan={2} className="py-3">
-                        <AccountPicker
-                          accounts={accounts}
-                          value={(line as any).incomeAccountId || defaultIncomeAccountId}
-                          onChange={(nextId) => updateLine(index, 'incomeAccountId', nextId ? String(nextId) : '')}
-                          placeholder="Select an account"
-                          disabled={!accounts.length}
-                          createHref="/accounts/new"
-                          isOptionDisabled={(a) => a.type !== 'INCOME'}
-                          getOptionDisabledReason={(a) => (a.type !== 'INCOME' ? 'Invoice lines must use an INCOME account' : undefined)}
-                        />
-                      </TableCell>
-                      <TableCell colSpan={4} />
-                    </TableRow>
                     </>
                       )
                     })}
@@ -419,7 +531,15 @@ export default function NewInvoicePage() {
                 <div className="w-64 space-y-1">
                   <div className="flex justify-between text-sm">
                     <span className="text-muted-foreground">Sub Total</span>
-                    <span className="tabular-nums">{totals.subtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                    <span className="tabular-nums">
+                      {totals.grossSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Discount</span>
+                    <span className="tabular-nums">
+                      {totals.discountTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
                   </div>
                   <div className="flex justify-between text-sm">
                     <span className="text-muted-foreground">Tax</span>

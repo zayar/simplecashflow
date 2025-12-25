@@ -14,6 +14,7 @@ export type PostJournalEntryInput = {
   companyId: number;
   date: Date;
   description: string;
+  warehouseId?: number | null;
   createdByUserId?: number | null;
   reversalOfJournalEntryId?: number | null;
   reversalReason?: string | null;
@@ -122,6 +123,18 @@ export async function postJournalEntry(
     }
   }
 
+  // Optional branch tagging (Warehouse-as-Branch). Validate tenant safety.
+  const warehouseId = input.warehouseId ?? null;
+  if (warehouseId) {
+    const wh = await tx.warehouse.findFirst({
+      where: { id: warehouseId, companyId },
+      select: { id: true },
+    });
+    if (!wh) {
+      throw Object.assign(new Error('warehouseId does not belong to this company'), { statusCode: 400 });
+    }
+  }
+
   // Balance check using Decimal
   let totalDebit = d0();
   let totalCredit = d0();
@@ -146,6 +159,7 @@ export async function postJournalEntry(
       entryNumber,
       date,
       description,
+      warehouseId,
       createdByUserId: input.createdByUserId ?? null,
       reversalOfJournalEntryId: input.reversalOfJournalEntryId ?? null,
       reversalReason: input.reversalReason ?? null,

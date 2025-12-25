@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
+import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from './invoiceAccounting.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
@@ -320,6 +321,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: invoiceId, companyId },
       include: {
         customer: true,
+        warehouse: true,
         lines: invoiceLinesIncludeWithIncomeAccount,
         journalEntry: {
           include: {
@@ -394,6 +396,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       id: invoice.id,
       invoiceNumber: invoice.invoiceNumber,
       customer: invoice.customer,
+      warehouse: invoice.warehouse ? { id: invoice.warehouse.id, name: invoice.warehouse.name } : null,
       status: invoice.status,
       invoiceDate: invoice.invoiceDate,
       dueDate: invoice.dueDate,
@@ -429,18 +432,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       customerId?: number;
+      warehouseId?: number | null;
       invoiceDate?: string;
       dueDate?: string;
       currency?: string;
       customerNotes?: string;
       termsAndConditions?: string;
       lines?: {
-        itemId: number;
+        // Optional: either provide itemId (for catalog items) OR omit it for custom/free-text lines.
+        itemId?: number;
         description?: string;
         quantity: number;
         unitPrice?: number;
         // taxRate is decimal (e.g., 0.07 for 7%)
         taxRate?: number;
+        // Line-level discount amount (tax-exclusive currency amount)
+        discountAmount?: number;
         // Optional per-line income account mapping (INCOME). Default UX uses Sales Income (4000).
         incomeAccountId?: number;
       }[];
@@ -473,8 +480,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'customerId not found in this company' };
     }
 
-    // Validate and load items (tenant-safe).
-    const itemIds = body.lines.map((l) => l.itemId);
+    // Optional branch tagging (Warehouse-as-Branch): validate tenant safety.
+    const warehouseId = body.warehouseId ? Number(body.warehouseId) : null;
+    if (warehouseId) {
+      const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId }, select: { id: true } });
+      if (!wh) {
+        reply.status(400);
+        return { error: 'warehouseId not found in this company' };
+      }
+    }
+
+    // Validate and load items (tenant-safe). Custom lines may not have itemId.
+    const itemIds = body.lines
+      .map((l) => Number((l as any).itemId ?? 0))
+      .filter((x) => x > 0);
     const items = await prisma.item.findMany({
       where: { companyId, id: { in: itemIds } },
     });
@@ -485,9 +504,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
         reply.status(400);
         return { error: 'each line must have quantity > 0' };
       }
-      if (!itemById.get(line.itemId)) {
-        reply.status(400);
-        return { error: `itemId ${line.itemId} not found in this company` };
+      const itemId = Number((line as any).itemId ?? 0);
+      if (itemId > 0) {
+        if (!itemById.get(itemId)) {
+          reply.status(400);
+          return { error: `itemId ${itemId} not found in this company` };
+        }
+      } else {
+        // Custom/free-text line must have a description and explicit unitPrice.
+        if (!line.description || !String(line.description).trim()) {
+          reply.status(400);
+          return { error: 'custom invoice line must include description' };
+        }
+        if (!line.unitPrice || Number(line.unitPrice) <= 0) {
+          reply.status(400);
+          return { error: 'custom invoice line must include unitPrice > 0' };
+        }
       }
     }
 
@@ -520,29 +552,42 @@ export async function booksRoutes(fastify: FastifyInstance) {
     let taxAmount = new Prisma.Decimal(0);
     let total = new Prisma.Decimal(0);
     const computedLines = body.lines.map((line) => {
-      const item = itemById.get(line.itemId)!;
+      const itemId = Number((line as any).itemId ?? 0);
+      const item = itemId > 0 ? itemById.get(itemId)! : null;
       const qty = toMoneyDecimal(line.quantity);
-      const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
+      const unit = toMoneyDecimal(line.unitPrice ?? (item ? Number((item as any).sellingPrice) : 0));
+      if (unit.lessThanOrEqualTo(0)) {
+        throw Object.assign(new Error('unitPrice must be > 0'), { statusCode: 400 });
+      }
       const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const discount = toMoneyDecimal((line as any).discountAmount ?? 0).toDecimalPlaces(2);
+      if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+        throw Object.assign(
+          new Error(`invalid discountAmount: must be between 0 and line subtotal`),
+          { statusCode: 400 }
+        );
+      }
+      const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
       const rate = new Prisma.Decimal(Number((line as any).taxRate ?? 0)).toDecimalPlaces(4);
       if (rate.lessThan(0) || rate.greaterThan(1)) {
         throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
           statusCode: 400,
         });
       }
-      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-      subtotal = subtotal.add(lineSubtotal);
+      const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+      subtotal = subtotal.add(netSubtotal);
       taxAmount = taxAmount.add(lineTax);
       total = total.add(lineTotal);
 
       return {
         companyId,
-        itemId: item.id,
-        description: line.description ?? null,
+        itemId: item ? (item as any).id : null,
+        description: line.description ?? (item ? (item as any).name : null),
         quantity: qty,
         unitPrice: unit,
-        lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+        discountAmount: discount,
+        lineTotal: netSubtotal, // store net subtotal (after discount) for backwards compatibility
         taxRate: rate,
         taxAmount: lineTax,
         incomeAccountId: Number((line as any).incomeAccountId ?? 0) || salesIncomeAccountId,
@@ -553,6 +598,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       data: {
         companyId,
         customerId: customer.id,
+        warehouseId,
         invoiceNumber: generateInvoiceNumber(),
         status: 'DRAFT',
         invoiceDate,
@@ -592,17 +638,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       customerId?: number;
+      warehouseId?: number | null;
       invoiceDate?: string;
       dueDate?: string | null;
       currency?: string | null;
       customerNotes?: string | null;
       termsAndConditions?: string | null;
       lines?: {
-        itemId: number;
+        itemId?: number;
         description?: string;
         quantity: number;
         unitPrice?: number;
         taxRate?: number;
+        discountAmount?: number;
         incomeAccountId?: number;
       }[];
     };
@@ -631,6 +679,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'customerId not found in this company' };
     }
 
+    // Optional branch tagging (Warehouse-as-Branch): validate tenant safety.
+    const warehouseId = body.warehouseId ? Number(body.warehouseId) : null;
+    if (warehouseId) {
+      const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId }, select: { id: true } });
+      if (!wh) {
+        reply.status(400);
+        return { error: 'warehouseId not found in this company' };
+      }
+    }
+
     // Currency policy (single-currency per company if baseCurrency is set)
     const company = await prisma.company.findUnique({
       where: { id: companyId },
@@ -642,8 +700,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const invoiceCurrency = baseCurrency ?? requestedCurrency ?? customerCurrency;
     enforceSingleCurrency(baseCurrency, invoiceCurrency);
 
-    // Validate and load items (tenant-safe).
-    const itemIds = body.lines.map((l) => l.itemId);
+    // Validate and load items (tenant-safe). Custom lines may not have itemId.
+    const itemIds = body.lines
+      .map((l) => Number((l as any).itemId ?? 0))
+      .filter((x) => x > 0);
     const items = await prisma.item.findMany({
       where: { companyId, id: { in: itemIds } },
     });
@@ -654,9 +714,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
         reply.status(400);
         return { error: 'each line must have quantity > 0' };
       }
-      if (!itemById.get(line.itemId)) {
-        reply.status(400);
-        return { error: `itemId ${line.itemId} not found in this company` };
+      const itemId = Number((line as any).itemId ?? 0);
+      if (itemId > 0) {
+        if (!itemById.get(itemId)) {
+          reply.status(400);
+          return { error: `itemId ${itemId} not found in this company` };
+        }
+      } else {
+        // Custom/free-text line must have a description and explicit unitPrice.
+        if (!line.description || !String(line.description).trim()) {
+          reply.status(400);
+          return { error: 'custom invoice line must include description' };
+        }
+        if (!line.unitPrice || Number(line.unitPrice) <= 0) {
+          reply.status(400);
+          return { error: 'custom invoice line must include unitPrice > 0' };
+        }
       }
     }
 
@@ -686,29 +759,42 @@ export async function booksRoutes(fastify: FastifyInstance) {
     let taxAmount = new Prisma.Decimal(0);
     let total = new Prisma.Decimal(0);
     const computedLines = body.lines.map((line) => {
-      const item = itemById.get(line.itemId)!;
+      const itemId = Number((line as any).itemId ?? 0);
+      const item = itemId > 0 ? itemById.get(itemId)! : null;
       const qty = toMoneyDecimal(line.quantity);
-      const unit = toMoneyDecimal(line.unitPrice ?? Number((item as any).sellingPrice));
+      const unit = toMoneyDecimal(line.unitPrice ?? (item ? Number((item as any).sellingPrice) : 0));
+      if (unit.lessThanOrEqualTo(0)) {
+        throw Object.assign(new Error('unitPrice must be > 0'), { statusCode: 400 });
+      }
       const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const discount = toMoneyDecimal((line as any).discountAmount ?? 0).toDecimalPlaces(2);
+      if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+        throw Object.assign(
+          new Error(`invalid discountAmount: must be between 0 and line subtotal`),
+          { statusCode: 400 }
+        );
+      }
+      const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
       const rate = new Prisma.Decimal(Number((line as any).taxRate ?? 0)).toDecimalPlaces(4);
       if (rate.lessThan(0) || rate.greaterThan(1)) {
-        throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
+        throw Object.assign(new Error(`invalid taxRate: must be between 0 and 1`), {
           statusCode: 400,
         });
       }
-      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-      subtotal = subtotal.add(lineSubtotal);
+      const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+      subtotal = subtotal.add(netSubtotal);
       taxAmount = taxAmount.add(lineTax);
       total = total.add(lineTotal);
 
       return {
         companyId,
-        itemId: item.id,
-        description: line.description ?? null,
+        itemId: item ? (item as any).id : null,
+        description: line.description ?? (item ? (item as any).name : null),
         quantity: qty,
         unitPrice: unit,
-        lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+        discountAmount: discount,
+        lineTotal: netSubtotal, // store net subtotal (after discount) for backwards compatibility
         taxRate: rate,
         taxAmount: lineTax,
         incomeAccountId: Number((line as any).incomeAccountId ?? 0) || salesIncomeAccountId,
@@ -738,6 +824,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
         where: { id: invoiceId, companyId },
         data: {
           customerId: customer.id,
+          warehouseId,
           invoiceDate,
           dueDate: dueDate ?? null,
           currency: invoiceCurrency,
@@ -1608,6 +1695,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: invoiceId, companyId },
       select: {
         id: true,
+        warehouseId: true,
         company: { select: { defaultWarehouseId: true } },
         lines: {
           select: {
@@ -1622,13 +1710,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'invoice not found' };
     }
 
-    let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
+    let fallbackWarehouseId = pre.warehouseId ?? pre.company.defaultWarehouseId ?? null;
     if (!fallbackWarehouseId) {
       const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
       fallbackWarehouseId = wh?.id ?? null;
     }
 
-    const trackedLines = pre.lines.filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
+    const isTrackedPreLine = (
+      l: (typeof pre.lines)[number]
+    ): l is { itemId: number; item: { type: ItemType; trackInventory: boolean; defaultWarehouseId: number | null } } => {
+      return Boolean(l.itemId && l.item && l.item.type === ItemType.GOODS && l.item.trackInventory);
+    };
+
+    const trackedLines = pre.lines.filter(isTrackedPreLine);
     if (trackedLines.length > 0) {
       const missingWh = trackedLines.some((l) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
       if (missingWh) {
@@ -1641,7 +1735,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       trackedLines.length === 0
         ? []
         : trackedLines.map((l) => {
-            const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId) as number;
+            const wid = l.item.defaultWarehouseId ?? fallbackWarehouseId;
+            if (!wid) throw new Error('default warehouse is not set');
             return `lock:stock:${companyId}:${wid}:${l.itemId}`;
           });
 
@@ -1703,46 +1798,44 @@ export async function booksRoutes(fastify: FastifyInstance) {
             });
           }
 
-          // Recompute totals from stored lines (source of truth).
-          let subtotal = new Prisma.Decimal(0);
-          let taxAmount = new Prisma.Decimal(0);
-          const incomeBuckets = new Map<number, Prisma.Decimal>();
-
-          for (const line of invoice.lines) {
-            const qty = new Prisma.Decimal(line.quantity);
-            const unit = new Prisma.Decimal(line.unitPrice);
-            const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
-            subtotal = subtotal.add(lineSubtotal);
-
-            const taxRate = new Prisma.Decimal((line as any).taxRate ?? 0).toDecimalPlaces(4);
-            if (taxRate.lessThan(0) || taxRate.greaterThan(1)) {
-              throw Object.assign(new Error('invoice line taxRate must be between 0 and 1'), { statusCode: 400 });
-            }
-            const lineTax = lineSubtotal.mul(taxRate).toDecimalPlaces(2);
-            taxAmount = taxAmount.add(lineTax);
-
-            const incomeAccountId = (line as any).incomeAccountId ?? (line as any).item?.incomeAccountId;
+          // Recompute totals from stored lines (source of truth) and bucket revenue (net of discounts, tax excluded).
+          const linesForMath = (invoice.lines ?? []).map((line: any) => {
+            const incomeAccountId = line.incomeAccountId ?? line.item?.incomeAccountId;
             if (!incomeAccountId) {
               throw Object.assign(new Error('invoice line is missing income account mapping'), { statusCode: 400 });
             }
-            const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-            incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal)); // Revenue excludes tax
+            return {
+              quantity: line.quantity,
+              unitPrice: line.unitPrice,
+              discountAmount: line.discountAmount ?? 0,
+              taxRate: line.taxRate ?? 0,
+              incomeAccountId: Number(incomeAccountId),
+            };
+          });
+
+          let computed;
+          try {
+            computed = computeInvoiceTotalsAndIncomeBuckets(linesForMath);
+          } catch (e: any) {
+            throw Object.assign(new Error(e?.message ?? 'invalid invoice lines'), { statusCode: 400 });
           }
 
-          subtotal = subtotal.toDecimalPlaces(2);
-          taxAmount = taxAmount.toDecimalPlaces(2);
-          const total = subtotal.add(taxAmount).toDecimalPlaces(2); // Total = subtotal + tax
+          const subtotal = new Prisma.Decimal(computed.subtotal);
+          const taxAmount = new Prisma.Decimal(computed.taxAmount);
+          const total = new Prisma.Decimal(computed.total);
+          const incomeBuckets = new Map<number, Prisma.Decimal>(
+            Array.from(computed.incomeBuckets.entries()).map(([k, v]) => [k, new Prisma.Decimal(v)])
+          );
 
-          // CRITICAL FIX #3: Rounding validation - ensure recomputed total matches stored total.
-          // This prevents debit != credit if line-level rounding drifted from sum-then-round.
-          const storedTotal = new Prisma.Decimal(invoice.total).toDecimalPlaces(2);
-          if (!total.equals(storedTotal)) {
-            throw Object.assign(
-              new Error(
-                `rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}. Invoice may have been corrupted.`
-              ),
-              { statusCode: 400, recomputedTotal: total.toString(), storedTotal: storedTotal.toString() }
-            );
+          // Guardrail: ensure recomputed totals match stored totals to prevent any JE imbalance.
+          try {
+            assertTotalsMatchStored(total as any, new Prisma.Decimal(invoice.total));
+          } catch (e: any) {
+            throw Object.assign(new Error(e?.message ?? 'rounding mismatch'), {
+              statusCode: 400,
+              recomputedTotal: total.toString(),
+              storedTotal: new Prisma.Decimal(invoice.total).toDecimalPlaces(2).toString(),
+            });
           }
 
           // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
@@ -1772,11 +1865,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
           }
 
           // Inventory V1: deduct stock + compute COGS (WAC) at invoice post time
-          const tracked = invoice.lines.filter((l) => l.item.type === 'GOODS' && (l.item as any).trackInventory);
+          const isTrackedInvoiceLine = (
+            l: (typeof invoice.lines)[number]
+          ): l is (typeof invoice.lines)[number] & { itemId: number; item: NonNullable<(typeof invoice.lines)[number]['item']> } => {
+            return Boolean(l.itemId && l.item && (l.item as any).type === 'GOODS' && (l.item as any).trackInventory);
+          };
+
+          const tracked = invoice.lines.filter(isTrackedInvoiceLine);
           let totalCogs = new Prisma.Decimal(0);
 
-          // Resolve default warehouse for this company (required if any tracked items exist).
-          let defaultWarehouseId: number | null = (invoice.company as any).defaultWarehouseId ?? null;
+          // Resolve default warehouse for this invoice (Warehouse-as-Branch).
+          // Preference: invoice.warehouseId -> company.defaultWarehouseId -> company default Warehouse row.
+          let defaultWarehouseId: number | null =
+            (invoice as any).warehouseId ?? (invoice.company as any).defaultWarehouseId ?? null;
 
           if (tracked.length > 0) {
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
@@ -1784,11 +1885,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
             for (const line of tracked) {
               const wid = (line.item as any).defaultWarehouseId ?? defaultWarehouseId;
+              if (!wid) {
+                throw Object.assign(new Error('default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)'), {
+                  statusCode: 400,
+                });
+              }
               const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
               const applied = await applyStockMoveWac(tx as any, {
                 companyId,
-                warehouseId: wid,
-                itemId: line.itemId,
+                warehouseId: Number(wid),
+                itemId: Number(line.itemId),
                 date: invoice.invoiceDate,
                 type: 'SALE_ISSUE',
                 direction: 'OUT',
@@ -1806,49 +1912,24 @@ export async function booksRoutes(fastify: FastifyInstance) {
             totalCogs = totalCogs.toDecimalPlaces(2);
           }
 
-          // CRITICAL FIX #5: Build journal entry lines including tax
-          // Tax entry: Dr AR (total), Cr Revenue (subtotal), Cr Tax Payable (taxAmount)
-          const jeLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
-            // Debit: Accounts Receivable (full amount including tax)
-            { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
-            // Credit: Revenue accounts (subtotal, excluding tax)
-            ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
-              accountId: incomeAccountId,
-              debit: new Prisma.Decimal(0),
-              credit: amount.toDecimalPlaces(2),
-            })),
-          ];
-
-          // Tax Payable (credit) when tax exists
-          if (taxAmount.greaterThan(0)) {
-            jeLines.push({
-              accountId: taxPayableAccountId!,
-              debit: new Prisma.Decimal(0),
-              credit: taxAmount,
-            });
-          }
-
-          // Add COGS entries for inventory-tracked items
-          if (totalCogs.greaterThan(0)) {
-            const invCfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
-            jeLines.push(
-              {
-                accountId: invCfg.cogsAccountId!,
-                debit: totalCogs,
-                credit: new Prisma.Decimal(0),
-              },
-              {
-                accountId: invCfg.inventoryAssetAccountId!,
-                debit: new Prisma.Decimal(0),
-                credit: totalCogs,
-              }
-            );
-          }
+          // Build journal entry lines including tax (and optional inventory COGS).
+          const invCfgForCogs = totalCogs.greaterThan(0) ? await ensureInventoryCompanyDefaults(tx as any, companyId) : null;
+          const jeLines = buildInvoicePostingJournalLines({
+            arAccountId: arAccount.id,
+            total: total as any,
+            incomeBuckets: incomeBuckets as any,
+            taxPayableAccountId: taxAmount.greaterThan(0) ? taxPayableAccountId! : null,
+            taxAmount: taxAmount as any,
+            totalCogs: totalCogs as any,
+            cogsAccountId: invCfgForCogs?.cogsAccountId ?? null,
+            inventoryAssetAccountId: invCfgForCogs?.inventoryAssetAccountId ?? null,
+          }) as any;
 
           const journalEntry = await postJournalEntry(tx, {
             companyId,
             date: invoice.invoiceDate,
             description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
+            warehouseId: (invoice as any).warehouseId ?? null,
             createdByUserId: (request as any).user?.userId ?? null,
             lines: jeLines,
           });
@@ -2144,6 +2225,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   companyId,
                   date: paymentDate,
                   description: `Payment for Invoice ${invoice.invoiceNumber}`,
+                  warehouseId: (invoice as any).warehouseId ?? null,
                   createdByUserId: (request as any).user?.userId ?? null,
                   skipAccountValidation: true,
                   lines: [
@@ -2191,6 +2273,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   metadata: {
                     invoiceId: invoice.id,
                     invoiceNumber: (invoice as any).invoiceNumber,
+                    warehouseId: (invoice as any).warehouseId ?? null,
                     paymentDate,
                     amount: amount.toString(),
                     bankAccountId: bankAccount.id,
@@ -2815,15 +2898,21 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
 
       const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const discount = toMoneyDecimal((l as any).discountAmount ?? 0).toDecimalPlaces(2);
+      if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+        reply.status(400);
+        return { error: `lines[${idx}].discountAmount must be between 0 and line subtotal` };
+      }
+      const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
       const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
       if (rate.lessThan(0) || rate.greaterThan(1)) {
         reply.status(400);
         return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
       }
-      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+      const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
 
-      subtotal = subtotal.add(lineSubtotal);
+      subtotal = subtotal.add(netSubtotal);
       taxAmount = taxAmount.add(lineTax);
       total = total.add(lineTotal);
 
@@ -2833,7 +2922,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
         description: l.description ?? item.name ?? null,
         quantity: qty,
         unitPrice: unit,
-        lineTotal, // subtotal + tax
+        discountAmount: discount,
+        lineTotal: netSubtotal, // store net subtotal (after discount), tax is stored separately
         taxRate: rate,
         taxAmount: lineTax,
         incomeAccountId: Number((l as any).incomeAccountId ?? 0) || null,
@@ -2903,6 +2993,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
         quantity?: number;
         unitPrice?: number;
         taxRate?: number;
+        discountAmount?: number;
         incomeAccountId?: number;
       }[];
     };
@@ -2981,15 +3072,21 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
 
       const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+      const discount = toMoneyDecimal((l as any).discountAmount ?? 0).toDecimalPlaces(2);
+      if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+        reply.status(400);
+        return { error: `lines[${idx}].discountAmount must be between 0 and line subtotal` };
+      }
+      const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
       const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
       if (rate.lessThan(0) || rate.greaterThan(1)) {
         reply.status(400);
         return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
       }
-      const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
+      const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+      const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
 
-      subtotal = subtotal.add(lineSubtotal);
+      subtotal = subtotal.add(netSubtotal);
       taxAmount = taxAmount.add(lineTax);
       total = total.add(lineTotal);
 
@@ -2999,7 +3096,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
         description: l.description ?? item.name ?? null,
         quantity: qty,
         unitPrice: unit,
-        lineTotal, // subtotal + tax
+        discountAmount: discount,
+        lineTotal: netSubtotal, // store net subtotal; tax stored separately
         taxRate: rate,
         taxAmount: lineTax,
         invoiceLineId: Number(l.invoiceLineId ?? 0) || null,
@@ -3109,7 +3207,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
             }
 
             await tx.creditNoteLine.deleteMany({ where: { companyId, creditNoteId: cn.id } });
-            await tx.creditNote.delete({ where: { id: cn.id } });
+            // Tenant-safe delete (enforced by our tenant isolation rules)
+            await tx.creditNote.deleteMany({ where: { id: cn.id, companyId } });
 
             await writeAuditLog(tx as any, {
               companyId,
@@ -4098,9 +4197,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 const qty = new Prisma.Decimal(line.quantity);
                 const unit = new Prisma.Decimal(line.unitPrice);
                 const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+                const discount = new Prisma.Decimal((line as any).discountAmount ?? 0).toDecimalPlaces(2);
+                if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                  throw Object.assign(new Error('credit note line discountAmount must be between 0 and line subtotal'), { statusCode: 400 });
+                }
+                const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
                 const lineTax = new Prisma.Decimal((line as any).taxAmount ?? 0).toDecimalPlaces(2);
-                const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-                subtotal = subtotal.add(lineSubtotal);
+                const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+                subtotal = subtotal.add(netSubtotal);
                 taxAmount = taxAmount.add(lineTax);
                 total = total.add(lineTotal);
                 const incomeAccountId = (line as any).incomeAccountId ?? (line as any).item?.incomeAccountId;
@@ -4108,7 +4212,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   throw Object.assign(new Error('credit note line is missing income account mapping'), { statusCode: 400 });
                 }
                 const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-                incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal));
+                incomeBuckets.set(incomeAccountId, prev.add(netSubtotal));
 
                 const item = (line as any).item;
                 const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;

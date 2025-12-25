@@ -297,6 +297,11 @@ model JournalEntry {
   companyId Int
   company   Company @relation(fields: [companyId], references: [id])
 
+  // Optional branch tagging (we currently use Warehouse as Branch).
+  // Used for reporting/filtering without affecting double-entry correctness.
+  warehouseId Int?
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id])
+
   // Gapless, audit-friendly journal entry number (distinct from PK id).
   // Allocated atomically inside the posting transaction using DocumentSequence
   // (per company per year).
@@ -354,6 +359,8 @@ model JournalEntry {
 
   @@unique([companyId, entryNumber])
   @@index([companyId, date])
+  @@index([companyId, warehouseId])
+  @@index([warehouseId])
 }
 
 model JournalLine {
@@ -506,6 +513,8 @@ model Warehouse {
   purchaseBills       PurchaseBill[]
   purchaseBillLines   PurchaseBillLine[]
   defaultForCompanies Company[]          @relation("Company_DefaultWarehouse")
+  invoices            Invoice[]
+  journalEntries      JournalEntry[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -581,6 +590,10 @@ model Invoice {
   customerId Int
   customer   Customer @relation(fields: [customerId], references: [id])
 
+  // Optional branch tagging (we currently use Warehouse as Branch).
+  warehouseId Int?
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id])
+
   invoiceNumber      String
   status             InvoiceStatus
   invoiceDate        DateTime
@@ -627,6 +640,8 @@ model Invoice {
   @@unique([companyId, invoiceNumber])
   @@index([companyId, invoiceDate])
   @@index([companyId, status])
+  @@index([companyId, warehouseId])
+  @@index([warehouseId])
 }
 
 model CreditNote {
