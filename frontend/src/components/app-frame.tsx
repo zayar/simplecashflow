@@ -22,8 +22,8 @@ import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 
 function pageTitleFromPath(pathname: string) {
-  if (pathname === "/") return "Dashboard"
   const map: Record<string, string> = {
+    "/dashboard": "Dashboard",
     "/invoices": "Invoices",
     "/credit-notes": "Credit Notes",
     "/expenses": "Expenses",

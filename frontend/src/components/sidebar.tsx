@@ -33,7 +33,7 @@ type NavItem = {
 
 const navGroups: { label: string; items: NavItem[] }[] = [
   // Home
-  { label: "Home", items: [{ href: "/", label: "Home", icon: LayoutDashboard }] },
+  { label: "Home", items: [{ href: "/dashboard", label: "Dashboard", icon: LayoutDashboard }] },
 
   // Top-level items
   { label: "", items: [{ href: "/items", label: "Items", icon: Package }] },
@@ -67,7 +67,7 @@ const navGroups: { label: string; items: NavItem[] }[] = [
       { href: "/inventory/summary", label: "Inventory Summary", icon: Package },
       { href: "/inventory/opening-balance", label: "Opening Balance", icon: Package },
       { href: "/inventory/adjustments", label: "Adjust Stock", icon: Package },
-      { href: "/inventory/warehouses", label: "Warehouses", icon: Package },
+      { href: "/inventory/locations", label: "Locations", icon: Package },
     ],
   },
 
@@ -99,7 +99,7 @@ export function Sidebar() {
 
   return (
     <div className="flex h-full flex-col">
-      <Link href="/" className="flex h-14 items-center gap-2 px-4">
+      <Link href="/dashboard" className="flex h-14 items-center gap-2 px-4">
         <LogoMark className="h-9 w-9" title="Cashflow" />
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold tracking-tight">
@@ -125,9 +125,7 @@ export function Sidebar() {
               <div className="space-y-1">
                 {group.items.map((item) => {
                   const isActive =
-                    item.href === "/"
-                      ? pathname === "/"
-                      : pathname === item.href || pathname.startsWith(item.href + "/")
+                    pathname === item.href || pathname.startsWith(item.href + "/")
 
                   return (
                     <Link

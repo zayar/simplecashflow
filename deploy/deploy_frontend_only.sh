@@ -17,20 +17,32 @@ set -euo pipefail
 PROJECT_ID="${PROJECT_ID:-aiaccount-1c845}"
 REGION="${REGION:-asia-southeast1}"
 NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-https://cashflow-api-291129507535.asia-southeast1.run.app}"
+NEXT_PUBLIC_APP_LOGIN_URL="${NEXT_PUBLIC_APP_LOGIN_URL:-}"
 
-gcloud config set project "$PROJECT_ID" 1>/dev/null
+gcloud --quiet config set project "$PROJECT_ID" 1>/dev/null
 
 echo "Building frontend image with Cloud Build..."
 gcloud builds submit \
+  --quiet \
   --config deploy/cloudbuild.frontend.yaml \
   --substitutions "_NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}" \
   .
 
 echo "Deploying cashflow-frontend to Cloud Run..."
-gcloud run deploy cashflow-frontend \
-  --image "gcr.io/${PROJECT_ID}/cashflow-frontend" \
-  --region "${REGION}" \
-  --allow-unauthenticated
+if [[ -n "${NEXT_PUBLIC_APP_LOGIN_URL}" ]]; then
+  gcloud run deploy cashflow-frontend \
+    --quiet \
+    --image "gcr.io/${PROJECT_ID}/cashflow-frontend" \
+    --region "${REGION}" \
+    --set-env-vars "NEXT_PUBLIC_APP_LOGIN_URL=${NEXT_PUBLIC_APP_LOGIN_URL}" \
+    --allow-unauthenticated
+else
+  gcloud run deploy cashflow-frontend \
+    --quiet \
+    --image "gcr.io/${PROJECT_ID}/cashflow-frontend" \
+    --region "${REGION}" \
+    --allow-unauthenticated
+fi
 
 echo "✅ Frontend deployed."
 

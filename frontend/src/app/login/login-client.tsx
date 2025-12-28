@@ -19,11 +19,9 @@ import {
 import { Label } from "@/components/ui/label"
 import { LogoMark } from "@/components/logo-mark"
 
-export default function RegisterPage() {
+export function LoginClientPage() {
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
-  const [name, setName] = useState("")
-  const [companyName, setCompanyName] = useState("")
   const [error, setError] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const { login, user, isLoading } = useAuth()
@@ -38,9 +36,9 @@ export default function RegisterPage() {
     setError("")
     setIsSubmitting(true)
     try {
-      const res = await fetchApi('/register', {
+      const res = await fetchApi('/login', {
         method: 'POST',
-        body: JSON.stringify({ email, password, name, companyName }),
+        body: JSON.stringify({ email, password }),
       });
       login(res.token, res.user);
     } catch (err: any) {
@@ -67,39 +65,25 @@ export default function RegisterPage() {
                 </div>
 
                 <div className="flex items-center gap-2 rounded-full border bg-muted/30 p-1">
-                  <Link href="/login" className="rounded-full px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-                    Login
+                  <div className="rounded-full bg-background px-3 py-1 text-xs font-medium">Login</div>
+                  <Link href="/register" className="rounded-full px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+                    Sign Up
                   </Link>
-                  <div className="rounded-full bg-background px-3 py-1 text-xs font-medium">Sign Up</div>
                 </div>
           </div>
 
               <div className="mb-6 space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
-                <p className="text-sm text-muted-foreground">Start with the basics — you can refine settings later.</p>
+          <h1 className="text-2xl font-semibold tracking-tight">Welcome back</h1>
+                <p className="text-sm text-muted-foreground">Please enter your details to log in.</p>
         </div>
 
               <Card className="shadow-none border-muted/60">
         <CardHeader>
-          <CardTitle className="text-lg">Sign up</CardTitle>
-          <CardDescription>Create a workspace for your business.</CardDescription>
+          <CardTitle className="text-lg">Sign in</CardTitle>
+                  <CardDescription>Use your email and password to continue.</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="grid gap-4">
-            <div className="grid gap-2">
-                      <Label htmlFor="name">Full name</Label>
-                      <Input id="name" placeholder="Enter your name" required value={name} onChange={(e) => setName(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-                      <Label htmlFor="companyName">Company name</Label>
-              <Input
-                id="companyName"
-                        placeholder="Enter your company name"
-                required
-                value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-              />
-            </div>
             <div className="grid gap-2">
                       <Label htmlFor="email">Email address</Label>
               <Input
@@ -111,12 +95,16 @@ export default function RegisterPage() {
                 onChange={(e) => setEmail(e.target.value)}
               />
             </div>
+
             <div className="grid gap-2">
+                      <div className="flex items-center justify-between">
               <Label htmlFor="password">Password</Label>
+                        <span className="text-xs text-muted-foreground">Forgot password?</span>
+                      </div>
               <Input
                 id="password"
                 type="password"
-                        placeholder="Create a password"
+                        placeholder="Enter your password"
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -126,13 +114,13 @@ export default function RegisterPage() {
                     {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
             <Button className="w-full" type="submit" disabled={isSubmitting}>
-              {isSubmitting ? "Creating..." : "Create account"}
+                      {isSubmitting ? "Signing in..." : "Log In"}
             </Button>
 
                     <div className="text-center text-sm text-muted-foreground">
-              Already have an account?{" "}
-                      <Link href="/login" className="font-medium text-foreground underline underline-offset-4">
-                Sign in
+              Don&apos;t have an account?{" "}
+                      <Link href="/register" className="font-medium text-foreground underline underline-offset-4">
+                Sign up
               </Link>
             </div>
           </form>
@@ -140,14 +128,20 @@ export default function RegisterPage() {
         </Card>
 
               <p className="mt-6 text-center text-xs text-muted-foreground">
-          We’ll store your session securely in cookies.
+          By continuing, you agree to your internal company policies.
         </p>
             </div>
 
-            {/* Right: Hero image (same as login) */}
+            {/* Right: Hero image */}
             <div className="relative hidden md:block">
               <div className="absolute inset-0 bg-gradient-to-br from-primary/15 via-transparent to-primary/10" />
-              <Image src="/login-hero.svg" alt="Finance platform" fill priority className="object-cover" />
+              <Image
+                src="/login-hero.svg"
+                alt="Finance platform"
+                fill
+                priority
+                className="object-cover"
+              />
             </div>
           </div>
         </div>
@@ -155,3 +149,4 @@ export default function RegisterPage() {
     </div>
   );
 }
+
