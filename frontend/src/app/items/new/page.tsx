@@ -15,7 +15,7 @@ export default function NewItemPage() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [incomeAccounts, setIncomeAccounts] = useState<any[]>([]);
-  const [warehouses, setWarehouses] = useState<any[]>([]);
+  const [locations, setLocations] = useState<any[]>([]);
   
   const [formData, setFormData] = useState({
     name: '',
@@ -25,7 +25,7 @@ export default function NewItemPage() {
     costPrice: '',
     incomeAccountId: '',
     trackInventory: false,
-    defaultWarehouseId: '',
+    defaultLocationId: '',
   });
 
   useEffect(() => {
@@ -35,8 +35,8 @@ export default function NewItemPage() {
         .then(setIncomeAccounts)
         .catch(console.error);
 
-      fetchApi(`/companies/${user.companyId}/warehouses`)
-        .then(setWarehouses)
+      fetchApi(`/companies/${user.companyId}/locations`)
+        .then(setLocations)
         .catch(console.error);
     }
   }, [user?.companyId]);
@@ -55,8 +55,8 @@ export default function NewItemPage() {
           costPrice: formData.costPrice ? Number(formData.costPrice) : undefined,
           incomeAccountId: Number(formData.incomeAccountId),
           trackInventory: formData.type === 'GOODS' ? Boolean(formData.trackInventory) : false,
-          defaultWarehouseId:
-            formData.defaultWarehouseId ? Number(formData.defaultWarehouseId) : null,
+          defaultLocationId:
+            formData.defaultLocationId ? Number(formData.defaultLocationId) : null,
         }),
       });
       router.push('/items');
@@ -161,15 +161,15 @@ export default function NewItemPage() {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="defaultWarehouse">Default Warehouse</Label>
+                <Label htmlFor="defaultLocation">Default Location</Label>
                 <SelectNative
-                  id="defaultWarehouse"
-                  value={formData.defaultWarehouseId}
-                  onChange={(e) => setFormData({ ...formData, defaultWarehouseId: e.target.value })}
+                  id="defaultLocation"
+                  value={formData.defaultLocationId}
+                  onChange={(e) => setFormData({ ...formData, defaultLocationId: e.target.value })}
                   disabled={formData.type !== 'GOODS'}
                 >
                   <option value="">Company default</option>
-                  {warehouses.map((w) => (
+                  {locations.map((w) => (
                     <option key={w.id} value={String(w.id)}>
                       {w.name}
                       {w.isDefault ? ' (Default)' : ''}

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
+import { isFutureBusinessDate } from '../../utils/docDatePolicy.js';
 import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from './invoiceAccounting.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
@@ -16,6 +17,7 @@ import { ensureInventoryCompanyDefaults, ensureInventoryItem, getStockBalanceFor
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { nextCreditNoteNumber } from '../sequence/sequence.service.js';
+import { resolveLocationForStockIssue } from './warehousePolicy.js';
 import {
   buildAdjustmentLinesFromNets,
   computeNetByAccount,
@@ -197,7 +199,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       include: {
         incomeAccount: { select: { id: true, code: true, name: true, type: true } },
         expenseAccount: { select: { id: true, code: true, name: true, type: true } },
-        defaultWarehouse: { select: { id: true, name: true, isDefault: true } },
+        defaultLocation: { select: { id: true, name: true, isDefault: true } },
       },
     });
     if (!item) {
@@ -220,7 +222,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       incomeAccountId?: number;
       expenseAccountId?: number;
       trackInventory?: boolean;
-      defaultWarehouseId?: number | null;
+      defaultLocationId?: number | null;
+      defaultWarehouseId?: number | null; // backward-compatible alias
     };
 
     if (!body.name || !body.type || body.sellingPrice === undefined || !body.incomeAccountId) {
@@ -252,14 +255,16 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'trackInventory can only be enabled for GOODS' };
     }
 
-    if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
-      const wh = await prisma.warehouse.findFirst({
-        where: { id: body.defaultWarehouseId, companyId },
+    const desiredDefaultLocationId =
+      body.defaultLocationId !== undefined ? body.defaultLocationId : body.defaultWarehouseId;
+    if (desiredDefaultLocationId !== undefined && desiredDefaultLocationId !== null) {
+      const loc = await prisma.location.findFirst({
+        where: { id: desiredDefaultLocationId, companyId },
         select: { id: true },
       });
-      if (!wh) {
+      if (!loc) {
         reply.status(400);
-        return { error: 'defaultWarehouseId must be a warehouse in this company' };
+        return { error: 'defaultLocationId must be a location in this company' };
       }
     }
 
@@ -274,7 +279,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
         incomeAccountId: body.incomeAccountId,
         expenseAccountId: body.expenseAccountId ?? null,
         trackInventory: body.trackInventory ?? false,
-        defaultWarehouseId: body.defaultWarehouseId ?? null,
+        defaultLocationId: desiredDefaultLocationId ?? null,
       },
       include: {
         incomeAccount: true,
@@ -321,7 +326,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: invoiceId, companyId },
       include: {
         customer: true,
-        warehouse: true,
+        location: true,
         lines: invoiceLinesIncludeWithIncomeAccount,
         journalEntry: {
           include: {
@@ -396,7 +401,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
       id: invoice.id,
       invoiceNumber: invoice.invoiceNumber,
       customer: invoice.customer,
-      warehouse: invoice.warehouse ? { id: invoice.warehouse.id, name: invoice.warehouse.name } : null,
+      location: (invoice as any).location ? { id: (invoice as any).location.id, name: (invoice as any).location.name } : null,
+      // Backward compatibility (deprecated)
+      warehouse: (invoice as any).location ? { id: (invoice as any).location.id, name: (invoice as any).location.name } : null,
       status: invoice.status,
       invoiceDate: invoice.invoiceDate,
       dueDate: invoice.dueDate,
@@ -432,7 +439,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       customerId?: number;
-      warehouseId?: number | null;
+      locationId?: number | null;
+      warehouseId?: number | null; // backward-compatible alias
       invoiceDate?: string;
       dueDate?: string;
       currency?: string;
@@ -480,13 +488,13 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'customerId not found in this company' };
     }
 
-    // Optional branch tagging (Warehouse-as-Branch): validate tenant safety.
-    const warehouseId = body.warehouseId ? Number(body.warehouseId) : null;
-    if (warehouseId) {
-      const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId }, select: { id: true } });
-      if (!wh) {
+    // Optional location tagging: validate tenant safety.
+    const locationId = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
+    if (locationId) {
+      const loc = await prisma.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } });
+      if (!loc) {
         reply.status(400);
-        return { error: 'warehouseId not found in this company' };
+        return { error: 'locationId not found in this company' };
       }
     }
 
@@ -598,7 +606,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       data: {
         companyId,
         customerId: customer.id,
-        warehouseId,
+        locationId,
         invoiceNumber: generateInvoiceNumber(),
         status: 'DRAFT',
         invoiceDate,
@@ -638,7 +646,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       customerId?: number;
-      warehouseId?: number | null;
+      locationId?: number | null;
+      warehouseId?: number | null; // backward-compatible alias
       invoiceDate?: string;
       dueDate?: string | null;
       currency?: string | null;
@@ -679,13 +688,13 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'customerId not found in this company' };
     }
 
-    // Optional branch tagging (Warehouse-as-Branch): validate tenant safety.
-    const warehouseId = body.warehouseId ? Number(body.warehouseId) : null;
-    if (warehouseId) {
-      const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId }, select: { id: true } });
-      if (!wh) {
+    // Optional location tagging: validate tenant safety.
+    const locationId = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
+    if (locationId) {
+      const loc = await prisma.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } });
+      if (!loc) {
         reply.status(400);
-        return { error: 'warehouseId not found in this company' };
+        return { error: 'locationId not found in this company' };
       }
     }
 
@@ -824,7 +833,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
         where: { id: invoiceId, companyId },
         data: {
           customerId: customer.id,
-          warehouseId,
+          locationId,
           invoiceDate,
           dueDate: dueDate ?? null,
           currency: invoiceCurrency,
@@ -1410,10 +1419,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
       // If invoice posting touched inventory, we must lock per-item stock keys during void to avoid WAC races.
       const preMoves = await prisma.stockMove.findMany({
         where: { companyId, referenceType: 'Invoice', referenceId: String(invoiceId) },
-        select: { warehouseId: true, itemId: true },
+        select: { locationId: true, itemId: true },
       });
       const stockLockKeys = Array.from(
-        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`))
+        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.locationId}:${m.itemId}`))
       );
 
       const wrapped = async (fn: () => Promise<any>) =>
@@ -1469,7 +1478,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 direction: 'OUT',
               },
               select: {
-                warehouseId: true,
+                locationId: true,
                 itemId: true,
                 quantity: true,
                 unitCostApplied: true,
@@ -1543,7 +1552,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
               for (const m of origIssueMoves as any[]) {
                 await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId: m.warehouseId,
+                  locationId: m.locationId,
                   itemId: m.itemId,
                   date: voidDate,
                   type: 'SALE_RETURN',
@@ -1695,12 +1704,12 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: invoiceId, companyId },
       select: {
         id: true,
-        warehouseId: true,
-        company: { select: { defaultWarehouseId: true } },
+        locationId: true,
+        company: { select: { defaultLocationId: true } },
         lines: {
           select: {
             itemId: true,
-            item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+            item: { select: { type: true, trackInventory: true, defaultLocationId: true } },
           },
         },
       },
@@ -1710,24 +1719,32 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'invoice not found' };
     }
 
-    let fallbackWarehouseId = pre.warehouseId ?? pre.company.defaultWarehouseId ?? null;
-    if (!fallbackWarehouseId) {
-      const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
-      fallbackWarehouseId = wh?.id ?? null;
+    let fallbackLocationId = (pre as any).locationId ?? (pre.company as any).defaultLocationId ?? null;
+    if (!fallbackLocationId) {
+      const loc = await prisma.location.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+      fallbackLocationId = loc?.id ?? null;
     }
+    const invoiceLocationId = (pre as any).locationId ?? null;
 
     const isTrackedPreLine = (
       l: (typeof pre.lines)[number]
-    ): l is { itemId: number; item: { type: ItemType; trackInventory: boolean; defaultWarehouseId: number | null } } => {
+    ): l is { itemId: number; item: { type: ItemType; trackInventory: boolean; defaultLocationId: number | null } } => {
       return Boolean(l.itemId && l.item && l.item.type === ItemType.GOODS && l.item.trackInventory);
     };
 
     const trackedLines = pre.lines.filter(isTrackedPreLine);
     if (trackedLines.length > 0) {
-      const missingWh = trackedLines.some((l) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+      const missingWh = trackedLines.some(
+        (l) =>
+          !resolveLocationForStockIssue({
+            invoiceLocationId,
+            itemDefaultLocationId: (l.item as any).defaultLocationId ?? null,
+            companyDefaultLocationId: fallbackLocationId,
+          })
+      );
       if (missingWh) {
         reply.status(400);
-        return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+        return { error: 'default location is not set (set company.defaultLocationId or item.defaultLocationId)' };
       }
     }
 
@@ -1735,9 +1752,13 @@ export async function booksRoutes(fastify: FastifyInstance) {
       trackedLines.length === 0
         ? []
         : trackedLines.map((l) => {
-            const wid = l.item.defaultWarehouseId ?? fallbackWarehouseId;
-            if (!wid) throw new Error('default warehouse is not set');
-            return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+            const lid = resolveLocationForStockIssue({
+              invoiceLocationId,
+              itemDefaultLocationId: (l.item as any).defaultLocationId ?? null,
+              companyDefaultLocationId: fallbackLocationId,
+            });
+            if (!lid) throw new Error('default location is not set');
+            return `lock:stock:${companyId}:${lid}:${l.itemId}`;
           });
 
     const { replay, response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () =>
@@ -1874,26 +1895,46 @@ export async function booksRoutes(fastify: FastifyInstance) {
           const tracked = invoice.lines.filter(isTrackedInvoiceLine);
           let totalCogs = new Prisma.Decimal(0);
 
-          // Resolve default warehouse for this invoice (Warehouse-as-Branch).
-          // Preference: invoice.warehouseId -> company.defaultWarehouseId -> company default Warehouse row.
-          let defaultWarehouseId: number | null =
-            (invoice as any).warehouseId ?? (invoice.company as any).defaultWarehouseId ?? null;
+          // Resolve default location for this invoice (location tagging).
+          // Preference: invoice.locationId -> company.defaultLocationId -> company default Location row.
+          const invoiceLocationId: number | null = (invoice as any).locationId ?? null;
+          let defaultLocationId: number | null = (invoice.company as any).defaultLocationId ?? null;
 
           if (tracked.length > 0) {
+            // Inventory engine v1 stores only a "current" StockBalance (not a date-effective ledger),
+            // so allowing future-dated inventory documents creates confusing/incorrect current stock.
+            // Industry-standard approach is to either:
+            // - post stock on ship/delivery date (separate from invoice), or
+            // - implement reservations/available-to-promise.
+            // Until then, we disallow posting inventory-affecting invoices with a future invoiceDate.
+            const tz = ((invoice.company as any).timeZone as string | null | undefined) ?? null;
+            if (isFutureBusinessDate({ date: new Date(invoice.invoiceDate), timeZone: tz })) {
+              throw Object.assign(
+                new Error(
+                  'cannot post an inventory invoice with a future invoice date. Set the invoice date to today or keep it as DRAFT and post on the shipment date.'
+                ),
+                { statusCode: 400 }
+              );
+            }
+
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
-            defaultWarehouseId = defaultWarehouseId ?? cfg.defaultWarehouseId;
+            defaultLocationId = defaultLocationId ?? (cfg as any).defaultLocationId;
 
             for (const line of tracked) {
-              const wid = (line.item as any).defaultWarehouseId ?? defaultWarehouseId;
-              if (!wid) {
-                throw Object.assign(new Error('default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)'), {
+              const lid = resolveLocationForStockIssue({
+                invoiceLocationId,
+                itemDefaultLocationId: (line.item as any).defaultLocationId ?? null,
+                companyDefaultLocationId: defaultLocationId,
+              });
+              if (!lid) {
+                throw Object.assign(new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'), {
                   statusCode: 400,
                 });
               }
               const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
               const applied = await applyStockMoveWac(tx as any, {
                 companyId,
-                warehouseId: Number(wid),
+                locationId: Number(lid),
                 itemId: Number(line.itemId),
                 date: invoice.invoiceDate,
                 type: 'SALE_ISSUE',
@@ -1929,7 +1970,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
             companyId,
             date: invoice.invoiceDate,
             description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
-            warehouseId: (invoice as any).warehouseId ?? null,
+            locationId: (invoice as any).locationId ?? null,
             createdByUserId: (request as any).user?.userId ?? null,
             lines: jeLines,
           });
@@ -2225,7 +2266,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   companyId,
                   date: paymentDate,
                   description: `Payment for Invoice ${invoice.invoiceNumber}`,
-                  warehouseId: (invoice as any).warehouseId ?? null,
+                  locationId: (invoice as any).locationId ?? null,
                   createdByUserId: (request as any).user?.userId ?? null,
                   skipAccountValidation: true,
                   lines: [
@@ -2273,7 +2314,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   metadata: {
                     invoiceId: invoice.id,
                     invoiceNumber: (invoice as any).invoiceNumber,
-                    warehouseId: (invoice as any).warehouseId ?? null,
+                    locationId: (invoice as any).locationId ?? null,
                     paymentDate,
                     amount: amount.toString(),
                     bankAccountId: bankAccount.id,
@@ -3341,7 +3382,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
     try {
       const preMoves = await prisma.stockMove.findMany({
         where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
-        select: { warehouseId: true, itemId: true },
+        select: { locationId: true, itemId: true },
       });
       if ((preMoves ?? []).length > 0) {
         reply.status(400);
@@ -3677,10 +3718,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     try {
       const preMoves = await prisma.stockMove.findMany({
         where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
-        select: { warehouseId: true, itemId: true },
+        select: { locationId: true, itemId: true },
       });
       const stockLockKeys = Array.from(
-        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`))
+        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.locationId}:${m.itemId}`))
       );
 
       const wrapped = async (fn: () => Promise<any>) =>
@@ -3762,7 +3803,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
             // Capture original inventory moves (if any) before we post reversal JE.
             const origMoves = await tx.stockMove.findMany({
               where: { companyId, referenceType: 'CreditNote', referenceId: String(cn.id) },
-              select: { warehouseId: true, itemId: true, quantity: true, totalCostApplied: true },
+              select: { locationId: true, itemId: true, quantity: true, totalCostApplied: true },
             });
 
             const { reversal } = await createReversalJournalEntry(tx, {
@@ -3778,7 +3819,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
               for (const m of origMoves as any[]) {
                 await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId: m.warehouseId,
+                  locationId: m.locationId,
                   itemId: m.itemId,
                   date: voidDate,
                   type: 'ADJUSTMENT',
@@ -4092,11 +4133,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
         where: { id: creditNoteId, companyId },
         select: {
           id: true,
-          company: { select: { defaultWarehouseId: true } },
+          company: { select: { defaultLocationId: true } },
           lines: {
             select: {
               itemId: true,
-              item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+              item: { select: { type: true, trackInventory: true, defaultLocationId: true } },
             },
           },
         },
@@ -4106,18 +4147,18 @@ export async function booksRoutes(fastify: FastifyInstance) {
         return { error: 'credit note not found' };
       }
 
-      let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
-      if (!fallbackWarehouseId) {
-        const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
-        fallbackWarehouseId = wh?.id ?? null;
+      let fallbackLocationId = pre.company.defaultLocationId ?? null;
+      if (!fallbackLocationId) {
+        const loc = await prisma.location.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+        fallbackLocationId = loc?.id ?? null;
       }
 
       const trackedLines = (pre.lines ?? []).filter((l: any) => l.item.type === 'GOODS' && l.item.trackInventory);
       if (trackedLines.length > 0) {
-        const missingWh = trackedLines.some((l: any) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+        const missingWh = trackedLines.some((l: any) => !(l.item.defaultLocationId ?? fallbackLocationId));
         if (missingWh) {
           reply.status(400);
-          return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+          return { error: 'default location is not set (set company.defaultLocationId or item.defaultLocationId)' };
         }
       }
 
@@ -4125,8 +4166,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
         trackedLines.length === 0
           ? []
           : trackedLines.map((l: any) => {
-              const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId) as number;
-              return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+              const lid = (l.item.defaultLocationId ?? fallbackLocationId) as number;
+              return `lock:stock:${companyId}:${lid}:${l.itemId}`;
             });
 
       const { response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () =>
@@ -4228,9 +4269,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
                   await ensureInventoryItem(tx as any, companyId, line.itemId);
 
-                  // Clean cost + warehouse allocation:
+                  // Clean cost + location allocation:
                   // Allocate return quantity across the original SALE_ISSUE StockMoves for this invoice+item.
-                  // This guarantees the return uses the same cost basis and warehouse(s) as the original sale.
+                  // This guarantees the return uses the same cost basis and location(s) as the original sale.
                   const saleMoves = (await tx.stockMove.findMany({
                     where: {
                       companyId,
@@ -4240,8 +4281,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
                       referenceType: 'Invoice',
                       referenceId: String(sourceInvoiceId),
                     },
-                    orderBy: [{ warehouseId: 'asc' }, { id: 'asc' }],
-                    select: { id: true, warehouseId: true, quantity: true, unitCostApplied: true },
+                    orderBy: [{ locationId: 'asc' }, { id: 'asc' }],
+                    select: { id: true, locationId: true, quantity: true, unitCostApplied: true },
                   })) as any[];
                   if (!saleMoves.length) {
                     throw Object.assign(new Error('cannot locate original sale stock moves for return (invoice linkage missing or inventory not tracked at sale time)'), {
@@ -4251,11 +4292,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
                     });
                   }
 
-                  // Returned qty for this invoice+item by warehouse (posted credit notes only)
-                  const returnedByWh = (await tx.$queryRaw<
-                    Array<{ warehouseId: number; qty: any }>
+                  // Returned qty for this invoice+item by location (posted credit notes only)
+                  const returnedByLocation = (await tx.$queryRaw<
+                    Array<{ locationId: number; qty: any }>
                   >`
-                    SELECT sm.warehouseId as warehouseId, SUM(sm.quantity) as qty
+                    SELECT sm.warehouseId as locationId, SUM(sm.quantity) as qty
                     FROM StockMove sm
                     JOIN CreditNote cn2
                       ON cn2.id = CAST(sm.referenceId AS SIGNED)
@@ -4268,25 +4309,25 @@ export async function booksRoutes(fastify: FastifyInstance) {
                       AND cn2.invoiceId = ${sourceInvoiceId}
                       AND cn2.status = 'POSTED'
                     GROUP BY sm.warehouseId
-                  `) as Array<{ warehouseId: number; qty: any }>;
+                  `) as Array<{ locationId: number; qty: any }>;
                   const returnedWhMap = new Map<number, Prisma.Decimal>(
-                    (returnedByWh ?? []).map((r) => [Number(r.warehouseId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)])
+                    (returnedByLocation ?? []).map((r) => [Number(r.locationId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)])
                   );
 
-                  // Compute remaining quantities per sale move after previous returns (FIFO per warehouse)
-                  const movesByWarehouse = new Map<number, any[]>();
+                  // Compute remaining quantities per sale move after previous returns (FIFO per location)
+                  const movesByLocation = new Map<number, any[]>();
                   for (const m of saleMoves) {
-                    const wid = Number(m.warehouseId);
-                    const list = movesByWarehouse.get(wid) ?? [];
+                    const lid = Number(m.locationId);
+                    const list = movesByLocation.get(lid) ?? [];
                     list.push(m);
-                    movesByWarehouse.set(wid, list);
+                    movesByLocation.set(lid, list);
                   }
 
                   // Allocate return qty across warehouses/moves
                   let remainingToReturn = qty.toDecimalPlaces(2);
-                  for (const [wid, moves] of movesByWarehouse.entries()) {
+                  for (const [lid, moves] of movesByLocation.entries()) {
                     if (remainingToReturn.lessThanOrEqualTo(0)) break;
-                    let returnedToConsume = returnedWhMap.get(wid) ?? new Prisma.Decimal(0);
+                    let returnedToConsume = returnedWhMap.get(lid) ?? new Prisma.Decimal(0);
 
                     for (const m of moves) {
                       if (remainingToReturn.lessThanOrEqualTo(0)) break;
@@ -4303,7 +4344,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
                       const applied = await applyStockMoveWac(tx as any, {
                         companyId,
-                        warehouseId: wid,
+                        locationId: lid,
                         itemId: line.itemId,
                         date: cn.creditNoteDate,
                         type: 'SALE_RETURN',

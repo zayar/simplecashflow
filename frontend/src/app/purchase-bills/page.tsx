@@ -67,7 +67,7 @@ export default function PurchaseBillsPage() {
                 <TableHead className="w-[140px]">Date</TableHead>
                 <TableHead className="w-[180px]">Number</TableHead>
                 <TableHead>Vendor</TableHead>
-                <TableHead>Warehouse</TableHead>
+                <TableHead>Location</TableHead>
                 <TableHead className="w-[120px]">Status</TableHead>
                 <TableHead className="text-right">Total</TableHead>
               </TableRow>
@@ -89,7 +89,7 @@ export default function PurchaseBillsPage() {
                   </TableCell>
                   <TableCell className="font-medium">{b.billNumber}</TableCell>
                   <TableCell>{b.vendorName ?? '—'}</TableCell>
-                  <TableCell className="text-muted-foreground">{b.warehouseName ?? '—'}</TableCell>
+                  <TableCell className="text-muted-foreground">{b.locationName ?? b.warehouseName ?? '—'}</TableCell>
                   <TableCell>{statusBadge(b.status)}</TableCell>
                   <TableCell className="text-right font-medium tabular-nums">
                     {Number(b.total ?? 0).toLocaleString()}

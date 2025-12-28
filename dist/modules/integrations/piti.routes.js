@@ -5,11 +5,24 @@ import { postJournalEntry } from '../ledger/posting.service.js';
 import { forbidClientProvidedCompanyId } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
+import { requireIntegrationKey } from './integrationAuth.js';
+import { upsertPostedCreditNoteFromPitiRefund, upsertPostedInvoiceFromPitiSale } from './piti.service.js';
 export async function pitiRoutes(fastify) {
-    // Integration endpoints should be protected (JWT for now).
-    // Later: switch to signed webhooks / service-to-service auth.
-    fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
+    // Integration auth:
+    // - Prefer service-to-service `X-Integration-Key` for Piti team
+    // - Allow JWT as fallback for internal testing
+    fastify.addHook('preHandler', async (request, reply) => {
+        const hasIntegrationKey = Boolean(request.headers?.['x-integration-key']);
+        if (hasIntegrationKey) {
+            const ok = requireIntegrationKey(request, reply, 'PITI_INTEGRATION_API_KEY');
+            if (!ok)
+                return;
+            return;
+        }
+        // fallback to JWT
+        return fastify.authenticate(request, reply);
+    });
     // --- Piti integration: simple cash sale ---
     // This simulates Piti sending a sale event to the ledger.
     fastify.post('/integrations/piti/sale', async (request, reply) => {
@@ -84,6 +97,78 @@ export async function pitiRoutes(fastify) {
             return entry;
         }, redis);
         return response;
+    });
+    /**
+     * Piti -> Cashflow: Sale Completed (Finance import)
+     *
+     * Creates a POSTED invoice (and optional payment) in Cashflow.
+     * IMPORTANT: Items created by this endpoint will have trackInventory=false.
+     */
+    fastify.post('/integrations/piti/companies/:companyId/sales', async (request, reply) => {
+        const companyId = Number(request.params?.companyId);
+        if (!Number.isInteger(companyId) || companyId <= 0) {
+            reply.status(400);
+            return { error: 'invalid companyId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        try {
+            const { replay, response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const payload = request.body;
+                const result = await upsertPostedInvoiceFromPitiSale({
+                    prisma,
+                    companyId,
+                    idempotencyKey,
+                    payload,
+                    userId: request.user?.userId ?? null,
+                });
+                return result;
+            }, redis);
+            // Keep response stable (ignore replay flag for now)
+            return response;
+        }
+        catch (err) {
+            reply.status(400);
+            return { error: err?.message ?? 'invalid payload' };
+        }
+    });
+    /**
+     * Piti -> Cashflow: Refund/Return (Finance import)
+     *
+     * Creates a POSTED credit note in Cashflow and posts the required journal entry.
+     * IMPORTANT: This is finance-only (no stock moves).
+     */
+    fastify.post('/integrations/piti/companies/:companyId/refunds', async (request, reply) => {
+        const companyId = Number(request.params?.companyId);
+        if (!Number.isInteger(companyId) || companyId <= 0) {
+            reply.status(400);
+            return { error: 'invalid companyId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        try {
+            const { response } = await runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const payload = request.body;
+                return await upsertPostedCreditNoteFromPitiRefund({
+                    prisma,
+                    companyId,
+                    idempotencyKey,
+                    payload,
+                    userId: request.user?.userId ?? null,
+                });
+            }, redis);
+            return response;
+        }
+        catch (err) {
+            reply.status(400);
+            return { error: err?.message ?? 'invalid payload' };
+        }
     });
 }
 //# sourceMappingURL=piti.routes.js.map

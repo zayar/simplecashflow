@@ -77,6 +77,17 @@ export async function postJournalEntry(tx, input) {
             });
         }
     }
+    // Optional location tagging. Validate tenant safety.
+    const locationId = input.locationId ?? input.warehouseId ?? null;
+    if (locationId) {
+        const loc = await tx.location.findFirst({
+            where: { id: locationId, companyId },
+            select: { id: true },
+        });
+        if (!loc) {
+            throw Object.assign(new Error('locationId does not belong to this company'), { statusCode: 400 });
+        }
+    }
     // Balance check using Decimal
     let totalDebit = d0();
     let totalCredit = d0();
@@ -99,6 +110,7 @@ export async function postJournalEntry(tx, input) {
             entryNumber,
             date,
             description,
+            locationId,
             createdByUserId: input.createdByUserId ?? null,
             reversalOfJournalEntryId: input.reversalOfJournalEntryId ?? null,
             reversalReason: input.reversalReason ?? null,

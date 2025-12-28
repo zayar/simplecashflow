@@ -32,14 +32,14 @@
 - [x] `DEPLOY_TAX_MODULE.sh` - NEW: Deployment automation
 
 #### Documentation (8 files)
-- [x] `CRITICAL_FIXES_SUMMARY.md`
-- [x] `CRITICAL_FIX_5_TAX_MIGRATION.md`
-- [x] `TAX_MODULE_IMPLEMENTATION_GUIDE.md`
-- [x] `TAX_MODULE_ARCHITECTURE.md`
-- [x] `TAX_MODULE_COMPLETE.md`
-- [x] `IMPLEMENTATION_COMPLETE.md`
-- [x] `DEPLOYMENT_CHECKLIST.md` (this file)
-- [x] `TAX_MODULE_SUMMARY.txt`
+- [x] `docs/tax/CRITICAL_FIXES_SUMMARY.md`
+- [x] `docs/tax/CRITICAL_FIX_5_TAX_MIGRATION.md`
+- [x] `docs/tax/TAX_MODULE_IMPLEMENTATION_GUIDE.md`
+- [x] `docs/tax/TAX_MODULE_ARCHITECTURE.md`
+- [x] `docs/tax/TAX_MODULE_COMPLETE.md`
+- [x] `docs/release/IMPLEMENTATION_COMPLETE.md`
+- [x] `docs/deploy/DEPLOYMENT_CHECKLIST.md` (this file)
+- [x] `docs/tax/TAX_MODULE_SUMMARY.txt`
 
 ---
 

@@ -3,7 +3,7 @@ import type { PrismaTx } from '../ledger/posting.service.js';
 
 export type StockMoveInput = {
   companyId: number;
-  warehouseId: number;
+  locationId: number;
   itemId: number;
   date: Date;
   /**
@@ -11,7 +11,7 @@ export type StockMoveInput = {
    * To keep WAC and "no oversell" correct, we must apply stock moves in chronological order.
    *
    * If allowBackdated is false (default), we reject moves dated earlier than the latest StockMove
-   * for the same (companyId, warehouseId, itemId).
+   * for the same (companyId, locationId, itemId).
    */
   allowBackdated?: boolean;
   type:
@@ -49,7 +49,7 @@ export async function getCompanyInventoryConfig(tx: PrismaTx, companyId: number)
       inventoryAssetAccountId: true,
       cogsAccountId: true,
       openingBalanceEquityAccountId: true,
-      defaultWarehouseId: true,
+      defaultLocationId: true,
     },
   });
   if (!company) {
@@ -60,7 +60,7 @@ export async function getCompanyInventoryConfig(tx: PrismaTx, companyId: number)
     inventoryAssetAccountId: number | null;
     cogsAccountId: number | null;
     openingBalanceEquityAccountId: number | null;
-    defaultWarehouseId: number | null;
+    defaultLocationId: number | null;
   };
 }
 
@@ -77,27 +77,27 @@ export async function ensureInventoryCompanyDefaults(tx: PrismaTx, companyId: nu
       inventoryAssetAccountId: true,
       cogsAccountId: true,
       openingBalanceEquityAccountId: true,
-      defaultWarehouseId: true,
+      defaultLocationId: true,
     },
   });
   if (!company) throw Object.assign(new Error('company not found'), { statusCode: 404 });
 
-  // 1) Default warehouse
-  let defaultWarehouseId: number | null = company.defaultWarehouseId ?? null;
-  if (!defaultWarehouseId) {
-    const wh = await (tx as any).warehouse.findFirst({
+  // 1) Default location
+  let defaultLocationId: number | null = company.defaultLocationId ?? null;
+  if (!defaultLocationId) {
+    const loc = await (tx as any).location.findFirst({
       where: { companyId, isDefault: true },
       select: { id: true },
     });
-    if (wh?.id) {
-      defaultWarehouseId = wh.id;
+    if (loc?.id) {
+      defaultLocationId = loc.id;
     } else {
-      // Create a default warehouse
-      const created = await (tx as any).warehouse.create({
-        data: { companyId, name: 'Main Warehouse', isDefault: true },
+      // Create a default location
+      const created = await (tx as any).location.create({
+        data: { companyId, name: 'Main Location', isDefault: true },
         select: { id: true },
       });
-      defaultWarehouseId = created.id;
+      defaultLocationId = created.id;
     }
   }
 
@@ -179,7 +179,7 @@ export async function ensureInventoryCompanyDefaults(tx: PrismaTx, companyId: nu
   await (tx as any).company.update({
     where: { id: companyId },
     data: {
-      defaultWarehouseId,
+      defaultLocationId,
       inventoryAssetAccountId,
       cogsAccountId,
       openingBalanceEquityAccountId,
@@ -188,22 +188,27 @@ export async function ensureInventoryCompanyDefaults(tx: PrismaTx, companyId: nu
 
   return {
     id: companyId,
-    defaultWarehouseId,
+    defaultLocationId,
     inventoryAssetAccountId,
     cogsAccountId,
     openingBalanceEquityAccountId,
   };
 }
 
-export async function ensureWarehouse(tx: PrismaTx, companyId: number, warehouseId: number) {
-  const wh = await (tx as any).warehouse.findFirst({
-    where: { id: warehouseId, companyId },
+export async function ensureLocation(tx: PrismaTx, companyId: number, locationId: number) {
+  const loc = await (tx as any).location.findFirst({
+    where: { id: locationId, companyId },
     select: { id: true, name: true, isDefault: true },
   });
-  if (!wh) {
-    throw Object.assign(new Error('warehouse not found'), { statusCode: 400 });
+  if (!loc) {
+    throw Object.assign(new Error('location not found'), { statusCode: 400 });
   }
-  return wh as { id: number; name: string; isDefault: boolean };
+  return loc as { id: number; name: string; isDefault: boolean };
+}
+
+// Backward-compatible alias during migration.
+export async function ensureWarehouse(tx: PrismaTx, companyId: number, warehouseId: number) {
+  return await ensureLocation(tx, companyId, warehouseId);
 }
 
 export async function ensureInventoryItem(tx: PrismaTx, companyId: number, itemId: number) {
@@ -238,7 +243,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
   // independent of Redis availability.
   const existing = await lockAndGetStockBalanceRowForUpdate(tx, {
     companyId: input.companyId,
-    warehouseId: input.warehouseId,
+    locationId: input.locationId,
     itemId: input.itemId,
   });
 
@@ -247,7 +252,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
   // after later purchases were already posted.
   if (!input.allowBackdated) {
     const lastMove = await (tx as any).stockMove.findFirst({
-      where: { companyId: input.companyId, warehouseId: input.warehouseId, itemId: input.itemId },
+      where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
       orderBy: [{ date: 'desc' }, { id: 'desc' }],
       select: { date: true },
     });
@@ -271,7 +276,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
       throw Object.assign(new Error('insufficient stock'), {
         statusCode: 400,
         itemId: input.itemId,
-        warehouseId: input.warehouseId,
+        locationId: input.locationId,
         qtyOnHand: Q.toString(),
         qtyRequested: qty.toString(),
       });
@@ -294,9 +299,9 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
 
     const balance = await (tx as any).stockBalance.upsert({
       where: {
-        companyId_warehouseId_itemId: {
+        companyId_locationId_itemId: {
           companyId: input.companyId,
-          warehouseId: input.warehouseId,
+          locationId: input.locationId,
           itemId: input.itemId,
         },
       },
@@ -307,7 +312,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
       },
       create: {
         companyId: input.companyId,
-        warehouseId: input.warehouseId,
+        locationId: input.locationId,
         itemId: input.itemId,
         qtyOnHand: newQ,
         avgUnitCost: newA,
@@ -318,7 +323,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
     const move = await (tx as any).stockMove.create({
       data: {
         companyId: input.companyId,
-        warehouseId: input.warehouseId,
+        locationId: input.locationId,
         itemId: input.itemId,
         date: input.date,
         type: input.type,
@@ -351,9 +356,9 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
 
   const balance = await (tx as any).stockBalance.upsert({
     where: {
-      companyId_warehouseId_itemId: {
+      companyId_locationId_itemId: {
         companyId: input.companyId,
-        warehouseId: input.warehouseId,
+        locationId: input.locationId,
         itemId: input.itemId,
       },
     },
@@ -364,7 +369,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
     },
     create: {
       companyId: input.companyId,
-      warehouseId: input.warehouseId,
+      locationId: input.locationId,
       itemId: input.itemId,
       qtyOnHand: newQ,
       avgUnitCost: newA,
@@ -375,7 +380,7 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
   const move = await (tx as any).stockMove.create({
     data: {
       companyId: input.companyId,
-      warehouseId: input.warehouseId,
+      locationId: input.locationId,
       itemId: input.itemId,
       date: input.date,
       type: input.type,
@@ -401,25 +406,25 @@ export async function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInput
 
 async function lockAndGetStockBalanceRowForUpdate(
   tx: PrismaTx,
-  input: { companyId: number; warehouseId: number; itemId: number }
+  input: { companyId: number; locationId: number; itemId: number }
 ): Promise<{ qtyOnHand: Prisma.Decimal; avgUnitCost: Prisma.Decimal; inventoryValue: Prisma.Decimal } | null> {
-  const { companyId, warehouseId, itemId } = input;
+  const { companyId, locationId, itemId } = input;
   if (!Number.isInteger(companyId) || companyId <= 0) return null;
-  if (!Number.isInteger(warehouseId) || warehouseId <= 0) return null;
+  if (!Number.isInteger(locationId) || locationId <= 0) return null;
   if (!Number.isInteger(itemId) || itemId <= 0) return null;
 
   // Ensure the row exists so we can reliably acquire a row lock.
   // Uses the unique key (companyId, warehouseId, itemId).
   await (tx as any).$executeRaw`
     INSERT INTO StockBalance (companyId, warehouseId, itemId, qtyOnHand, avgUnitCost, inventoryValue, createdAt, updatedAt)
-    VALUES (${companyId}, ${warehouseId}, ${itemId}, 0, 0, 0, NOW(), NOW())
+    VALUES (${companyId}, ${locationId}, ${itemId}, 0, 0, 0, NOW(), NOW())
     ON DUPLICATE KEY UPDATE updatedAt = updatedAt
   `;
 
   const rows = (await (tx as any).$queryRaw`
     SELECT qtyOnHand, avgUnitCost, inventoryValue
     FROM StockBalance
-    WHERE companyId = ${companyId} AND warehouseId = ${warehouseId} AND itemId = ${itemId}
+    WHERE companyId = ${companyId} AND warehouseId = ${locationId} AND itemId = ${itemId}
     FOR UPDATE
   `) as Array<{ qtyOnHand: any; avgUnitCost: any; inventoryValue: any }>;
 
@@ -434,7 +439,7 @@ async function lockAndGetStockBalanceRowForUpdate(
 
 export async function getStockBalanceForUpdate(
   tx: PrismaTx,
-  input: { companyId: number; warehouseId: number; itemId: number }
+  input: { companyId: number; locationId: number; itemId: number }
 ) {
   return await lockAndGetStockBalanceRowForUpdate(tx, input);
 }

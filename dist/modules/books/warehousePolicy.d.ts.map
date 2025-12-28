@@ -1,0 +1,1 @@
+{"version":3,"file":"warehousePolicy.d.ts","sourceRoot":"","sources":["../../../src/modules/books/warehousePolicy.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;GAUG;AACH,wBAAgB,4BAA4B,CAAC,IAAI,EAAE;IACjD,iBAAiB,EAAE,MAAM,GAAG,IAAI,GAAG,SAAS,CAAC;IAC7C,qBAAqB,EAAE,MAAM,GAAG,IAAI,GAAG,SAAS,CAAC;IACjD,wBAAwB,EAAE,MAAM,GAAG,IAAI,GAAG,SAAS,CAAC;CACrD,GAAG,MAAM,GAAG,IAAI,CAYhB"}

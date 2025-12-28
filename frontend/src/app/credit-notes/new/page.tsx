@@ -32,6 +32,7 @@ type Line = {
   unitPrice: number;
   taxRate: number; // decimal, e.g. 0.07
   taxLabel: string;
+  discount?: number;
   incomeAccountId?: string;
 };
 
@@ -56,7 +57,7 @@ export default function NewCreditNotePage() {
   const [customerNotes, setCustomerNotes] = useState('');
   const [termsAndConditions, setTermsAndConditions] = useState('');
   const [lines, setLines] = useState<Line[]>([
-    { itemId: '', description: '', quantity: 1, unitPrice: 0, taxRate: 0, taxLabel: '' },
+    { itemId: '', description: '', quantity: 1, unitPrice: 0, taxRate: 0, taxLabel: '', discount: 0 },
   ]);
   const [sourceInvoice, setSourceInvoice] = useState<any>(null);
 
@@ -134,13 +135,16 @@ export default function NewCreditNotePage() {
   }, [user?.companyId, search]);
 
   const totals = useMemo(() => {
-    const subtotal = lines.reduce(
-      (sum, l) => sum + Number(l.quantity || 0) * Number(l.unitPrice || 0),
-      0
-    );
+    const subtotal = lines.reduce((sum, l) => {
+      const raw = Number(l.quantity || 0) * Number(l.unitPrice || 0);
+      const discount = Math.max(0, Number((l as any).discount || 0));
+      return sum + Math.max(0, raw - discount);
+    }, 0);
     const tax = lines.reduce((sum, l) => {
-      const lineSubtotal = Number(l.quantity || 0) * Number(l.unitPrice || 0);
-      return sum + lineSubtotal * Number(l.taxRate || 0);
+      const raw = Number(l.quantity || 0) * Number(l.unitPrice || 0);
+      const discount = Math.max(0, Number((l as any).discount || 0));
+      const net = Math.max(0, raw - discount);
+      return sum + net * Number(l.taxRate || 0);
     }, 0);
     return { subtotal, tax, total: subtotal + tax };
   }, [lines]);
@@ -173,6 +177,7 @@ export default function NewCreditNotePage() {
         unitPrice: 0,
         taxRate: 0,
         taxLabel: '',
+        discount: 0,
         incomeAccountId: defaultIncomeAccountId ? String(defaultIncomeAccountId) : '',
       },
     ]);
@@ -232,6 +237,7 @@ export default function NewCreditNotePage() {
             quantity: Number(l.quantity),
             unitPrice: Number(l.unitPrice),
               taxRate: Number(l.taxRate || 0),
+            discountAmount: Number((l as any).discount || 0),
             incomeAccountId:
               Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
                 ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
@@ -308,7 +314,11 @@ export default function NewCreditNotePage() {
               </TableHeader>
               <TableBody>
                 {lines.map((l, idx) => {
-                  const lineSubtotal = Number(l.quantity || 0) * Number(l.unitPrice || 0);
+                  const rawSubtotal = Number(l.quantity || 0) * Number(l.unitPrice || 0);
+                  const discount = Math.max(0, Number((l as any).discount || 0));
+                  const netSubtotal = Math.max(0, rawSubtotal - discount);
+                  const lineTax = netSubtotal * Number(l.taxRate || 0);
+                  const itemAmount = netSubtotal + lineTax;
                   return (
                     <>
                     <TableRow key={`main-${idx}`} className="border-b-0">
@@ -398,10 +408,18 @@ export default function NewCreditNotePage() {
                 </DropdownMenu>
                       </TableCell>
                       <TableCell className="align-top">
-                        <Input disabled className="text-right" value="0.00" />
+                        <Input
+                          inputMode="decimal"
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          className="text-right"
+                          value={Number((l as any).discount || 0)}
+                          onChange={(e) => updateLine(idx, { discount: Number(e.target.value || 0) } as any)}
+                        />
                       </TableCell>
                       <TableCell className="align-top text-right font-semibold tabular-nums">
-                        {lineSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {itemAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </TableCell>
                       <TableCell className="align-top text-right">
                         <Button variant="ghost" size="icon" onClick={() => removeLine(idx)} type="button" disabled={lines.length <= 1}>

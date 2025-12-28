@@ -28,4 +28,29 @@ Open the app at the URL shown by Vite (usually `http://localhost:5173`).
 - Requests send `Authorization: Bearer <token>`.
 - All non-GET requests automatically include `Idempotency-Key` for fintech safety.
 
+## Deploy (Cloud Run)
+
+This repo already deploys the API + Next frontend to Cloud Run. The mobile PWA can be deployed the same way.
+
+### 1) Configure API base URL
+
+The PWA is a **static** build; API URL is baked at build-time via `VITE_API_URL`.
+
+Example:
+
+```bash
+export VITE_API_URL="https://cashflow-api-xxxx.asia-southeast1.run.app"
+```
+
+### 2) Deploy
+
+```bash
+cd ..
+./deploy/deploy_mobile_pwa.sh
+```
+
+This will:
+- Build and push `gcr.io/$PROJECT_ID/cashflow-mobile-pwa`
+- Deploy Cloud Run service `cashflow-mobile-pwa`
+
 

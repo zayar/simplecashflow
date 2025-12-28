@@ -79,11 +79,11 @@ export async function authRoutes(fastify: FastifyInstance) {
         include: { accounts: true },
       });
 
-      // Create default warehouse (Inventory V1)
-      const warehouse = await tx.warehouse.create({
+      // Create default location (Inventory V1)
+      const location = await tx.location.create({
         data: {
           companyId: company.id,
-          name: 'Main Warehouse',
+          name: 'Main Location',
           isDefault: true,
         },
       });
@@ -114,7 +114,7 @@ export async function authRoutes(fastify: FastifyInstance) {
       await tx.company.update({
         where: { id: company.id },
         data: {
-          defaultWarehouseId: warehouse.id,
+          defaultLocationId: location.id,
           ...(inventoryAccount ? { inventoryAssetAccountId: inventoryAccount.id } : {}),
           ...(cogsAccount ? { cogsAccountId: cogsAccount.id } : {}),
           ...(openingEquity ? { openingBalanceEquityAccountId: openingEquity.id } : {}),

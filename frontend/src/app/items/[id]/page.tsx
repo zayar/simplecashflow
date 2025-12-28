@@ -9,6 +9,12 @@ import { Badge } from '@/components/ui/badge';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
   Table,
   TableBody,
   TableCell,
@@ -16,6 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { Settings2 } from 'lucide-react';
 
 type TabKey = 'overview' | 'locations' | 'transactions';
 
@@ -99,6 +106,7 @@ export default function ItemDetailPage() {
   const itemId = Number(params?.id);
 
   const [tab, setTab] = useState<TabKey>('overview');
+  const [stockMode, setStockMode] = useState<'accounting' | 'physical'>('accounting');
   const [item, setItem] = useState<any | null>(null);
   const [balances, setBalances] = useState<any[]>([]);
   const [moves, setMoves] = useState<any[]>([]);
@@ -207,8 +215,8 @@ export default function ItemDetailPage() {
                 </span>
               </div>
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Default Warehouse</span>
-                <span className="font-medium">{item?.defaultWarehouse?.name ?? 'Company default'}</span>
+                <span className="text-muted-foreground">Default Location</span>
+                <span className="font-medium">{item?.defaultLocation?.name ?? item?.defaultWarehouse?.name ?? 'Company default'}</span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Valuation</span>
@@ -242,25 +250,78 @@ export default function ItemDetailPage() {
       {tab === 'locations' && (
         <Card className="shadow-sm">
           <CardHeader>
-            <CardTitle className="text-lg">Stock by location</CardTitle>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <CardTitle className="text-lg">Stock Locations</CardTitle>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="icon" title="Options">
+                      <Settings2 className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start">
+                    <DropdownMenuItem disabled>Options (coming soon)</DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+
+              <div className="inline-flex rounded-md border bg-background p-1">
+                <Button
+                  type="button"
+                  variant={stockMode === 'accounting' ? 'default' : 'ghost'}
+                  className="h-8 rounded-sm"
+                  onClick={() => setStockMode('accounting')}
+                >
+                  Accounting Stock
+                </Button>
+                <Button
+                  type="button"
+                  variant={stockMode === 'physical' ? 'default' : 'ghost'}
+                  className="h-8 rounded-sm"
+                  onClick={() => setStockMode('physical')}
+                >
+                  Physical Stock
+                </Button>
+              </div>
+            </div>
           </CardHeader>
           <CardContent className="pt-0">
+            {stockMode === 'physical' ? (
+              <div className="mb-3 text-xs text-muted-foreground">
+                Physical stock tracking is not yet implemented, so this view currently matches accounting stock.
+              </div>
+            ) : (
+              <div className="mb-3 text-xs text-muted-foreground">
+                Committed stock (reservations) is not tracked yet, so it shows as 0.
+              </div>
+            )}
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Warehouse</TableHead>
-                  <TableHead className="w-[140px] text-right">Qty</TableHead>
-                  <TableHead className="w-[160px] text-right">Avg Cost</TableHead>
-                  <TableHead className="w-[180px] text-right">Value</TableHead>
+                  <TableHead>Location name</TableHead>
+                  <TableHead className="w-[160px] text-right">Stock on hand</TableHead>
+                  <TableHead className="w-[160px] text-right">Committed stock</TableHead>
+                  <TableHead className="w-[180px] text-right">Available for sale</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {balances.map((b, idx) => (
                   <TableRow key={`${b.warehouse?.id ?? 'w'}-${idx}`}>
-                    <TableCell className="font-medium">{b.warehouse?.name ?? '—'}</TableCell>
+                    <TableCell className="font-medium">
+                      <div className="inline-flex items-center gap-2">
+                        <span>{b.warehouse?.name ?? '—'}</span>
+                        {b.warehouse?.isDefault ? (
+                          <span title="Default location" className="text-amber-500">
+                            ★
+                          </span>
+                        ) : null}
+                      </div>
+                    </TableCell>
                     <TableCell className="text-right tabular-nums">{Number(b.qtyOnHand ?? 0).toLocaleString()}</TableCell>
-                    <TableCell className="text-right tabular-nums">{Number(b.avgUnitCost ?? 0).toLocaleString()}</TableCell>
-                    <TableCell className="text-right font-medium tabular-nums">{Number(b.inventoryValue ?? 0).toLocaleString()}</TableCell>
+                    <TableCell className="text-right tabular-nums">0</TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">
+                      {Number(b.qtyOnHand ?? 0).toLocaleString()}
+                    </TableCell>
                   </TableRow>
                 ))}
                 {balances.length === 0 && (
@@ -287,7 +348,7 @@ export default function ItemDetailPage() {
                 <TableRow>
                   <TableHead className="w-[140px]">Date</TableHead>
                   <TableHead className="w-[160px]">Type</TableHead>
-                  <TableHead>Warehouse</TableHead>
+                  <TableHead>Location</TableHead>
                   <TableHead className="w-[120px] text-right">Qty</TableHead>
                   <TableHead className="w-[140px] text-right">Unit Cost</TableHead>
                   <TableHead className="w-[160px] text-right">Total</TableHead>

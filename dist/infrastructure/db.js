@@ -55,7 +55,7 @@ const TENANT_MODELS = new Set([
     'TaxRate',
     'User', // tenant-scoped users (email is global-unique, but data access must still be scoped)
     'Vendor',
-    'Warehouse',
+    'Location',
 ]);
 function whereHasCompanyId(where) {
     if (!where || typeof where !== 'object')

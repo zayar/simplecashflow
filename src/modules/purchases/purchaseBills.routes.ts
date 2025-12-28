@@ -31,7 +31,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
     const rows = await prisma.purchaseBill.findMany({
       where: { companyId },
       orderBy: [{ billDate: 'desc' }, { id: 'desc' }],
-      include: { vendor: true, warehouse: true },
+      include: { vendor: true, location: true },
     });
     return rows.map((b) => ({
       id: b.id,
@@ -40,7 +40,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       billDate: b.billDate,
       dueDate: b.dueDate ?? null,
       vendorName: b.vendor?.name ?? null,
-      warehouseName: b.warehouse?.name ?? null,
+      locationName: (b as any).location?.name ?? null,
       total: b.total.toString(),
       amountPaid: b.amountPaid.toString(),
       createdAt: b.createdAt,
@@ -55,7 +55,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       billDate?: string;
       dueDate?: string;
       currency?: string;
-      warehouseId?: number;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       lines?: { itemId?: number; quantity?: number; unitCost?: number; description?: string; accountId?: number }[];
     };
 
@@ -77,10 +78,10 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
 
     // Bootstrap defaults for older companies
     const cfg = await ensureInventoryCompanyDefaults(prisma as any, companyId);
-    const warehouseId = Number(body.warehouseId ?? cfg.defaultWarehouseId);
-    if (!warehouseId || Number.isNaN(warehouseId)) {
+    const locationId = Number(body.locationId ?? body.warehouseId ?? (cfg as any).defaultLocationId);
+    if (!locationId || Number.isNaN(locationId)) {
       reply.status(400);
-      return { error: 'warehouseId is required (or set company defaultWarehouseId)' };
+      return { error: 'locationId is required (or set company defaultLocationId)' };
     }
 
     if (body.vendorId) {
@@ -91,10 +92,10 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       }
     }
 
-    const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId } });
-    if (!wh) {
+    const loc = await prisma.location.findFirst({ where: { id: locationId, companyId } });
+    if (!loc) {
       reply.status(400);
-      return { error: 'warehouseId not found in this company' };
+      return { error: 'locationId not found in this company' };
     }
 
     // Compute lines + totals
@@ -155,7 +156,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       total = total.add(lineTotal);
       computedLines.push({
         companyId,
-        warehouseId,
+        locationId,
         itemId,
         accountId,
         description: l.description ?? null,
@@ -173,7 +174,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
         data: {
           companyId,
           vendorId: body.vendorId ?? null,
-          warehouseId,
+          locationId,
           billNumber,
           status: 'DRAFT',
           billDate,
@@ -185,7 +186,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
         } as any,
         include: {
           vendor: true,
-          warehouse: true,
+          location: true,
           lines: { include: { item: true, account: true } },
         },
       });
@@ -207,7 +208,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       where: { id: purchaseBillId, companyId },
       include: {
         vendor: true,
-        warehouse: true,
+        location: true,
         lines: { include: { item: true, account: true } },
         payments: {
           include: {
@@ -243,7 +244,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       dueDate: bill.dueDate ?? null,
       currency: bill.currency ?? null,
       vendor: bill.vendor,
-      warehouse: bill.warehouse,
+      location: (bill as any).location,
       total: bill.total,
       totalPaid,
       remainingBalance: Number(bill.total) - totalPaid,
@@ -287,7 +288,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       billDate?: string;
       dueDate?: string | null;
       currency?: string | null;
-      warehouseId?: number;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       lines?: { itemId?: number; quantity?: number; unitCost?: number; description?: string; accountId?: number }[];
     };
 
@@ -308,10 +310,10 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
     }
 
     const cfg = await ensureInventoryCompanyDefaults(prisma as any, companyId);
-    const warehouseId = Number(body.warehouseId ?? cfg.defaultWarehouseId);
-    if (!warehouseId || Number.isNaN(warehouseId)) {
+    const locationId = Number(body.locationId ?? body.warehouseId ?? (cfg as any).defaultLocationId);
+    if (!locationId || Number.isNaN(locationId)) {
       reply.status(400);
-      return { error: 'warehouseId is required (or set company defaultWarehouseId)' };
+      return { error: 'locationId is required (or set company defaultLocationId)' };
     }
 
     if (body.vendorId) {
@@ -322,10 +324,10 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       }
     }
 
-    const wh = await prisma.warehouse.findFirst({ where: { id: warehouseId, companyId } });
-    if (!wh) {
+    const loc2 = await prisma.location.findFirst({ where: { id: locationId, companyId } });
+    if (!loc2) {
       reply.status(400);
-      return { error: 'warehouseId not found in this company' };
+      return { error: 'locationId not found in this company' };
     }
 
     // Compute lines + totals (same rules as create)
@@ -379,7 +381,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
       total = total.add(lineTotal);
       computedLines.push({
         companyId,
-        warehouseId,
+        locationId,
         itemId,
         accountId,
         description: l.description ?? null,
@@ -413,7 +415,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
         where: { id: purchaseBillId, companyId },
         data: {
           vendorId: body.vendorId ?? null,
-          warehouseId,
+          locationId,
           billDate,
           dueDate: dueDate ?? null,
           currency: body.currency ?? null,
@@ -425,7 +427,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
         },
         include: {
           vendor: true,
-          warehouse: true,
+          location: true,
           lines: { include: { item: true, account: true } },
         },
       });
@@ -587,14 +589,14 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
 
     const pre = await prisma.purchaseBill.findFirst({
       where: { id: purchaseBillId, companyId },
-      select: { id: true, warehouseId: true, lines: { select: { itemId: true } } },
+      select: { id: true, locationId: true, lines: { select: { itemId: true } } },
     });
     if (!pre) {
       reply.status(404);
       return { error: 'purchase bill not found' };
     }
 
-    const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.warehouseId}:${l.itemId}`);
+    const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
 
     const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () =>
       withLockBestEffort(redis, lockKey, 30_000, async () =>
@@ -613,7 +615,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
 
             const bill = await (tx as any).purchaseBill.findFirst({
               where: { id: purchaseBillId, companyId },
-              include: { company: true, vendor: true, warehouse: true, lines: { include: { item: true } } },
+              include: { company: true, vendor: true, location: true, lines: { include: { item: true } } },
             });
             if (!bill) throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
             if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
@@ -658,7 +660,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                 await ensureInventoryItem(tx as any, companyId, l.itemId);
                 await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId: bill.warehouseId,
+                  locationId: bill.locationId,
                   itemId: l.itemId,
                   date: bill.billDate,
                   type: 'PURCHASE_RECEIPT',
@@ -767,7 +769,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               metadata: {
                 billNumber: bill.billNumber,
                 billDate: bill.billDate,
-                warehouseId: bill.warehouseId,
+                locationId: bill.locationId,
                 total: total.toString(),
                 journalEntryId: je.id,
               },
@@ -898,7 +900,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               total = total.add(lineTotal);
               computedLines.push({
                 companyId,
-                warehouseId: bill.warehouseId,
+                locationId: bill.locationId,
                 itemId,
                 accountId,
                 description: l.description ?? null,
@@ -1095,10 +1097,10 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
     try {
       const preMoves = await prisma.stockMove.findMany({
         where: { companyId, referenceType: 'PurchaseBill', referenceId: String(purchaseBillId) },
-        select: { warehouseId: true, itemId: true },
+        select: { locationId: true, itemId: true },
       });
       const stockLockKeys = Array.from(
-        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`))
+        new Set((preMoves ?? []).map((m: any) => `lock:stock:${companyId}:${m.locationId}:${m.itemId}`))
       );
       const wrapped = async (fn: () => Promise<any>) =>
         stockLockKeys.length > 0
@@ -1178,7 +1180,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
 
             const origMoves = await tx.stockMove.findMany({
               where: { companyId, referenceType: 'PurchaseBill', referenceId: String(bill.id) },
-              select: { warehouseId: true, itemId: true, quantity: true, totalCostApplied: true },
+              select: { locationId: true, itemId: true, quantity: true, totalCostApplied: true },
             });
 
             const { reversal } = await createReversalJournalEntry(tx, {
@@ -1193,7 +1195,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               for (const m of origMoves as any[]) {
                 await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId: m.warehouseId,
+                  locationId: m.locationId,
                   itemId: m.itemId,
                   date: voidDate,
                   type: 'ADJUSTMENT',

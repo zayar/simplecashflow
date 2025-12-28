@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Plus } from 'lucide-react';
+import { Loader2, Plus, Trash2 } from 'lucide-react';
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi } from '@/lib/api';
 import { formatDateInTimeZone } from '@/lib/utils';
@@ -25,6 +25,24 @@ export default function CreditNotesPage() {
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
   const [rows, setRows] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  async function deleteRow(e: React.MouseEvent, cn: any) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!user?.companyId) return;
+    if (deletingId === Number(cn.id)) return;
+    if (!confirm('Delete this credit note? This is only allowed for DRAFT/APPROVED credit notes.')) return;
+    try {
+      setDeletingId(Number(cn.id));
+      await fetchApi(`/companies/${user.companyId}/credit-notes/${cn.id}`, { method: 'DELETE' });
+      setRows((prev) => prev.filter((r) => r.id !== cn.id));
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to delete credit note');
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   useEffect(() => {
     if (!user?.companyId) return;
@@ -79,6 +97,7 @@ export default function CreditNotesPage() {
                   <TableHead className="w-[200px]">Customer</TableHead>
                   <TableHead className="text-right w-[160px]">Total</TableHead>
                   <TableHead className="text-right w-[160px]">Status</TableHead>
+                  <TableHead className="text-right w-[90px]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -108,6 +127,25 @@ export default function CreditNotesPage() {
                       <Badge variant={cn.status === 'POSTED' ? 'secondary' : 'outline'}>
                         {cn.status}
                       </Badge>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {(['DRAFT', 'APPROVED'].includes(String(cn.status)) && !cn.journalEntryId) ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="text-destructive hover:text-destructive"
+                          title="Delete"
+                          disabled={deletingId === Number(cn.id)}
+                          onClick={(e) => deleteRow(e, cn)}
+                        >
+                          {deletingId === Number(cn.id) ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                        </Button>
+                      ) : null}
                     </TableCell>
                   </TableRow>
                 ))}

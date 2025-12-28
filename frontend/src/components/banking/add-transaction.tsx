@@ -351,10 +351,10 @@ export function AddTransaction({
     fetchApi(`/companies/${companyId}/banking-accounts`).then(setBankingAccounts).catch(console.error)
   }, [open, companyId])
 
-  // Warehouses (Branch) list for tagging transactions.
+  // Locations list for tagging transactions.
   useEffect(() => {
     if (!open) return
-    fetchApi(`/companies/${companyId}/warehouses`).then(setWarehouses).catch(console.error)
+    fetchApi(`/companies/${companyId}/locations`).then(setWarehouses).catch(console.error)
   }, [open, companyId])
 
   // Flow-specific lookups
@@ -397,7 +397,7 @@ export function AddTransaction({
       const base = String(desc ?? "").trim()
       const whName = String(selectedWarehouse?.name ?? "").trim()
       if (!whName) return base
-      return `Branch: ${whName} — ${base}`.trim()
+      return `Location: ${whName} — ${base}`.trim()
     },
     [selectedWarehouse]
   )
@@ -730,7 +730,7 @@ export function AddTransaction({
         if (!description.trim()) description = preset === "customer_advance" ? "Customer advance" : "Money in"
 
         if (preset === "customer_advance") {
-          if (!warehouseId) throw new Error("Please select a branch (warehouse)")
+          if (!warehouseId) throw new Error("Please select a location")
           if (!customerAdvanceCustomerId) throw new Error("Please select a customer")
           const customerName = String(selectedCustomerAdvanceCustomer?.name ?? "").trim()
           if (customerName) description = `Customer advance • ${customerName} — ${description}`.trim()
@@ -793,7 +793,7 @@ export function AddTransaction({
         if (!description.trim()) description = preset === "supplier_advance" ? "Supplier advance" : "Money out"
 
         if (preset === "supplier_advance") {
-          if (!warehouseId) throw new Error("Please select a branch (warehouse)")
+          if (!warehouseId) throw new Error("Please select a location")
           if (!supplierAdvanceVendorId) throw new Error("Please select a supplier")
           const supplierName = String(selectedSupplier?.name ?? "").trim()
           if (supplierName) {
@@ -946,10 +946,10 @@ export function AddTransaction({
             </div>
           </div>
 
-          {/* Common: Branch/Warehouse tagging */}
+          {/* Common: Location tagging */}
           <div className="grid gap-2 md:max-w-[420px]">
             <Label>
-              Branch (Warehouse)
+              Location
               {preset === "supplier_advance" || preset === "customer_advance" ? "*" : ""}
             </Label>
             <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>

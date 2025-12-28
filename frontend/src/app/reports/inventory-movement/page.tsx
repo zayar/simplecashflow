@@ -14,8 +14,8 @@ export default function InventoryMovementReportPage() {
   const { user, companySettings } = useAuth();
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
-  const [warehouseId, setWarehouseId] = useState('');
-  const [warehouses, setWarehouses] = useState<any[]>([]);
+  const [locationId, setLocationId] = useState('');
+  const [locations, setLocations] = useState<any[]>([]);
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -34,7 +34,7 @@ export default function InventoryMovementReportPage() {
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setLocations).catch(console.error);
   }, [user?.companyId]);
 
   const load = async () => {
@@ -44,7 +44,7 @@ export default function InventoryMovementReportPage() {
       const qs = new URLSearchParams();
       qs.set('from', from);
       qs.set('to', to);
-      if (warehouseId) qs.set('warehouseId', warehouseId);
+      if (locationId) qs.set('locationId', locationId);
       const res = await fetchApi(`/companies/${user.companyId}/reports/inventory-movement?${qs.toString()}`);
       setData(res);
     } finally {
@@ -69,12 +69,12 @@ export default function InventoryMovementReportPage() {
           <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
         </div>
         <div className="grid gap-1">
-          <div className="text-sm text-muted-foreground">Warehouse</div>
-          <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
-            <option value="">All warehouses</option>
-            {warehouses.map((w) => (
-              <option key={w.id} value={String(w.id)}>
-                {w.name}
+          <div className="text-sm text-muted-foreground">Location</div>
+          <SelectNative value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+            <option value="">All locations</option>
+            {locations.map((l) => (
+              <option key={l.id} value={String(l.id)}>
+                {l.name}
               </option>
             ))}
           </SelectNative>
@@ -96,7 +96,7 @@ export default function InventoryMovementReportPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Item</TableHead>
-                <TableHead>Warehouse</TableHead>
+                <TableHead>Location</TableHead>
                 <TableHead className="text-right">Begin Qty</TableHead>
                 <TableHead className="text-right">Qty In</TableHead>
                 <TableHead className="text-right">Qty Out</TableHead>
@@ -107,9 +107,9 @@ export default function InventoryMovementReportPage() {
             </TableHeader>
             <TableBody>
               {(data?.rows ?? []).map((r: any) => (
-                <TableRow key={`${r.warehouseId}-${r.itemId}`}>
+                <TableRow key={`${r.locationId}-${r.itemId}`}>
                   <TableCell className="font-medium">{r.itemName}</TableCell>
-                  <TableCell className="text-muted-foreground">{r.warehouseName}</TableCell>
+                  <TableCell className="text-muted-foreground">{r.locationName}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.beginQty ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyIn ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyOut ?? 0).toLocaleString()}</TableCell>

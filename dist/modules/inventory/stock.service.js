@@ -13,7 +13,7 @@ export async function getCompanyInventoryConfig(tx, companyId) {
             inventoryAssetAccountId: true,
             cogsAccountId: true,
             openingBalanceEquityAccountId: true,
-            defaultWarehouseId: true,
+            defaultLocationId: true,
         },
     });
     if (!company) {
@@ -34,28 +34,28 @@ export async function ensureInventoryCompanyDefaults(tx, companyId) {
             inventoryAssetAccountId: true,
             cogsAccountId: true,
             openingBalanceEquityAccountId: true,
-            defaultWarehouseId: true,
+            defaultLocationId: true,
         },
     });
     if (!company)
         throw Object.assign(new Error('company not found'), { statusCode: 404 });
-    // 1) Default warehouse
-    let defaultWarehouseId = company.defaultWarehouseId ?? null;
-    if (!defaultWarehouseId) {
-        const wh = await tx.warehouse.findFirst({
+    // 1) Default location
+    let defaultLocationId = company.defaultLocationId ?? null;
+    if (!defaultLocationId) {
+        const loc = await tx.location.findFirst({
             where: { companyId, isDefault: true },
             select: { id: true },
         });
-        if (wh?.id) {
-            defaultWarehouseId = wh.id;
+        if (loc?.id) {
+            defaultLocationId = loc.id;
         }
         else {
-            // Create a default warehouse
-            const created = await tx.warehouse.create({
-                data: { companyId, name: 'Main Warehouse', isDefault: true },
+            // Create a default location
+            const created = await tx.location.create({
+                data: { companyId, name: 'Main Location', isDefault: true },
                 select: { id: true },
             });
-            defaultWarehouseId = created.id;
+            defaultLocationId = created.id;
         }
     }
     // 2) Accounts
@@ -126,7 +126,7 @@ export async function ensureInventoryCompanyDefaults(tx, companyId) {
     await tx.company.update({
         where: { id: companyId },
         data: {
-            defaultWarehouseId,
+            defaultLocationId,
             inventoryAssetAccountId,
             cogsAccountId,
             openingBalanceEquityAccountId,
@@ -134,21 +134,25 @@ export async function ensureInventoryCompanyDefaults(tx, companyId) {
     });
     return {
         id: companyId,
-        defaultWarehouseId,
+        defaultLocationId,
         inventoryAssetAccountId,
         cogsAccountId,
         openingBalanceEquityAccountId,
     };
 }
-export async function ensureWarehouse(tx, companyId, warehouseId) {
-    const wh = await tx.warehouse.findFirst({
-        where: { id: warehouseId, companyId },
+export async function ensureLocation(tx, companyId, locationId) {
+    const loc = await tx.location.findFirst({
+        where: { id: locationId, companyId },
         select: { id: true, name: true, isDefault: true },
     });
-    if (!wh) {
-        throw Object.assign(new Error('warehouse not found'), { statusCode: 400 });
+    if (!loc) {
+        throw Object.assign(new Error('location not found'), { statusCode: 400 });
     }
-    return wh;
+    return loc;
+}
+// Backward-compatible alias during migration.
+export async function ensureWarehouse(tx, companyId, warehouseId) {
+    return await ensureLocation(tx, companyId, warehouseId);
 }
 export async function ensureInventoryItem(tx, companyId, itemId) {
     const item = await tx.item.findFirst({
@@ -180,7 +184,7 @@ export async function applyStockMoveWac(tx, input) {
     // independent of Redis availability.
     const existing = await lockAndGetStockBalanceRowForUpdate(tx, {
         companyId: input.companyId,
-        warehouseId: input.warehouseId,
+        locationId: input.locationId,
         itemId: input.itemId,
     });
     // Prevent backdated stock moves (fixes "sell 7 after buying 4" when a sale is posted later but backdated).
@@ -188,7 +192,7 @@ export async function applyStockMoveWac(tx, input) {
     // after later purchases were already posted.
     if (!input.allowBackdated) {
         const lastMove = await tx.stockMove.findFirst({
-            where: { companyId: input.companyId, warehouseId: input.warehouseId, itemId: input.itemId },
+            where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
             orderBy: [{ date: 'desc' }, { id: 'desc' }],
             select: { date: true },
         });
@@ -205,7 +209,7 @@ export async function applyStockMoveWac(tx, input) {
             throw Object.assign(new Error('insufficient stock'), {
                 statusCode: 400,
                 itemId: input.itemId,
-                warehouseId: input.warehouseId,
+                locationId: input.locationId,
                 qtyOnHand: Q.toString(),
                 qtyRequested: qty.toString(),
             });
@@ -226,9 +230,9 @@ export async function applyStockMoveWac(tx, input) {
         const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : unitCost;
         const balance = await tx.stockBalance.upsert({
             where: {
-                companyId_warehouseId_itemId: {
+                companyId_locationId_itemId: {
                     companyId: input.companyId,
-                    warehouseId: input.warehouseId,
+                    locationId: input.locationId,
                     itemId: input.itemId,
                 },
             },
@@ -239,7 +243,7 @@ export async function applyStockMoveWac(tx, input) {
             },
             create: {
                 companyId: input.companyId,
-                warehouseId: input.warehouseId,
+                locationId: input.locationId,
                 itemId: input.itemId,
                 qtyOnHand: newQ,
                 avgUnitCost: newA,
@@ -249,7 +253,7 @@ export async function applyStockMoveWac(tx, input) {
         const move = await tx.stockMove.create({
             data: {
                 companyId: input.companyId,
-                warehouseId: input.warehouseId,
+                locationId: input.locationId,
                 itemId: input.itemId,
                 date: input.date,
                 type: input.type,
@@ -279,9 +283,9 @@ export async function applyStockMoveWac(tx, input) {
     const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : d2(unitCost);
     const balance = await tx.stockBalance.upsert({
         where: {
-            companyId_warehouseId_itemId: {
+            companyId_locationId_itemId: {
                 companyId: input.companyId,
-                warehouseId: input.warehouseId,
+                locationId: input.locationId,
                 itemId: input.itemId,
             },
         },
@@ -292,7 +296,7 @@ export async function applyStockMoveWac(tx, input) {
         },
         create: {
             companyId: input.companyId,
-            warehouseId: input.warehouseId,
+            locationId: input.locationId,
             itemId: input.itemId,
             qtyOnHand: newQ,
             avgUnitCost: newA,
@@ -302,7 +306,7 @@ export async function applyStockMoveWac(tx, input) {
     const move = await tx.stockMove.create({
         data: {
             companyId: input.companyId,
-            warehouseId: input.warehouseId,
+            locationId: input.locationId,
             itemId: input.itemId,
             date: input.date,
             type: input.type,
@@ -325,10 +329,10 @@ export async function applyStockMoveWac(tx, input) {
     };
 }
 async function lockAndGetStockBalanceRowForUpdate(tx, input) {
-    const { companyId, warehouseId, itemId } = input;
+    const { companyId, locationId, itemId } = input;
     if (!Number.isInteger(companyId) || companyId <= 0)
         return null;
-    if (!Number.isInteger(warehouseId) || warehouseId <= 0)
+    if (!Number.isInteger(locationId) || locationId <= 0)
         return null;
     if (!Number.isInteger(itemId) || itemId <= 0)
         return null;
@@ -336,13 +340,13 @@ async function lockAndGetStockBalanceRowForUpdate(tx, input) {
     // Uses the unique key (companyId, warehouseId, itemId).
     await tx.$executeRaw `
     INSERT INTO StockBalance (companyId, warehouseId, itemId, qtyOnHand, avgUnitCost, inventoryValue, createdAt, updatedAt)
-    VALUES (${companyId}, ${warehouseId}, ${itemId}, 0, 0, 0, NOW(), NOW())
+    VALUES (${companyId}, ${locationId}, ${itemId}, 0, 0, 0, NOW(), NOW())
     ON DUPLICATE KEY UPDATE updatedAt = updatedAt
   `;
     const rows = (await tx.$queryRaw `
     SELECT qtyOnHand, avgUnitCost, inventoryValue
     FROM StockBalance
-    WHERE companyId = ${companyId} AND warehouseId = ${warehouseId} AND itemId = ${itemId}
+    WHERE companyId = ${companyId} AND warehouseId = ${locationId} AND itemId = ${itemId}
     FOR UPDATE
   `);
     const r = rows?.[0];

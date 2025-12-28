@@ -162,10 +162,7 @@ export default function TaxesPage() {
                         <input type="checkbox" className="rounded border-gray-300" />
                       </td>
                       <td className="py-3">
-                        <Link
-                          href={`/taxes/${item.type}/${item.id}`}
-                          className="text-primary hover:underline"
-                        >
+                        <Link href={`/taxes/${item.type}/${item.id}`} className="text-primary hover:underline">
                           {item.name}
                         </Link>
                         {item.type === 'group' && (
@@ -180,9 +177,11 @@ export default function TaxesPage() {
                           : (item as TaxGroup).totalRatePercent.toFixed(2)}
                       </td>
                       <td className="py-3 text-right">
-                        <Button variant="ghost" size="sm">
-                          Edit
-                        </Button>
+                        <Link href={`/taxes/${item.type}/${item.id}`}>
+                          <Button variant="ghost" size="sm">
+                            Edit
+                          </Button>
+                        </Link>
                       </td>
                     </tr>
                   ))}

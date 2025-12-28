@@ -14,6 +14,11 @@ export type PostJournalEntryInput = {
   companyId: number;
   date: Date;
   description: string;
+  /**
+   * Location tag (replaces legacy warehouse/branch tagging).
+   * Prefer `locationId`. `warehouseId` is accepted as a backward-compatible alias during migration.
+   */
+  locationId?: number | null;
   warehouseId?: number | null;
   createdByUserId?: number | null;
   reversalOfJournalEntryId?: number | null;
@@ -123,15 +128,15 @@ export async function postJournalEntry(
     }
   }
 
-  // Optional branch tagging (Warehouse-as-Branch). Validate tenant safety.
-  const warehouseId = input.warehouseId ?? null;
-  if (warehouseId) {
-    const wh = await tx.warehouse.findFirst({
-      where: { id: warehouseId, companyId },
+  // Optional location tagging. Validate tenant safety.
+  const locationId = input.locationId ?? input.warehouseId ?? null;
+  if (locationId) {
+    const loc = await tx.location.findFirst({
+      where: { id: locationId, companyId },
       select: { id: true },
     });
-    if (!wh) {
-      throw Object.assign(new Error('warehouseId does not belong to this company'), { statusCode: 400 });
+    if (!loc) {
+      throw Object.assign(new Error('locationId does not belong to this company'), { statusCode: 400 });
     }
   }
 
@@ -159,7 +164,7 @@ export async function postJournalEntry(
       entryNumber,
       date,
       description,
-      warehouseId,
+      locationId,
       createdByUserId: input.createdByUserId ?? null,
       reversalOfJournalEntryId: input.reversalOfJournalEntryId ?? null,
       reversalReason: input.reversalReason ?? null,

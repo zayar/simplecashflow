@@ -1,0 +1,20 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'VITE_API_URL=$_VITE_API_URL'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/cashflow-mobile-pwa'
+      - './mobile-pwa'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/cashflow-mobile-pwa']
+
+images:
+  - 'gcr.io/$PROJECT_ID/cashflow-mobile-pwa'
+
+substitutions:
+  _VITE_API_URL: 'https://cashflow-api-291129507535.asia-southeast1.run.app'
+
+

@@ -84,7 +84,7 @@ export default function EditInvoicePage() {
       fetchApi(`/companies/${user.companyId}/items`),
       fetchApi(`/companies/${user.companyId}/taxes`),
       fetchApi(`/companies/${user.companyId}/accounts`),
-      fetchApi(`/companies/${user.companyId}/warehouses`),
+      fetchApi(`/companies/${user.companyId}/locations`),
       fetchApi(`/companies/${user.companyId}/settings`),
     ])
       .then(([cust, itm, taxes, accounts, whs, settings]) => {
@@ -149,7 +149,7 @@ export default function EditInvoicePage() {
           termsAndConditions: inv.termsAndConditions ?? '',
         });
         setInvoiceWarehouseId(
-          (inv?.warehouse?.id ?? inv?.warehouseId ?? null) || defaultWarehouseId || null
+          (inv?.location?.id ?? inv?.locationId ?? inv?.warehouse?.id ?? inv?.warehouseId ?? null) || defaultWarehouseId || null
         );
         const invLines = (inv.lines ?? []) as any[];
         if (invLines.length > 0) {
@@ -256,7 +256,7 @@ export default function EditInvoicePage() {
         method: 'PUT',
         body: JSON.stringify({
           customerId: Number(formData.customerId),
-          warehouseId: invoiceWarehouseId || undefined,
+          locationId: invoiceWarehouseId || undefined,
           invoiceDate: formData.invoiceDate,
           dueDate: formData.dueDate || null,
           customerNotes: formData.customerNotes || null,
@@ -354,7 +354,7 @@ export default function EditInvoicePage() {
                   />
                 </div>
                 <div className="grid gap-2 md:col-span-3">
-                  <Label htmlFor="branch">Branch (Warehouse)</Label>
+                  <Label htmlFor="branch">Location</Label>
                   <div className="flex gap-2">
                     <SelectNative
                       id="branch"

@@ -4,6 +4,14 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
+import Invoices from './pages/Invoices';
+import InvoiceNew from './pages/InvoiceNew';
+import InvoiceLine from './pages/InvoiceLine';
+import Customers from './pages/Customers';
+import Items from './pages/Items';
+import InvoiceDetail from './pages/InvoiceDetail';
+import InvoicePayment from './pages/InvoicePayment';
+import Warehouses from './pages/Warehouses';
 
 function NotFound() {
   return (
@@ -25,7 +33,79 @@ export default function App() {
         path="/"
         element={
           <ProtectedRoute>
+            <Invoices />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices"
+        element={
+          <ProtectedRoute>
+            <Invoices />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices/new"
+        element={
+          <ProtectedRoute>
+            <InvoiceNew />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices/new/line"
+        element={
+          <ProtectedRoute>
+            <InvoiceLine />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices/:id"
+        element={
+          <ProtectedRoute>
+            <InvoiceDetail />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices/:id/payment"
+        element={
+          <ProtectedRoute>
+            <InvoicePayment />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/customers"
+        element={
+          <ProtectedRoute>
+            <Customers />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/items"
+        element={
+          <ProtectedRoute>
+            <Items />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/more"
+        element={
+          <ProtectedRoute>
             <Dashboard />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/warehouses"
+        element={
+          <ProtectedRoute>
+            <Warehouses />
           </ProtectedRoute>
         }
       />

@@ -13,7 +13,7 @@
     "start:publisher": "node dist/publisher.js",
     "db:truncate": "CONFIRM=YES tsx scripts/truncate_db.ts",
     "seed:fixed-assets": "tsx scripts/seed_fixed_asset_defaults.ts",
-    "test": "node --test --import tsx test/reversal.service.test.ts"
+    "test": "node --test --import tsx test/*.test.ts"
   },
   "keywords": [],
   "author": "",

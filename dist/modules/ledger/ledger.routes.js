@@ -93,6 +93,7 @@ export async function ledgerRoutes(fastify) {
                     companyId,
                     date,
                     description: body.description ?? '',
+                    locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
                     createdByUserId: request.user?.userId ?? null,
                     lines: (body.lines ?? []).map((line) => ({
                         accountId: Number(line.accountId),
@@ -225,6 +226,7 @@ export async function ledgerRoutes(fastify) {
                     date,
                     description: body.description ?? '',
                     createdByUserId: request.user?.userId ?? null,
+                    locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
                     lines: (body.lines ?? []).map((line) => ({
                         accountId: line.accountId,
                         debit: new Prisma.Decimal((line.debit ?? 0).toFixed(2)),
@@ -266,6 +268,7 @@ export async function ledgerRoutes(fastify) {
                     metadata: {
                         date,
                         description: body.description ?? '',
+                        locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
                         totalDebit: Number(totalDebit),
                         totalCredit: Number(totalCredit),
                     },
@@ -1325,6 +1328,22 @@ export async function ledgerRoutes(fastify) {
                 return delta.mul(-1);
             return delta; // LIABILITY or EQUITY
         }
+        function inferCashflowActivity(d) {
+            if (d.cashflowActivity === 'OPERATING' || d.cashflowActivity === 'INVESTING' || d.cashflowActivity === 'FINANCING') {
+                return d.cashflowActivity;
+            }
+            // Best-effort defaults to reduce manual setup:
+            // - Fixed assets => Investing
+            // - Long term liabilities + equity => Financing
+            // - Other BS accounts => Operating
+            if (d.reportGroup === 'FIXED_ASSET')
+                return 'INVESTING';
+            if (d.reportGroup === 'LONG_TERM_LIABILITY')
+                return 'FINANCING';
+            if (d.type === 'EQUITY')
+                return 'FINANCING';
+            return 'OPERATING';
+        }
         const deltas = [];
         for (const id of allAccountIds) {
             const acc = bsById.get(id);
@@ -1346,6 +1365,11 @@ export async function ledgerRoutes(fastify) {
                 type: acc.type,
                 reportGroup: acc.reportGroup ?? null,
                 cashflowActivity: acc.cashflowActivity ?? null,
+                cashflowActivityEffective: inferCashflowActivity({
+                    type: acc.type,
+                    reportGroup: (acc.reportGroup ?? null),
+                    cashflowActivity: (acc.cashflowActivity ?? null),
+                }),
                 beginBalance: beginBal,
                 endBalance: endBal,
                 delta,
@@ -1353,13 +1377,28 @@ export async function ledgerRoutes(fastify) {
             });
         }
         const isCash = (d) => d.reportGroup === 'CASH_AND_CASH_EQUIVALENTS';
-        const cashBegin = deltas
-            .filter((d) => isCash(d))
-            .reduce((sum, d) => sum.add(d.beginBalance), new Prisma.Decimal(0))
+        // Compute cash begin/end from ALL cash accounts (not just those with non-zero delta),
+        // otherwise reconciliation can be misleading for periods with no cash movement.
+        const cashAccountIds = bsAccounts
+            .filter((a) => a.reportGroup === 'CASH_AND_CASH_EQUIVALENTS')
+            .map((a) => a.id);
+        const cashBegin = cashAccountIds
+            .reduce((sum, id) => {
+            const acc = bsById.get(id);
+            if (!acc)
+                return sum;
+            const begin = beginById.get(id) ?? { debit: new Prisma.Decimal(0), credit: new Prisma.Decimal(0) };
+            return sum.add(balanceFrom(acc, begin.debit, begin.credit).toDecimalPlaces(2));
+        }, new Prisma.Decimal(0))
             .toDecimalPlaces(2);
-        const cashEnd = deltas
-            .filter((d) => isCash(d))
-            .reduce((sum, d) => sum.add(d.endBalance), new Prisma.Decimal(0))
+        const cashEnd = cashAccountIds
+            .reduce((sum, id) => {
+            const acc = bsById.get(id);
+            if (!acc)
+                return sum;
+            const end = endById.get(id) ?? { debit: new Prisma.Decimal(0), credit: new Prisma.Decimal(0) };
+            return sum.add(balanceFrom(acc, end.debit, end.credit).toDecimalPlaces(2));
+        }, new Prisma.Decimal(0))
             .toDecimalPlaces(2);
         const netChangeInCash = cashEnd.sub(cashBegin).toDecimalPlaces(2);
         // Operating: net profit + working capital + other operating assets/liabilities (excluding cash)
@@ -1371,7 +1410,7 @@ export async function ledgerRoutes(fastify) {
             'OTHER_CURRENT_LIABILITY',
         ]);
         const operatingCandidates = deltas.filter((d) => !isCash(d) &&
-            d.cashflowActivity === 'OPERATING' &&
+            d.cashflowActivityEffective === 'OPERATING' &&
             (d.type === 'ASSET' || d.type === 'LIABILITY'));
         const wc = operatingCandidates.filter((d) => d.reportGroup && wcGroups.has(d.reportGroup));
         const otherOperating = operatingCandidates.filter((d) => !(d.reportGroup && wcGroups.has(d.reportGroup)));
@@ -1405,14 +1444,14 @@ export async function ledgerRoutes(fastify) {
             .toDecimalPlaces(2);
         // Investing / Financing based on account.cashflowActivity (best-effort v1)
         const investingLines = deltas
-            .filter((d) => !isCash(d) && d.cashflowActivity === 'INVESTING')
+            .filter((d) => !isCash(d) && d.cashflowActivityEffective === 'INVESTING')
             .sort((a, b) => b.cashEffect.abs().comparedTo(a.cashEffect.abs()))
             .map((d) => ({
             label: `${d.code} ${d.name} (Δ ${d.delta.toString()})`,
             amount: d.cashEffect.toString(),
         }));
         const financingLines = deltas
-            .filter((d) => !isCash(d) && d.cashflowActivity === 'FINANCING')
+            .filter((d) => !isCash(d) && d.cashflowActivityEffective === 'FINANCING')
             .sort((a, b) => b.cashEffect.abs().comparedTo(a.cashEffect.abs()))
             .map((d) => ({
             label: `${d.code} ${d.name} (Δ ${d.delta.toString()})`,
@@ -1425,6 +1464,7 @@ export async function ledgerRoutes(fastify) {
             .reduce((sum, l) => sum.add(new Prisma.Decimal(l.amount)), new Prisma.Decimal(0))
             .toDecimalPlaces(2);
         const computedNetChange = operatingTotal.add(investingTotal).add(financingTotal).toDecimalPlaces(2);
+        const autoClassifiedCount = deltas.filter((d) => !isCash(d) && !d.cashflowActivity).length;
         return {
             companyId,
             from: query.from,
@@ -1450,7 +1490,9 @@ export async function ledgerRoutes(fastify) {
             },
             notes: [
                 'Cashflow v1 uses the indirect method.',
-                'Investing/Financing sections are best-effort based on Account.cashflowActivity (classify accounts in Chart of Accounts).',
+                autoClassifiedCount > 0
+                    ? `Some accounts had no cashflowActivity; we auto-classified ${autoClassifiedCount} balance-sheet account(s) based on type/report group. Set cashflowActivity in Chart of Accounts to fine-tune.`
+                    : 'Investing/Financing sections are based on Account.cashflowActivity.',
             ],
         };
         function labelForWorkingCapitalGroup(group) {

@@ -14,8 +14,8 @@ import Link from 'next/link';
 export default function InventoryValuationReportPage() {
   const { user, companySettings } = useAuth();
   const [asOf, setAsOf] = useState('');
-  const [warehouseId, setWarehouseId] = useState('');
-  const [warehouses, setWarehouses] = useState<any[]>([]);
+  const [locationId, setLocationId] = useState('');
+  const [locations, setLocations] = useState<any[]>([]);
   const [data, setData] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -27,7 +27,7 @@ export default function InventoryValuationReportPage() {
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setLocations).catch(console.error);
   }, [user?.companyId]);
 
   const load = async () => {
@@ -36,7 +36,7 @@ export default function InventoryValuationReportPage() {
     try {
       const qs = new URLSearchParams();
       qs.set('asOf', asOf);
-      if (warehouseId) qs.set('warehouseId', warehouseId);
+      if (locationId) qs.set('locationId', locationId);
       const res = await fetchApi(`/companies/${user.companyId}/reports/inventory-valuation?${qs.toString()}`);
       setData(res);
     } finally {
@@ -64,13 +64,13 @@ export default function InventoryValuationReportPage() {
           <Input type="date" value={asOf} onChange={(e) => setAsOf(e.target.value)} />
         </div>
         <div className="grid gap-1">
-          <div className="text-sm text-muted-foreground">Warehouse</div>
-          <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
-            <option value="">All warehouses</option>
-            {warehouses.map((w) => (
-              <option key={w.id} value={String(w.id)}>
-                {w.name}
-                {w.isDefault ? ' (Default)' : ''}
+          <div className="text-sm text-muted-foreground">Location</div>
+          <SelectNative value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+            <option value="">All locations</option>
+            {locations.map((l) => (
+              <option key={l.id} value={String(l.id)}>
+                {l.name}
+                {l.isDefault ? ' (Default)' : ''}
               </option>
             ))}
           </SelectNative>
@@ -94,7 +94,7 @@ export default function InventoryValuationReportPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Item</TableHead>
-                <TableHead>Warehouse</TableHead>
+                <TableHead>Location</TableHead>
                 <TableHead className="text-right">Qty</TableHead>
                 <TableHead className="text-right">Avg Cost</TableHead>
                 <TableHead className="text-right">Value</TableHead>
@@ -102,7 +102,7 @@ export default function InventoryValuationReportPage() {
             </TableHeader>
             <TableBody>
               {(data?.rows ?? []).map((r: any) => (
-                <TableRow key={`${r.warehouseId}-${r.itemId}`}>
+                <TableRow key={`${r.locationId}-${r.itemId}`}>
                   <TableCell className="font-medium">
                     <div className="flex items-center justify-between gap-3">
                       <span className="truncate">{r.itemName}</span>
@@ -110,14 +110,14 @@ export default function InventoryValuationReportPage() {
                         className="text-xs underline text-muted-foreground"
                         href={`/reports/inventory-valuation/${r.itemId}?from=${encodeURIComponent(
                           yearStart
-                        )}&to=${encodeURIComponent(asOf)}${warehouseId ? `&warehouseId=${encodeURIComponent(warehouseId)}` : `&warehouseId=${encodeURIComponent(String(r.warehouseId))}`}`}
+                        )}&to=${encodeURIComponent(asOf)}${locationId ? `&locationId=${encodeURIComponent(locationId)}` : `&locationId=${encodeURIComponent(String(r.locationId))}`}`}
                         title="View item valuation details"
                       >
                         Details
                       </Link>
                     </div>
                   </TableCell>
-                  <TableCell className="text-muted-foreground">{r.warehouseName}</TableCell>
+                  <TableCell className="text-muted-foreground">{r.locationName}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyOnHand ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.avgUnitCost ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right font-medium tabular-nums">{Number(r.inventoryValue ?? 0).toLocaleString()}</TableCell>

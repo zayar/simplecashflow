@@ -1,6 +1,8 @@
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
+import { isFutureBusinessDate } from '../../utils/docDatePolicy.js';
+import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from './invoiceAccounting.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
@@ -14,6 +16,7 @@ import { ensureInventoryCompanyDefaults, ensureInventoryItem, getStockBalanceFor
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { nextCreditNoteNumber } from '../sequence/sequence.service.js';
+import { resolveLocationForStockIssue } from './warehousePolicy.js';
 import { buildAdjustmentLinesFromNets, computeNetByAccount, createReversalJournalEntry, diffNets, } from '../ledger/reversal.service.js';
 function generateInvoiceNumber() {
     // Beginner-friendly and “good enough” for now.
@@ -161,7 +164,7 @@ export async function booksRoutes(fastify) {
             include: {
                 incomeAccount: { select: { id: true, code: true, name: true, type: true } },
                 expenseAccount: { select: { id: true, code: true, name: true, type: true } },
-                defaultWarehouse: { select: { id: true, name: true, isDefault: true } },
+                defaultLocation: { select: { id: true, name: true, isDefault: true } },
             },
         });
         if (!item) {
@@ -198,14 +201,15 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'trackInventory can only be enabled for GOODS' };
         }
-        if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
-            const wh = await prisma.warehouse.findFirst({
-                where: { id: body.defaultWarehouseId, companyId },
+        const desiredDefaultLocationId = body.defaultLocationId !== undefined ? body.defaultLocationId : body.defaultWarehouseId;
+        if (desiredDefaultLocationId !== undefined && desiredDefaultLocationId !== null) {
+            const loc = await prisma.location.findFirst({
+                where: { id: desiredDefaultLocationId, companyId },
                 select: { id: true },
             });
-            if (!wh) {
+            if (!loc) {
                 reply.status(400);
-                return { error: 'defaultWarehouseId must be a warehouse in this company' };
+                return { error: 'defaultLocationId must be a location in this company' };
             }
         }
         const item = await prisma.item.create({
@@ -219,7 +223,7 @@ export async function booksRoutes(fastify) {
                 incomeAccountId: body.incomeAccountId,
                 expenseAccountId: body.expenseAccountId ?? null,
                 trackInventory: body.trackInventory ?? false,
-                defaultWarehouseId: body.defaultWarehouseId ?? null,
+                defaultLocationId: desiredDefaultLocationId ?? null,
             },
             include: {
                 incomeAccount: true,
@@ -260,6 +264,7 @@ export async function booksRoutes(fastify) {
             where: { id: invoiceId, companyId },
             include: {
                 customer: true,
+                location: true,
                 lines: invoiceLinesIncludeWithIncomeAccount,
                 journalEntry: {
                     include: {
@@ -330,6 +335,9 @@ export async function booksRoutes(fastify) {
             id: invoice.id,
             invoiceNumber: invoice.invoiceNumber,
             customer: invoice.customer,
+            location: invoice.location ? { id: invoice.location.id, name: invoice.location.name } : null,
+            // Backward compatibility (deprecated)
+            warehouse: invoice.location ? { id: invoice.location.id, name: invoice.location.name } : null,
             status: invoice.status,
             invoiceDate: invoice.invoiceDate,
             dueDate: invoice.dueDate,
@@ -385,8 +393,19 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'customerId not found in this company' };
         }
-        // Validate and load items (tenant-safe).
-        const itemIds = body.lines.map((l) => l.itemId);
+        // Optional location tagging: validate tenant safety.
+        const locationId = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
+        if (locationId) {
+            const loc = await prisma.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } });
+            if (!loc) {
+                reply.status(400);
+                return { error: 'locationId not found in this company' };
+            }
+        }
+        // Validate and load items (tenant-safe). Custom lines may not have itemId.
+        const itemIds = body.lines
+            .map((l) => Number(l.itemId ?? 0))
+            .filter((x) => x > 0);
         const items = await prisma.item.findMany({
             where: { companyId, id: { in: itemIds } },
         });
@@ -396,9 +415,23 @@ export async function booksRoutes(fastify) {
                 reply.status(400);
                 return { error: 'each line must have quantity > 0' };
             }
-            if (!itemById.get(line.itemId)) {
-                reply.status(400);
-                return { error: `itemId ${line.itemId} not found in this company` };
+            const itemId = Number(line.itemId ?? 0);
+            if (itemId > 0) {
+                if (!itemById.get(itemId)) {
+                    reply.status(400);
+                    return { error: `itemId ${itemId} not found in this company` };
+                }
+            }
+            else {
+                // Custom/free-text line must have a description and explicit unitPrice.
+                if (!line.description || !String(line.description).trim()) {
+                    reply.status(400);
+                    return { error: 'custom invoice line must include description' };
+                }
+                if (!line.unitPrice || Number(line.unitPrice) <= 0) {
+                    reply.status(400);
+                    return { error: 'custom invoice line must include unitPrice > 0' };
+                }
             }
         }
         const invoiceDate = parseDateInput(body.invoiceDate) ?? new Date();
@@ -424,28 +457,38 @@ export async function booksRoutes(fastify) {
         let taxAmount = new Prisma.Decimal(0);
         let total = new Prisma.Decimal(0);
         const computedLines = body.lines.map((line) => {
-            const item = itemById.get(line.itemId);
+            const itemId = Number(line.itemId ?? 0);
+            const item = itemId > 0 ? itemById.get(itemId) : null;
             const qty = toMoneyDecimal(line.quantity);
-            const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
+            const unit = toMoneyDecimal(line.unitPrice ?? (item ? Number(item.sellingPrice) : 0));
+            if (unit.lessThanOrEqualTo(0)) {
+                throw Object.assign(new Error('unitPrice must be > 0'), { statusCode: 400 });
+            }
             const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+            const discount = toMoneyDecimal(line.discountAmount ?? 0).toDecimalPlaces(2);
+            if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                throw Object.assign(new Error(`invalid discountAmount: must be between 0 and line subtotal`), { statusCode: 400 });
+            }
+            const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
             const rate = new Prisma.Decimal(Number(line.taxRate ?? 0)).toDecimalPlaces(4);
             if (rate.lessThan(0) || rate.greaterThan(1)) {
                 throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
                     statusCode: 400,
                 });
             }
-            const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-            const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-            subtotal = subtotal.add(lineSubtotal);
+            const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+            const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+            subtotal = subtotal.add(netSubtotal);
             taxAmount = taxAmount.add(lineTax);
             total = total.add(lineTotal);
             return {
                 companyId,
-                itemId: item.id,
-                description: line.description ?? null,
+                itemId: item ? item.id : null,
+                description: line.description ?? (item ? item.name : null),
                 quantity: qty,
                 unitPrice: unit,
-                lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+                discountAmount: discount,
+                lineTotal: netSubtotal, // store net subtotal (after discount) for backwards compatibility
                 taxRate: rate,
                 taxAmount: lineTax,
                 incomeAccountId: Number(line.incomeAccountId ?? 0) || salesIncomeAccountId,
@@ -455,6 +498,7 @@ export async function booksRoutes(fastify) {
             data: {
                 companyId,
                 customerId: customer.id,
+                locationId,
                 invoiceNumber: generateInvoiceNumber(),
                 status: 'DRAFT',
                 invoiceDate,
@@ -509,6 +553,15 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'customerId not found in this company' };
         }
+        // Optional location tagging: validate tenant safety.
+        const locationId = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
+        if (locationId) {
+            const loc = await prisma.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } });
+            if (!loc) {
+                reply.status(400);
+                return { error: 'locationId not found in this company' };
+            }
+        }
         // Currency policy (single-currency per company if baseCurrency is set)
         const company = await prisma.company.findUnique({
             where: { id: companyId },
@@ -519,8 +572,10 @@ export async function booksRoutes(fastify) {
         const customerCurrency = normalizeCurrencyOrNull(customer.currency ?? null);
         const invoiceCurrency = baseCurrency ?? requestedCurrency ?? customerCurrency;
         enforceSingleCurrency(baseCurrency, invoiceCurrency);
-        // Validate and load items (tenant-safe).
-        const itemIds = body.lines.map((l) => l.itemId);
+        // Validate and load items (tenant-safe). Custom lines may not have itemId.
+        const itemIds = body.lines
+            .map((l) => Number(l.itemId ?? 0))
+            .filter((x) => x > 0);
         const items = await prisma.item.findMany({
             where: { companyId, id: { in: itemIds } },
         });
@@ -530,9 +585,23 @@ export async function booksRoutes(fastify) {
                 reply.status(400);
                 return { error: 'each line must have quantity > 0' };
             }
-            if (!itemById.get(line.itemId)) {
-                reply.status(400);
-                return { error: `itemId ${line.itemId} not found in this company` };
+            const itemId = Number(line.itemId ?? 0);
+            if (itemId > 0) {
+                if (!itemById.get(itemId)) {
+                    reply.status(400);
+                    return { error: `itemId ${itemId} not found in this company` };
+                }
+            }
+            else {
+                // Custom/free-text line must have a description and explicit unitPrice.
+                if (!line.description || !String(line.description).trim()) {
+                    reply.status(400);
+                    return { error: 'custom invoice line must include description' };
+                }
+                if (!line.unitPrice || Number(line.unitPrice) <= 0) {
+                    reply.status(400);
+                    return { error: 'custom invoice line must include unitPrice > 0' };
+                }
             }
         }
         // Validate optional income accounts (tenant-safe) and determine Sales Income default.
@@ -556,28 +625,38 @@ export async function booksRoutes(fastify) {
         let taxAmount = new Prisma.Decimal(0);
         let total = new Prisma.Decimal(0);
         const computedLines = body.lines.map((line) => {
-            const item = itemById.get(line.itemId);
+            const itemId = Number(line.itemId ?? 0);
+            const item = itemId > 0 ? itemById.get(itemId) : null;
             const qty = toMoneyDecimal(line.quantity);
-            const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
+            const unit = toMoneyDecimal(line.unitPrice ?? (item ? Number(item.sellingPrice) : 0));
+            if (unit.lessThanOrEqualTo(0)) {
+                throw Object.assign(new Error('unitPrice must be > 0'), { statusCode: 400 });
+            }
             const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+            const discount = toMoneyDecimal(line.discountAmount ?? 0).toDecimalPlaces(2);
+            if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                throw Object.assign(new Error(`invalid discountAmount: must be between 0 and line subtotal`), { statusCode: 400 });
+            }
+            const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
             const rate = new Prisma.Decimal(Number(line.taxRate ?? 0)).toDecimalPlaces(4);
             if (rate.lessThan(0) || rate.greaterThan(1)) {
-                throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), {
+                throw Object.assign(new Error(`invalid taxRate: must be between 0 and 1`), {
                     statusCode: 400,
                 });
             }
-            const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-            const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-            subtotal = subtotal.add(lineSubtotal);
+            const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+            const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+            subtotal = subtotal.add(netSubtotal);
             taxAmount = taxAmount.add(lineTax);
             total = total.add(lineTotal);
             return {
                 companyId,
-                itemId: item.id,
-                description: line.description ?? null,
+                itemId: item ? item.id : null,
+                description: line.description ?? (item ? item.name : null),
                 quantity: qty,
                 unitPrice: unit,
-                lineTotal: lineSubtotal, // store subtotal in lineTotal for backwards compatibility
+                discountAmount: discount,
+                lineTotal: netSubtotal, // store net subtotal (after discount) for backwards compatibility
                 taxRate: rate,
                 taxAmount: lineTax,
                 incomeAccountId: Number(line.incomeAccountId ?? 0) || salesIncomeAccountId,
@@ -604,6 +683,7 @@ export async function booksRoutes(fastify) {
                 where: { id: invoiceId, companyId },
                 data: {
                     customerId: customer.id,
+                    locationId,
                     invoiceDate,
                     dueDate: dueDate ?? null,
                     currency: invoiceCurrency,
@@ -1115,9 +1195,9 @@ export async function booksRoutes(fastify) {
             // If invoice posting touched inventory, we must lock per-item stock keys during void to avoid WAC races.
             const preMoves = await prisma.stockMove.findMany({
                 where: { companyId, referenceType: 'Invoice', referenceId: String(invoiceId) },
-                select: { warehouseId: true, itemId: true },
+                select: { locationId: true, itemId: true },
             });
-            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`)));
+            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.locationId}:${m.itemId}`)));
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
@@ -1165,7 +1245,7 @@ export async function booksRoutes(fastify) {
                             direction: 'OUT',
                         },
                         select: {
-                            warehouseId: true,
+                            locationId: true,
                             itemId: true,
                             quantity: true,
                             unitCostApplied: true,
@@ -1236,7 +1316,7 @@ export async function booksRoutes(fastify) {
                         for (const m of origIssueMoves) {
                             await applyStockMoveWac(tx, {
                                 companyId,
-                                warehouseId: m.warehouseId,
+                                locationId: m.locationId,
                                 itemId: m.itemId,
                                 date: voidDate,
                                 type: 'SALE_RETURN',
@@ -1376,11 +1456,12 @@ export async function booksRoutes(fastify) {
             where: { id: invoiceId, companyId },
             select: {
                 id: true,
-                company: { select: { defaultWarehouseId: true } },
+                locationId: true,
+                company: { select: { defaultLocationId: true } },
                 lines: {
                     select: {
                         itemId: true,
-                        item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+                        item: { select: { type: true, trackInventory: true, defaultLocationId: true } },
                     },
                 },
             },
@@ -1389,24 +1470,38 @@ export async function booksRoutes(fastify) {
             reply.status(404);
             return { error: 'invoice not found' };
         }
-        let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
-        if (!fallbackWarehouseId) {
-            const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
-            fallbackWarehouseId = wh?.id ?? null;
+        let fallbackLocationId = pre.locationId ?? pre.company.defaultLocationId ?? null;
+        if (!fallbackLocationId) {
+            const loc = await prisma.location.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+            fallbackLocationId = loc?.id ?? null;
         }
-        const trackedLines = pre.lines.filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
+        const invoiceLocationId = pre.locationId ?? null;
+        const isTrackedPreLine = (l) => {
+            return Boolean(l.itemId && l.item && l.item.type === ItemType.GOODS && l.item.trackInventory);
+        };
+        const trackedLines = pre.lines.filter(isTrackedPreLine);
         if (trackedLines.length > 0) {
-            const missingWh = trackedLines.some((l) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+            const missingWh = trackedLines.some((l) => !resolveLocationForStockIssue({
+                invoiceLocationId,
+                itemDefaultLocationId: l.item.defaultLocationId ?? null,
+                companyDefaultLocationId: fallbackLocationId,
+            }));
             if (missingWh) {
                 reply.status(400);
-                return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+                return { error: 'default location is not set (set company.defaultLocationId or item.defaultLocationId)' };
             }
         }
         const stockLockKeys = trackedLines.length === 0
             ? []
             : trackedLines.map((l) => {
-                const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId);
-                return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+                const lid = resolveLocationForStockIssue({
+                    invoiceLocationId,
+                    itemDefaultLocationId: l.item.defaultLocationId ?? null,
+                    companyDefaultLocationId: fallbackLocationId,
+                });
+                if (!lid)
+                    throw new Error('default location is not set');
+                return `lock:stock:${companyId}:${lid}:${l.itemId}`;
             });
         const { replay, response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
@@ -1453,36 +1548,41 @@ export async function booksRoutes(fastify) {
                         statusCode: 400,
                     });
                 }
-                // Recompute totals from stored lines (source of truth).
-                let subtotal = new Prisma.Decimal(0);
-                let taxAmount = new Prisma.Decimal(0);
-                const incomeBuckets = new Map();
-                for (const line of invoice.lines) {
-                    const qty = new Prisma.Decimal(line.quantity);
-                    const unit = new Prisma.Decimal(line.unitPrice);
-                    const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
-                    subtotal = subtotal.add(lineSubtotal);
-                    const taxRate = new Prisma.Decimal(line.taxRate ?? 0).toDecimalPlaces(4);
-                    if (taxRate.lessThan(0) || taxRate.greaterThan(1)) {
-                        throw Object.assign(new Error('invoice line taxRate must be between 0 and 1'), { statusCode: 400 });
-                    }
-                    const lineTax = lineSubtotal.mul(taxRate).toDecimalPlaces(2);
-                    taxAmount = taxAmount.add(lineTax);
+                // Recompute totals from stored lines (source of truth) and bucket revenue (net of discounts, tax excluded).
+                const linesForMath = (invoice.lines ?? []).map((line) => {
                     const incomeAccountId = line.incomeAccountId ?? line.item?.incomeAccountId;
                     if (!incomeAccountId) {
                         throw Object.assign(new Error('invoice line is missing income account mapping'), { statusCode: 400 });
                     }
-                    const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-                    incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal)); // Revenue excludes tax
+                    return {
+                        quantity: line.quantity,
+                        unitPrice: line.unitPrice,
+                        discountAmount: line.discountAmount ?? 0,
+                        taxRate: line.taxRate ?? 0,
+                        incomeAccountId: Number(incomeAccountId),
+                    };
+                });
+                let computed;
+                try {
+                    computed = computeInvoiceTotalsAndIncomeBuckets(linesForMath);
                 }
-                subtotal = subtotal.toDecimalPlaces(2);
-                taxAmount = taxAmount.toDecimalPlaces(2);
-                const total = subtotal.add(taxAmount).toDecimalPlaces(2); // Total = subtotal + tax
-                // CRITICAL FIX #3: Rounding validation - ensure recomputed total matches stored total.
-                // This prevents debit != credit if line-level rounding drifted from sum-then-round.
-                const storedTotal = new Prisma.Decimal(invoice.total).toDecimalPlaces(2);
-                if (!total.equals(storedTotal)) {
-                    throw Object.assign(new Error(`rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}. Invoice may have been corrupted.`), { statusCode: 400, recomputedTotal: total.toString(), storedTotal: storedTotal.toString() });
+                catch (e) {
+                    throw Object.assign(new Error(e?.message ?? 'invalid invoice lines'), { statusCode: 400 });
+                }
+                const subtotal = new Prisma.Decimal(computed.subtotal);
+                const taxAmount = new Prisma.Decimal(computed.taxAmount);
+                const total = new Prisma.Decimal(computed.total);
+                const incomeBuckets = new Map(Array.from(computed.incomeBuckets.entries()).map(([k, v]) => [k, new Prisma.Decimal(v)]));
+                // Guardrail: ensure recomputed totals match stored totals to prevent any JE imbalance.
+                try {
+                    assertTotalsMatchStored(total, new Prisma.Decimal(invoice.total));
+                }
+                catch (e) {
+                    throw Object.assign(new Error(e?.message ?? 'rounding mismatch'), {
+                        statusCode: 400,
+                        recomputedTotal: total.toString(),
+                        storedTotal: new Prisma.Decimal(invoice.total).toDecimalPlaces(2).toString(),
+                    });
                 }
                 // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
                 let taxPayableAccountId = null;
@@ -1511,20 +1611,44 @@ export async function booksRoutes(fastify) {
                     }
                 }
                 // Inventory V1: deduct stock + compute COGS (WAC) at invoice post time
-                const tracked = invoice.lines.filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
+                const isTrackedInvoiceLine = (l) => {
+                    return Boolean(l.itemId && l.item && l.item.type === 'GOODS' && l.item.trackInventory);
+                };
+                const tracked = invoice.lines.filter(isTrackedInvoiceLine);
                 let totalCogs = new Prisma.Decimal(0);
-                // Resolve default warehouse for this company (required if any tracked items exist).
-                let defaultWarehouseId = invoice.company.defaultWarehouseId ?? null;
+                // Resolve default location for this invoice (location tagging).
+                // Preference: invoice.locationId -> company.defaultLocationId -> company default Location row.
+                const invoiceLocationId = invoice.locationId ?? null;
+                let defaultLocationId = invoice.company.defaultLocationId ?? null;
                 if (tracked.length > 0) {
+                    // Inventory engine v1 stores only a "current" StockBalance (not a date-effective ledger),
+                    // so allowing future-dated inventory documents creates confusing/incorrect current stock.
+                    // Industry-standard approach is to either:
+                    // - post stock on ship/delivery date (separate from invoice), or
+                    // - implement reservations/available-to-promise.
+                    // Until then, we disallow posting inventory-affecting invoices with a future invoiceDate.
+                    const tz = invoice.company.timeZone ?? null;
+                    if (isFutureBusinessDate({ date: new Date(invoice.invoiceDate), timeZone: tz })) {
+                        throw Object.assign(new Error('cannot post an inventory invoice with a future invoice date. Set the invoice date to today or keep it as DRAFT and post on the shipment date.'), { statusCode: 400 });
+                    }
                     const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
-                    defaultWarehouseId = defaultWarehouseId ?? cfg.defaultWarehouseId;
+                    defaultLocationId = defaultLocationId ?? cfg.defaultLocationId;
                     for (const line of tracked) {
-                        const wid = line.item.defaultWarehouseId ?? defaultWarehouseId;
+                        const lid = resolveLocationForStockIssue({
+                            invoiceLocationId,
+                            itemDefaultLocationId: line.item.defaultLocationId ?? null,
+                            companyDefaultLocationId: defaultLocationId,
+                        });
+                        if (!lid) {
+                            throw Object.assign(new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'), {
+                                statusCode: 400,
+                            });
+                        }
                         const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
                         const applied = await applyStockMoveWac(tx, {
                             companyId,
-                            warehouseId: wid,
-                            itemId: line.itemId,
+                            locationId: Number(lid),
+                            itemId: Number(line.itemId),
                             date: invoice.invoiceDate,
                             type: 'SALE_ISSUE',
                             direction: 'OUT',
@@ -1540,43 +1664,23 @@ export async function booksRoutes(fastify) {
                     }
                     totalCogs = totalCogs.toDecimalPlaces(2);
                 }
-                // CRITICAL FIX #5: Build journal entry lines including tax
-                // Tax entry: Dr AR (total), Cr Revenue (subtotal), Cr Tax Payable (taxAmount)
-                const jeLines = [
-                    // Debit: Accounts Receivable (full amount including tax)
-                    { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
-                    // Credit: Revenue accounts (subtotal, excluding tax)
-                    ...Array.from(incomeBuckets.entries()).map(([incomeAccountId, amount]) => ({
-                        accountId: incomeAccountId,
-                        debit: new Prisma.Decimal(0),
-                        credit: amount.toDecimalPlaces(2),
-                    })),
-                ];
-                // Tax Payable (credit) when tax exists
-                if (taxAmount.greaterThan(0)) {
-                    jeLines.push({
-                        accountId: taxPayableAccountId,
-                        debit: new Prisma.Decimal(0),
-                        credit: taxAmount,
-                    });
-                }
-                // Add COGS entries for inventory-tracked items
-                if (totalCogs.greaterThan(0)) {
-                    const invCfg = await ensureInventoryCompanyDefaults(tx, companyId);
-                    jeLines.push({
-                        accountId: invCfg.cogsAccountId,
-                        debit: totalCogs,
-                        credit: new Prisma.Decimal(0),
-                    }, {
-                        accountId: invCfg.inventoryAssetAccountId,
-                        debit: new Prisma.Decimal(0),
-                        credit: totalCogs,
-                    });
-                }
+                // Build journal entry lines including tax (and optional inventory COGS).
+                const invCfgForCogs = totalCogs.greaterThan(0) ? await ensureInventoryCompanyDefaults(tx, companyId) : null;
+                const jeLines = buildInvoicePostingJournalLines({
+                    arAccountId: arAccount.id,
+                    total: total,
+                    incomeBuckets: incomeBuckets,
+                    taxPayableAccountId: taxAmount.greaterThan(0) ? taxPayableAccountId : null,
+                    taxAmount: taxAmount,
+                    totalCogs: totalCogs,
+                    cogsAccountId: invCfgForCogs?.cogsAccountId ?? null,
+                    inventoryAssetAccountId: invCfgForCogs?.inventoryAssetAccountId ?? null,
+                });
                 const journalEntry = await postJournalEntry(tx, {
                     companyId,
                     date: invoice.invoiceDate,
                     description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
+                    locationId: invoice.locationId ?? null,
                     createdByUserId: request.user?.userId ?? null,
                     lines: jeLines,
                 });
@@ -1815,6 +1919,7 @@ export async function booksRoutes(fastify) {
                         companyId,
                         date: paymentDate,
                         description: `Payment for Invoice ${invoice.invoiceNumber}`,
+                        locationId: invoice.locationId ?? null,
                         createdByUserId: request.user?.userId ?? null,
                         skipAccountValidation: true,
                         lines: [
@@ -1858,6 +1963,7 @@ export async function booksRoutes(fastify) {
                         metadata: {
                             invoiceId: invoice.id,
                             invoiceNumber: invoice.invoiceNumber,
+                            locationId: invoice.locationId ?? null,
                             paymentDate,
                             amount: amount.toString(),
                             bankAccountId: bankAccount.id,
@@ -2406,14 +2512,20 @@ export async function booksRoutes(fastify) {
                 return { error: `lines[${idx}].unitPrice must be > 0` };
             }
             const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+            const discount = toMoneyDecimal(l.discountAmount ?? 0).toDecimalPlaces(2);
+            if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount must be between 0 and line subtotal` };
+            }
+            const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
             const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
             if (rate.lessThan(0) || rate.greaterThan(1)) {
                 reply.status(400);
                 return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
             }
-            const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-            const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-            subtotal = subtotal.add(lineSubtotal);
+            const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+            const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+            subtotal = subtotal.add(netSubtotal);
             taxAmount = taxAmount.add(lineTax);
             total = total.add(lineTotal);
             computedLines.push({
@@ -2422,7 +2534,8 @@ export async function booksRoutes(fastify) {
                 description: l.description ?? item.name ?? null,
                 quantity: qty,
                 unitPrice: unit,
-                lineTotal, // subtotal + tax
+                discountAmount: discount,
+                lineTotal: netSubtotal, // store net subtotal (after discount), tax is stored separately
                 taxRate: rate,
                 taxAmount: lineTax,
                 incomeAccountId: Number(l.incomeAccountId ?? 0) || null,
@@ -2538,14 +2651,20 @@ export async function booksRoutes(fastify) {
                 return { error: `lines[${idx}].unitPrice must be > 0` };
             }
             const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+            const discount = toMoneyDecimal(l.discountAmount ?? 0).toDecimalPlaces(2);
+            if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount must be between 0 and line subtotal` };
+            }
+            const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
             const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
             if (rate.lessThan(0) || rate.greaterThan(1)) {
                 reply.status(400);
                 return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
             }
-            const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-            const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-            subtotal = subtotal.add(lineSubtotal);
+            const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+            const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+            subtotal = subtotal.add(netSubtotal);
             taxAmount = taxAmount.add(lineTax);
             total = total.add(lineTotal);
             computedLines.push({
@@ -2554,7 +2673,8 @@ export async function booksRoutes(fastify) {
                 description: l.description ?? item.name ?? null,
                 quantity: qty,
                 unitPrice: unit,
-                lineTotal, // subtotal + tax
+                discountAmount: discount,
+                lineTotal: netSubtotal, // store net subtotal; tax stored separately
                 taxRate: rate,
                 taxAmount: lineTax,
                 invoiceLineId: Number(l.invoiceLineId ?? 0) || null,
@@ -2651,7 +2771,8 @@ export async function booksRoutes(fastify) {
                         throw Object.assign(new Error('cannot delete a credit note that already has a journal entry'), { statusCode: 400 });
                     }
                     await tx.creditNoteLine.deleteMany({ where: { companyId, creditNoteId: cn.id } });
-                    await tx.creditNote.delete({ where: { id: cn.id } });
+                    // Tenant-safe delete (enforced by our tenant isolation rules)
+                    await tx.creditNote.deleteMany({ where: { id: cn.id, companyId } });
                     await writeAuditLog(tx, {
                         companyId,
                         userId: request.user?.userId ?? null,
@@ -2758,7 +2879,7 @@ export async function booksRoutes(fastify) {
         try {
             const preMoves = await prisma.stockMove.findMany({
                 where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
-                select: { warehouseId: true, itemId: true },
+                select: { locationId: true, itemId: true },
             });
             if ((preMoves ?? []).length > 0) {
                 reply.status(400);
@@ -3073,9 +3194,9 @@ export async function booksRoutes(fastify) {
         try {
             const preMoves = await prisma.stockMove.findMany({
                 where: { companyId, referenceType: 'CreditNote', referenceId: String(creditNoteId) },
-                select: { warehouseId: true, itemId: true },
+                select: { locationId: true, itemId: true },
             });
-            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.warehouseId}:${m.itemId}`)));
+            const stockLockKeys = Array.from(new Set((preMoves ?? []).map((m) => `lock:stock:${companyId}:${m.locationId}:${m.itemId}`)));
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
@@ -3151,7 +3272,7 @@ export async function booksRoutes(fastify) {
                     // Capture original inventory moves (if any) before we post reversal JE.
                     const origMoves = await tx.stockMove.findMany({
                         where: { companyId, referenceType: 'CreditNote', referenceId: String(cn.id) },
-                        select: { warehouseId: true, itemId: true, quantity: true, totalCostApplied: true },
+                        select: { locationId: true, itemId: true, quantity: true, totalCostApplied: true },
                     });
                     const { reversal } = await createReversalJournalEntry(tx, {
                         companyId,
@@ -3165,7 +3286,7 @@ export async function booksRoutes(fastify) {
                         for (const m of origMoves) {
                             await applyStockMoveWac(tx, {
                                 companyId,
-                                warehouseId: m.warehouseId,
+                                locationId: m.locationId,
                                 itemId: m.itemId,
                                 date: voidDate,
                                 type: 'ADJUSTMENT',
@@ -3450,11 +3571,11 @@ export async function booksRoutes(fastify) {
                 where: { id: creditNoteId, companyId },
                 select: {
                     id: true,
-                    company: { select: { defaultWarehouseId: true } },
+                    company: { select: { defaultLocationId: true } },
                     lines: {
                         select: {
                             itemId: true,
-                            item: { select: { type: true, trackInventory: true, defaultWarehouseId: true } },
+                            item: { select: { type: true, trackInventory: true, defaultLocationId: true } },
                         },
                     },
                 },
@@ -3463,24 +3584,24 @@ export async function booksRoutes(fastify) {
                 reply.status(404);
                 return { error: 'credit note not found' };
             }
-            let fallbackWarehouseId = pre.company.defaultWarehouseId ?? null;
-            if (!fallbackWarehouseId) {
-                const wh = await prisma.warehouse.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
-                fallbackWarehouseId = wh?.id ?? null;
+            let fallbackLocationId = pre.company.defaultLocationId ?? null;
+            if (!fallbackLocationId) {
+                const loc = await prisma.location.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
+                fallbackLocationId = loc?.id ?? null;
             }
             const trackedLines = (pre.lines ?? []).filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
             if (trackedLines.length > 0) {
-                const missingWh = trackedLines.some((l) => !(l.item.defaultWarehouseId ?? fallbackWarehouseId));
+                const missingWh = trackedLines.some((l) => !(l.item.defaultLocationId ?? fallbackLocationId));
                 if (missingWh) {
                     reply.status(400);
-                    return { error: 'default warehouse is not set (set company.defaultWarehouseId or item.defaultWarehouseId)' };
+                    return { error: 'default location is not set (set company.defaultLocationId or item.defaultLocationId)' };
                 }
             }
             const stockLockKeys = trackedLines.length === 0
                 ? []
                 : trackedLines.map((l) => {
-                    const wid = (l.item.defaultWarehouseId ?? fallbackWarehouseId);
-                    return `lock:stock:${companyId}:${wid}:${l.itemId}`;
+                    const lid = (l.item.defaultLocationId ?? fallbackLocationId);
+                    return `lock:stock:${companyId}:${lid}:${l.itemId}`;
                 });
             const { response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
@@ -3535,9 +3656,14 @@ export async function booksRoutes(fastify) {
                         const qty = new Prisma.Decimal(line.quantity);
                         const unit = new Prisma.Decimal(line.unitPrice);
                         const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+                        const discount = new Prisma.Decimal(line.discountAmount ?? 0).toDecimalPlaces(2);
+                        if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                            throw Object.assign(new Error('credit note line discountAmount must be between 0 and line subtotal'), { statusCode: 400 });
+                        }
+                        const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
                         const lineTax = new Prisma.Decimal(line.taxAmount ?? 0).toDecimalPlaces(2);
-                        const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-                        subtotal = subtotal.add(lineSubtotal);
+                        const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+                        subtotal = subtotal.add(netSubtotal);
                         taxAmount = taxAmount.add(lineTax);
                         total = total.add(lineTotal);
                         const incomeAccountId = line.incomeAccountId ?? line.item?.incomeAccountId;
@@ -3545,7 +3671,7 @@ export async function booksRoutes(fastify) {
                             throw Object.assign(new Error('credit note line is missing income account mapping'), { statusCode: 400 });
                         }
                         const prev = incomeBuckets.get(incomeAccountId) ?? new Prisma.Decimal(0);
-                        incomeBuckets.set(incomeAccountId, prev.add(lineSubtotal));
+                        incomeBuckets.set(incomeAccountId, prev.add(netSubtotal));
                         const item = line.item;
                         const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
                         const hasInvoiceLink = !!sourceInvoiceId && !!line.invoiceLineId;
@@ -3554,9 +3680,9 @@ export async function booksRoutes(fastify) {
                                 throw Object.assign(new Error('company inventory accounts not configured (inventoryAssetAccountId/cogsAccountId)'), { statusCode: 400 });
                             }
                             await ensureInventoryItem(tx, companyId, line.itemId);
-                            // Clean cost + warehouse allocation:
+                            // Clean cost + location allocation:
                             // Allocate return quantity across the original SALE_ISSUE StockMoves for this invoice+item.
-                            // This guarantees the return uses the same cost basis and warehouse(s) as the original sale.
+                            // This guarantees the return uses the same cost basis and location(s) as the original sale.
                             const saleMoves = (await tx.stockMove.findMany({
                                 where: {
                                     companyId,
@@ -3566,8 +3692,8 @@ export async function booksRoutes(fastify) {
                                     referenceType: 'Invoice',
                                     referenceId: String(sourceInvoiceId),
                                 },
-                                orderBy: [{ warehouseId: 'asc' }, { id: 'asc' }],
-                                select: { id: true, warehouseId: true, quantity: true, unitCostApplied: true },
+                                orderBy: [{ locationId: 'asc' }, { id: 'asc' }],
+                                select: { id: true, locationId: true, quantity: true, unitCostApplied: true },
                             }));
                             if (!saleMoves.length) {
                                 throw Object.assign(new Error('cannot locate original sale stock moves for return (invoice linkage missing or inventory not tracked at sale time)'), {
@@ -3576,9 +3702,9 @@ export async function booksRoutes(fastify) {
                                     itemId: line.itemId,
                                 });
                             }
-                            // Returned qty for this invoice+item by warehouse (posted credit notes only)
-                            const returnedByWh = (await tx.$queryRaw `
-                    SELECT sm.warehouseId as warehouseId, SUM(sm.quantity) as qty
+                            // Returned qty for this invoice+item by location (posted credit notes only)
+                            const returnedByLocation = (await tx.$queryRaw `
+                    SELECT sm.warehouseId as locationId, SUM(sm.quantity) as qty
                     FROM StockMove sm
                     JOIN CreditNote cn2
                       ON cn2.id = CAST(sm.referenceId AS SIGNED)
@@ -3592,21 +3718,21 @@ export async function booksRoutes(fastify) {
                       AND cn2.status = 'POSTED'
                     GROUP BY sm.warehouseId
                   `);
-                            const returnedWhMap = new Map((returnedByWh ?? []).map((r) => [Number(r.warehouseId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)]));
-                            // Compute remaining quantities per sale move after previous returns (FIFO per warehouse)
-                            const movesByWarehouse = new Map();
+                            const returnedWhMap = new Map((returnedByLocation ?? []).map((r) => [Number(r.locationId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)]));
+                            // Compute remaining quantities per sale move after previous returns (FIFO per location)
+                            const movesByLocation = new Map();
                             for (const m of saleMoves) {
-                                const wid = Number(m.warehouseId);
-                                const list = movesByWarehouse.get(wid) ?? [];
+                                const lid = Number(m.locationId);
+                                const list = movesByLocation.get(lid) ?? [];
                                 list.push(m);
-                                movesByWarehouse.set(wid, list);
+                                movesByLocation.set(lid, list);
                             }
                             // Allocate return qty across warehouses/moves
                             let remainingToReturn = qty.toDecimalPlaces(2);
-                            for (const [wid, moves] of movesByWarehouse.entries()) {
+                            for (const [lid, moves] of movesByLocation.entries()) {
                                 if (remainingToReturn.lessThanOrEqualTo(0))
                                     break;
-                                let returnedToConsume = returnedWhMap.get(wid) ?? new Prisma.Decimal(0);
+                                let returnedToConsume = returnedWhMap.get(lid) ?? new Prisma.Decimal(0);
                                 for (const m of moves) {
                                     if (remainingToReturn.lessThanOrEqualTo(0))
                                         break;
@@ -3622,7 +3748,7 @@ export async function booksRoutes(fastify) {
                                     const unitCost = new Prisma.Decimal(m.unitCostApplied).toDecimalPlaces(2);
                                     const applied = await applyStockMoveWac(tx, {
                                         companyId,
-                                        warehouseId: wid,
+                                        locationId: lid,
                                         itemId: line.itemId,
                                         date: cn.creditNoteDate,
                                         type: 'SALE_RETURN',

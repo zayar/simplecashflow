@@ -24,7 +24,7 @@ export default function NewPurchaseBillPage() {
   const [loading, setLoading] = useState(false);
 
   const [vendors, setVendors] = useState<Vendor[]>([]);
-  const [warehouses, setWarehouses] = useState<any[]>([]);
+  const [locations, setLocations] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [inventoryAccountId, setInventoryAccountId] = useState<number | null>(null);
@@ -33,7 +33,7 @@ export default function NewPurchaseBillPage() {
     vendorId: '',
     billDate: '',
     dueDate: '',
-    warehouseId: '',
+    locationId: '',
   });
 
   const [lines, setLines] = useState<Line[]>([
@@ -43,7 +43,7 @@ export default function NewPurchaseBillPage() {
   useEffect(() => {
     if (!user?.companyId) return;
     getVendors(user.companyId).then(setVendors).catch(console.error);
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setLocations).catch(console.error);
     fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
     getAccounts(user.companyId).then(setAccounts).catch(console.error);
     fetchApi(`/companies/${user.companyId}/settings`)
@@ -111,7 +111,7 @@ export default function NewPurchaseBillPage() {
           vendorId: form.vendorId ? Number(form.vendorId) : null,
           billDate: form.billDate,
           dueDate: form.dueDate || undefined,
-          warehouseId: form.warehouseId ? Number(form.warehouseId) : undefined,
+          locationId: form.locationId ? Number(form.locationId) : undefined,
           lines: payloadLines,
         }),
       });
@@ -168,13 +168,13 @@ export default function NewPurchaseBillPage() {
             </div>
 
             <div className="grid gap-2 md:max-w-sm">
-              <Label>Warehouse</Label>
-              <SelectNative value={form.warehouseId} onChange={(e) => setForm({ ...form, warehouseId: e.target.value })}>
+              <Label>Location</Label>
+              <SelectNative value={form.locationId} onChange={(e) => setForm({ ...form, locationId: e.target.value })}>
                 <option value="">Company default</option>
-                {warehouses.map((w) => (
-                  <option key={w.id} value={String(w.id)}>
-                    {w.name}
-                    {w.isDefault ? ' (Default)' : ''}
+                {locations.map((l) => (
+                  <option key={l.id} value={String(l.id)}>
+                    {l.name}
+                    {l.isDefault ? ' (Default)' : ''}
                   </option>
                 ))}
               </SelectNative>
@@ -192,10 +192,11 @@ export default function NewPurchaseBillPage() {
                 <Table>
                   <TableHeader>
                       <TableRow className="bg-muted/40">
-                        <TableHead className="w-[420px]">ITEM / DESCRIPTION</TableHead>
+                        <TableHead className="w-[420px]">ITEM</TableHead>
                         <TableHead className="w-[90px] text-right">QTY</TableHead>
                         <TableHead className="w-[160px]">UNIT</TableHead>
                         <TableHead className="w-[160px] text-right">PRICE</TableHead>
+                        <TableHead className="w-[220px]">ACCOUNT</TableHead>
                         <TableHead className="w-[160px] text-right">DISCOUNT</TableHead>
                         <TableHead className="w-[160px] text-right">ITEM AMOUNT</TableHead>
                         <TableHead className="w-[60px]" />
@@ -266,27 +267,6 @@ export default function NewPurchaseBillPage() {
                           />
                         </TableCell>
                             <TableCell className="align-top">
-                              <Input disabled className="text-right" value="0.00" />
-                            </TableCell>
-                            <TableCell className="align-top text-right font-semibold tabular-nums">
-                              {lineTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        </TableCell>
-                            <TableCell className="align-top text-right">
-                              <Button type="button" variant="ghost" size="icon" onClick={() => removeLine(idx)} disabled={lines.length === 1}>
-                                <Trash2 className="h-4 w-4 text-muted-foreground" />
-                          </Button>
-                        </TableCell>
-                      </TableRow>
-                          <TableRow key={`acct-${idx}`} className="bg-muted/10 border-t-0">
-                            <TableCell className="py-3">
-                              <Textarea
-                                value={l.description}
-                                onChange={(e) => updateLine(idx, { description: e.target.value })}
-                                placeholder="Enter name or description"
-                                className="min-h-[44px]"
-                              />
-                            </TableCell>
-                            <TableCell colSpan={2} className="py-3">
                               {isTracked ? (
                                 <AccountPicker
                                   accounts={inventoryAccount ? [inventoryAccount as any] : []}
@@ -307,11 +287,23 @@ export default function NewPurchaseBillPage() {
                                 />
                               )}
                               {!isTracked && l.itemId && !l.accountId ? (
-                                <div className="mt-1 text-xs text-orange-600">Missing account → you can save Draft, but you can’t Post until set.</div>
+                                <div className="mt-1 text-xs text-orange-600">
+                                  Missing account → you can save Draft, but you can’t Post until set.
+                                </div>
                               ) : null}
                             </TableCell>
-                            <TableCell colSpan={4} />
-                          </TableRow>
+                            <TableCell className="align-top">
+                              <Input disabled className="text-right" value="0.00" />
+                            </TableCell>
+                            <TableCell className="align-top text-right font-semibold tabular-nums">
+                              {lineTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </TableCell>
+                            <TableCell className="align-top text-right">
+                              <Button type="button" variant="ghost" size="icon" onClick={() => removeLine(idx)} disabled={lines.length === 1}>
+                                <Trash2 className="h-4 w-4 text-muted-foreground" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
                           </>
                         );
                       })}

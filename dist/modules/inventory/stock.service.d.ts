@@ -2,7 +2,7 @@ import { Prisma } from '@prisma/client';
 import type { PrismaTx } from '../ledger/posting.service.js';
 export type StockMoveInput = {
     companyId: number;
-    warehouseId: number;
+    locationId: number;
     itemId: number;
     date: Date;
     /**
@@ -10,7 +10,7 @@ export type StockMoveInput = {
      * To keep WAC and "no oversell" correct, we must apply stock moves in chronological order.
      *
      * If allowBackdated is false (default), we reject moves dated earlier than the latest StockMove
-     * for the same (companyId, warehouseId, itemId).
+     * for the same (companyId, locationId, itemId).
      */
     allowBackdated?: boolean;
     type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'SALE_RETURN' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
@@ -29,7 +29,7 @@ export declare function getCompanyInventoryConfig(tx: PrismaTx, companyId: numbe
     inventoryAssetAccountId: number | null;
     cogsAccountId: number | null;
     openingBalanceEquityAccountId: number | null;
-    defaultWarehouseId: number | null;
+    defaultLocationId: number | null;
 }>;
 /**
  * Bootstrap inventory defaults for older tenants (created before inventory features existed).
@@ -38,10 +38,15 @@ export declare function getCompanyInventoryConfig(tx: PrismaTx, companyId: numbe
  */
 export declare function ensureInventoryCompanyDefaults(tx: PrismaTx, companyId: number): Promise<{
     id: number;
-    defaultWarehouseId: number | null;
+    defaultLocationId: number | null;
     inventoryAssetAccountId: number | null;
     cogsAccountId: number | null;
     openingBalanceEquityAccountId: number | null;
+}>;
+export declare function ensureLocation(tx: PrismaTx, companyId: number, locationId: number): Promise<{
+    id: number;
+    name: string;
+    isDefault: boolean;
 }>;
 export declare function ensureWarehouse(tx: PrismaTx, companyId: number, warehouseId: number): Promise<{
     id: number;
@@ -69,7 +74,7 @@ export declare function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInp
 }>;
 export declare function getStockBalanceForUpdate(tx: PrismaTx, input: {
     companyId: number;
-    warehouseId: number;
+    locationId: number;
     itemId: number;
 }): Promise<{
     qtyOnHand: Prisma.Decimal;

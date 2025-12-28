@@ -413,8 +413,8 @@ export default function InvoiceDetailPage() {
                   <div className="font-medium">
                     {invoice.dueDate ? formatDateInTimeZone(invoice.dueDate, tz) : "—"}
                   </div>
-                  <div className="text-muted-foreground">Branch</div>
-                  <div className="font-medium">{invoice.warehouse?.name ?? "—"}</div>
+                  <div className="text-muted-foreground">Location</div>
+                  <div className="font-medium">{invoice.location?.name ?? invoice.warehouse?.name ?? "—"}</div>
                   <div className="text-muted-foreground">Terms</div>
                   <div className="font-medium">{invoice.dueDate ? "Net" : "—"}</div>
                 </div>
@@ -670,7 +670,7 @@ export default function InvoiceDetailPage() {
                       <TableHeader>
                         <TableRow>
                           <TableHead>Account</TableHead>
-                          <TableHead className="w-[140px]">Branch</TableHead>
+                          <TableHead className="w-[140px]">Location</TableHead>
                           <TableHead className="text-right w-[140px]">Debit</TableHead>
                           <TableHead className="text-right w-[140px]">Credit</TableHead>
                         </TableRow>

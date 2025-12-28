@@ -79,7 +79,8 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     const body = request.body as {
       date?: string; // ISO or YYYY-MM-DD
       description?: string;
-      warehouseId?: number;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       lines?: { accountId?: number; debit?: number; credit?: number }[];
     };
 
@@ -116,7 +117,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
               companyId,
               date,
               description: body.description ?? '',
-              warehouseId: body.warehouseId ? Number(body.warehouseId) : null,
+              locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
               createdByUserId: (request as any).user?.userId ?? null,
               lines: (body.lines ?? []).map((line) => ({
                 accountId: Number(line.accountId),
@@ -245,6 +246,8 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       companyId?: number;
       date?: string; // ISO string
       description?: string;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       lines?: { accountId?: number; debit?: number; credit?: number }[];
     };
 
@@ -283,6 +286,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
             date,
             description: body.description ?? '',
             createdByUserId: (request as any).user?.userId ?? null,
+            locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
             lines: (body.lines ?? []).map((line) => ({
               accountId: line.accountId!,
               debit: new Prisma.Decimal((line.debit ?? 0).toFixed(2)),
@@ -333,7 +337,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
             metadata: {
               date,
               description: body.description ?? '',
-              warehouseId: (body as any).warehouseId ? Number((body as any).warehouseId) : null,
+              locationId: (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null,
               totalDebit: Number(totalDebit),
               totalCredit: Number(totalCredit),
             },
@@ -1550,6 +1554,20 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       return delta; // LIABILITY or EQUITY
     }
 
+    function inferCashflowActivity(d: { type: string; reportGroup: string | null; cashflowActivity: string | null }): 'OPERATING' | 'INVESTING' | 'FINANCING' {
+      if (d.cashflowActivity === 'OPERATING' || d.cashflowActivity === 'INVESTING' || d.cashflowActivity === 'FINANCING') {
+        return d.cashflowActivity;
+      }
+      // Best-effort defaults to reduce manual setup:
+      // - Fixed assets => Investing
+      // - Long term liabilities + equity => Financing
+      // - Other BS accounts => Operating
+      if (d.reportGroup === 'FIXED_ASSET') return 'INVESTING';
+      if (d.reportGroup === 'LONG_TERM_LIABILITY') return 'FINANCING';
+      if (d.type === 'EQUITY') return 'FINANCING';
+      return 'OPERATING';
+    }
+
     const deltas: Array<{
       accountId: number;
       code: string;
@@ -1557,6 +1575,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       type: string;
       reportGroup: string | null;
       cashflowActivity: string | null;
+      cashflowActivityEffective: 'OPERATING' | 'INVESTING' | 'FINANCING';
       beginBalance: Prisma.Decimal;
       endBalance: Prisma.Decimal;
       delta: Prisma.Decimal;
@@ -1584,6 +1603,11 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
         type: acc.type,
         reportGroup: acc.reportGroup ?? null,
         cashflowActivity: acc.cashflowActivity ?? null,
+        cashflowActivityEffective: inferCashflowActivity({
+          type: acc.type,
+          reportGroup: (acc.reportGroup ?? null) as any,
+          cashflowActivity: (acc.cashflowActivity ?? null) as any,
+        }),
         beginBalance: beginBal,
         endBalance: endBal,
         delta,
@@ -1593,13 +1617,26 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
 
     const isCash = (d: any) => d.reportGroup === 'CASH_AND_CASH_EQUIVALENTS';
 
-    const cashBegin = deltas
-      .filter((d) => isCash(d))
-      .reduce((sum, d) => sum.add(d.beginBalance), new Prisma.Decimal(0))
+    // Compute cash begin/end from ALL cash accounts (not just those with non-zero delta),
+    // otherwise reconciliation can be misleading for periods with no cash movement.
+    const cashAccountIds = bsAccounts
+      .filter((a: any) => a.reportGroup === 'CASH_AND_CASH_EQUIVALENTS')
+      .map((a: any) => a.id);
+    const cashBegin = cashAccountIds
+      .reduce((sum: Prisma.Decimal, id: number) => {
+        const acc = bsById.get(id);
+        if (!acc) return sum;
+        const begin = beginById.get(id) ?? { debit: new Prisma.Decimal(0), credit: new Prisma.Decimal(0) };
+        return sum.add(balanceFrom(acc, begin.debit, begin.credit).toDecimalPlaces(2));
+      }, new Prisma.Decimal(0))
       .toDecimalPlaces(2);
-    const cashEnd = deltas
-      .filter((d) => isCash(d))
-      .reduce((sum, d) => sum.add(d.endBalance), new Prisma.Decimal(0))
+    const cashEnd = cashAccountIds
+      .reduce((sum: Prisma.Decimal, id: number) => {
+        const acc = bsById.get(id);
+        if (!acc) return sum;
+        const end = endById.get(id) ?? { debit: new Prisma.Decimal(0), credit: new Prisma.Decimal(0) };
+        return sum.add(balanceFrom(acc, end.debit, end.credit).toDecimalPlaces(2));
+      }, new Prisma.Decimal(0))
       .toDecimalPlaces(2);
     const netChangeInCash = cashEnd.sub(cashBegin).toDecimalPlaces(2);
 
@@ -1615,7 +1652,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     const operatingCandidates = deltas.filter(
       (d) =>
         !isCash(d) &&
-        d.cashflowActivity === 'OPERATING' &&
+        d.cashflowActivityEffective === 'OPERATING' &&
         (d.type === 'ASSET' || d.type === 'LIABILITY')
     );
 
@@ -1657,7 +1694,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
 
     // Investing / Financing based on account.cashflowActivity (best-effort v1)
     const investingLines = deltas
-      .filter((d) => !isCash(d) && d.cashflowActivity === 'INVESTING')
+      .filter((d) => !isCash(d) && d.cashflowActivityEffective === 'INVESTING')
       .sort((a, b) => b.cashEffect.abs().comparedTo(a.cashEffect.abs()))
       .map((d) => ({
         label: `${d.code} ${d.name} (Δ ${d.delta.toString()})`,
@@ -1665,7 +1702,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       }));
 
     const financingLines = deltas
-      .filter((d) => !isCash(d) && d.cashflowActivity === 'FINANCING')
+      .filter((d) => !isCash(d) && d.cashflowActivityEffective === 'FINANCING')
       .sort((a, b) => b.cashEffect.abs().comparedTo(a.cashEffect.abs()))
       .map((d) => ({
         label: `${d.code} ${d.name} (Δ ${d.delta.toString()})`,
@@ -1680,6 +1717,7 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       .toDecimalPlaces(2);
 
     const computedNetChange = operatingTotal.add(investingTotal).add(financingTotal).toDecimalPlaces(2);
+    const autoClassifiedCount = deltas.filter((d) => !isCash(d) && !d.cashflowActivity).length;
 
     return {
       companyId,
@@ -1706,7 +1744,9 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
       },
       notes: [
         'Cashflow v1 uses the indirect method.',
-        'Investing/Financing sections are best-effort based on Account.cashflowActivity (classify accounts in Chart of Accounts).',
+        autoClassifiedCount > 0
+          ? `Some accounts had no cashflowActivity; we auto-classified ${autoClassifiedCount} balance-sheet account(s) based on type/report group. Set cashflowActivity in Chart of Accounts to fine-tune.`
+          : 'Investing/Financing sections are based on Account.cashflowActivity.',
       ],
     };
 

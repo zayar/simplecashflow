@@ -117,10 +117,10 @@ Done! ✅
 
 ## 📚 Full Documentation
 
-- `TAX_MODULE_IMPLEMENTATION_GUIDE.md` - Complete guide
-- `TAX_MODULE_ARCHITECTURE.md` - System architecture
-- `CRITICAL_FIXES_SUMMARY.md` - All 5 fixes explained
-- `DEPLOYMENT_CHECKLIST.md` - Step-by-step deployment
+- `docs/tax/TAX_MODULE_IMPLEMENTATION_GUIDE.md` - Complete guide
+- `docs/tax/TAX_MODULE_ARCHITECTURE.md` - System architecture
+- `docs/tax/CRITICAL_FIXES_SUMMARY.md` - All 5 fixes explained
+- `docs/deploy/DEPLOYMENT_CHECKLIST.md` - Step-by-step deployment
 
 ---
 

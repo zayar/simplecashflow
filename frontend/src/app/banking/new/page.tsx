@@ -157,7 +157,7 @@ export default function NewBankingAccountPage() {
                 </div>
 
                 <div className="grid gap-2">
-                  <Label htmlFor="branch">Branch</Label>
+                  <Label htmlFor="branch">Location</Label>
                   <Input
                     id="branch"
                     value={form.branch}

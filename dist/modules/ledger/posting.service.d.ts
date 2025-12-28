@@ -9,6 +9,12 @@ export type PostJournalEntryInput = {
     companyId: number;
     date: Date;
     description: string;
+    /**
+     * Location tag (replaces legacy warehouse/branch tagging).
+     * Prefer `locationId`. `warehouseId` is accepted as a backward-compatible alias during migration.
+     */
+    locationId?: number | null;
+    warehouseId?: number | null;
     createdByUserId?: number | null;
     reversalOfJournalEntryId?: number | null;
     reversalReason?: string | null;

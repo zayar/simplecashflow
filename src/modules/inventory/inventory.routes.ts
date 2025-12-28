@@ -8,7 +8,7 @@ import { withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
-import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureWarehouse } from './stock.service.js';
+import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureLocation } from './stock.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 
@@ -20,30 +20,32 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
   fastify.addHook('preHandler', fastify.authenticate);
   const redis = getRedis();
 
-  async function resolveDefaultWarehouseId(companyId: number): Promise<number | null> {
+  async function resolveDefaultLocationId(companyId: number): Promise<number | null> {
     const company = await prisma.company.findUnique({
       where: { id: companyId },
-      select: { defaultWarehouseId: true },
+      select: { defaultLocationId: true },
     });
-    const fromCompany = company?.defaultWarehouseId ?? null;
+    const fromCompany = company?.defaultLocationId ?? null;
     if (fromCompany) return fromCompany;
-    const wh = await prisma.warehouse.findFirst({
+    const loc = await prisma.location.findFirst({
       where: { companyId, isDefault: true },
       select: { id: true },
     });
-    return wh?.id ?? null;
+    return loc?.id ?? null;
   }
 
-  // --- Warehouses ---
-  fastify.get('/companies/:companyId/warehouses', async (request, reply) => {
+  // --- Locations (legacy: /warehouses) ---
+  async function listLocations(request: any, reply: any) {
     const companyId = requireCompanyIdParam(request, reply);
-    return await prisma.warehouse.findMany({
+    return await prisma.location.findMany({
       where: { companyId },
       orderBy: [{ isDefault: 'desc' }, { id: 'asc' }],
     });
-  });
+  }
+  fastify.get('/companies/:companyId/locations', listLocations);
+  fastify.get('/companies/:companyId/warehouses', listLocations); // backward-compatible alias
 
-  fastify.post('/companies/:companyId/warehouses', async (request, reply) => {
+  async function createLocation(request: any, reply: any) {
     const companyId = requireCompanyIdParam(request, reply);
     const body = request.body as { name?: string; isDefault?: boolean };
     if (!body.name) {
@@ -53,19 +55,21 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const created = await prisma.$transaction(async (tx) => {
       if (body.isDefault) {
-        await tx.warehouse.updateMany({ where: { companyId, isDefault: true }, data: { isDefault: false } });
+        await tx.location.updateMany({ where: { companyId, isDefault: true }, data: { isDefault: false } });
       }
-      const wh = await tx.warehouse.create({
+      const loc = await tx.location.create({
         data: { companyId, name: body.name!, isDefault: body.isDefault ?? false },
       });
       if (body.isDefault) {
-        await tx.company.update({ where: { id: companyId }, data: { defaultWarehouseId: wh.id } });
+        await tx.company.update({ where: { id: companyId }, data: { defaultLocationId: loc.id } });
       }
-      return wh;
+      return loc;
     });
 
     return created;
-  });
+  }
+  fastify.post('/companies/:companyId/locations', createLocation);
+  fastify.post('/companies/:companyId/warehouses', createLocation); // backward-compatible alias
 
   // --- Inventory: Opening Balance (posts stock + GL) ---
   // POST /companies/:companyId/inventory/opening-balance
@@ -81,7 +85,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       date?: string;
-      warehouseId?: number;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       lines?: { itemId?: number; quantity?: number; unitCost?: number }[];
     };
     if (!body.lines?.length) {
@@ -97,19 +102,19 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       return { error: 'invalid date' };
     }
 
-    const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
+    const locationIdHint = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
 
-    const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
-    const resolvedWarehouseId =
-      warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+    const defaultLocationId = await resolveDefaultLocationId(companyId);
+    const resolvedLocationId =
+      locationIdHint !== null ? Number(locationIdHint) : Number(defaultLocationId ?? NaN);
 
     const lockKeys = body.lines.flatMap((l) => {
       // Always lock by resolved numeric warehouseId when available to prevent races
       // between "default warehouse" calls and explicit warehouseId calls.
       const keys: string[] = [];
-      if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
-        keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
-        if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+      if (Number.isInteger(resolvedLocationId) && resolvedLocationId > 0) {
+        keys.push(`lock:stock:${companyId}:${resolvedLocationId}:${l.itemId}`);
+        if (defaultLocationId && resolvedLocationId === defaultLocationId) {
           keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
         }
       } else {
@@ -127,12 +132,12 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         async () => {
           const txResult = await prisma.$transaction(async (tx) => {
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
-            const warehouseId = Number(warehouseIdHint ?? cfg.defaultWarehouseId);
-            if (!warehouseId || Number.isNaN(warehouseId)) {
-              throw Object.assign(new Error('warehouseId is required (or set company defaultWarehouseId)'), { statusCode: 400 });
+            const locationId = Number(locationIdHint ?? (cfg as any).defaultLocationId);
+            if (!locationId || Number.isNaN(locationId)) {
+              throw Object.assign(new Error('locationId is required (or set company defaultLocationId)'), { statusCode: 400 });
             }
 
-            await ensureWarehouse(tx as any, companyId, warehouseId);
+            await ensureLocation(tx as any, companyId, locationId);
 
             let totalValue = new Prisma.Decimal(0);
             const appliedLines: Array<{
@@ -161,7 +166,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
               const applied = await applyStockMoveWac(tx as any, {
                 companyId,
-                warehouseId,
+                locationId,
                 itemId,
                 date,
                 type: 'OPENING',
@@ -235,7 +240,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               idempotencyKey,
               correlationId,
               metadata: {
-                warehouseId,
+                locationId,
                 totalValue: totalValue.toString(),
                 linesCount: (body.lines ?? []).length,
               },
@@ -244,7 +249,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
             return {
               journalEntryId: je.id,
               totalValue: totalValue.toString(),
-              warehouseId,
+              locationId,
               lines: appliedLines,
               _jeEventId: jeEventId,
             };
@@ -257,7 +262,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     );
 
     return {
-      warehouseId: (result as any).warehouseId,
+      locationId: (result as any).locationId,
       journalEntryId: (result as any).journalEntryId,
       totalValue: (result as any).totalValue,
       lines: (result as any).lines ?? [],
@@ -277,7 +282,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     const body = request.body as {
       date?: string;
-      warehouseId?: number;
+      locationId?: number;
+      warehouseId?: number; // backward-compatible alias
       offsetAccountId?: number;
       referenceNumber?: string;
       reason?: string;
@@ -296,17 +302,17 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       return { error: 'invalid date' };
     }
 
-    const warehouseIdHint = body.warehouseId ? Number(body.warehouseId) : null;
+    const locationIdHint = (body.locationId ?? body.warehouseId) ? Number(body.locationId ?? body.warehouseId) : null;
 
-    const defaultWarehouseId = await resolveDefaultWarehouseId(companyId);
-    const resolvedWarehouseId =
-      warehouseIdHint !== null ? Number(warehouseIdHint) : Number(defaultWarehouseId ?? NaN);
+    const defaultLocationId = await resolveDefaultLocationId(companyId);
+    const resolvedLocationId =
+      locationIdHint !== null ? Number(locationIdHint) : Number(defaultLocationId ?? NaN);
 
     const lockKeys = body.lines.flatMap((l) => {
       const keys: string[] = [];
-      if (Number.isInteger(resolvedWarehouseId) && resolvedWarehouseId > 0) {
-        keys.push(`lock:stock:${companyId}:${resolvedWarehouseId}:${l.itemId}`);
-        if (defaultWarehouseId && resolvedWarehouseId === defaultWarehouseId) {
+      if (Number.isInteger(resolvedLocationId) && resolvedLocationId > 0) {
+        keys.push(`lock:stock:${companyId}:${resolvedLocationId}:${l.itemId}`);
+        if (defaultLocationId && resolvedLocationId === defaultLocationId) {
           keys.push(`lock:stock:${companyId}:default:${l.itemId}`);
         }
       } else {
@@ -323,9 +329,9 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         async () => {
           const txResult = await prisma.$transaction(async (tx) => {
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
-            const warehouseId = Number(warehouseIdHint ?? cfg.defaultWarehouseId);
-            if (!warehouseId || Number.isNaN(warehouseId)) {
-              throw Object.assign(new Error('warehouseId is required (or set company defaultWarehouseId)'), { statusCode: 400 });
+            const locationId = Number(locationIdHint ?? (cfg as any).defaultLocationId);
+            if (!locationId || Number.isNaN(locationId)) {
+              throw Object.assign(new Error('locationId is required (or set company defaultLocationId)'), { statusCode: 400 });
             }
 
             const offsetAccountId = body.offsetAccountId ?? cfg.cogsAccountId;
@@ -333,7 +339,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               throw Object.assign(new Error('offsetAccountId is required (or set company.cogsAccountId)'), { statusCode: 400 });
             }
 
-            await ensureWarehouse(tx as any, companyId, warehouseId);
+            await ensureLocation(tx as any, companyId, locationId);
 
             // Validate offset account belongs to tenant
             const offsetAcc = await tx.account.findFirst({ where: { id: offsetAccountId, companyId } });
@@ -363,7 +369,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                 }
                 const applied = await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId,
+                  locationId,
                   itemId,
                   date,
                   type: 'ADJUSTMENT',
@@ -383,7 +389,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                 const qty = d2(Math.abs(delta));
                 const applied = await applyStockMoveWac(tx as any, {
                   companyId,
-                  warehouseId,
+                  locationId,
                   itemId,
                   date,
                   type: 'ADJUSTMENT',
@@ -480,7 +486,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               idempotencyKey,
               correlationId,
               metadata: {
-                warehouseId,
+                locationId,
                 offsetAccountId,
                 referenceNumber: body.referenceNumber ?? null,
                 reason: body.reason ?? null,
@@ -489,7 +495,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               },
             });
 
-            return { journalEntryId: je.id, netValue: net.toString(), warehouseId, _jeEventId: jeEventId };
+            return { journalEntryId: je.id, netValue: net.toString(), locationId, _jeEventId: jeEventId };
           });
 
           return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
@@ -499,39 +505,40 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     );
 
     return {
-      warehouseId: (result as any).warehouseId,
+      locationId: (result as any).locationId,
       journalEntryId: (result as any).journalEntryId,
       netValue: (result as any).netValue,
     };
   });
 
   // --- Inventory Summary (Accounting stock) ---
-  // GET /companies/:companyId/reports/inventory-summary?warehouseId=...
+  // GET /companies/:companyId/reports/inventory-summary?locationId=... (legacy: warehouseId)
   fastify.get('/companies/:companyId/reports/inventory-summary', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
-    const query = request.query as { warehouseId?: string };
+    const query = request.query as { locationId?: string; warehouseId?: string };
 
     const where: any = { companyId };
-    if (query.warehouseId) {
-      const wid = Number(query.warehouseId);
-      if (Number.isNaN(wid)) {
+    const locIdStr = query.locationId ?? query.warehouseId;
+    if (locIdStr) {
+      const lid = Number(locIdStr);
+      if (Number.isNaN(lid)) {
         reply.status(400);
-        return { error: 'invalid warehouseId' };
+        return { error: 'invalid locationId' };
       }
-      where.warehouseId = wid;
+      where.locationId = lid;
     }
 
     const rows = await prisma.stockBalance.findMany({
       where,
       include: {
         item: { select: { id: true, name: true, sku: true } },
-        warehouse: { select: { id: true, name: true } },
+        location: { select: { id: true, name: true } },
       },
-      orderBy: [{ warehouseId: 'asc' }, { itemId: 'asc' }],
+      orderBy: [{ locationId: 'asc' }, { itemId: 'asc' }],
     });
 
     return rows.map((r) => ({
-      warehouse: r.warehouse,
+      location: (r as any).location,
       item: r.item,
       qtyOnHand: r.qtyOnHand.toString(),
       avgUnitCost: r.avgUnitCost.toString(),
@@ -544,43 +551,43 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
   fastify.get('/companies/:companyId/reports/inventory-valuation', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
     const asOfStr = (request.query as any)?.asOf as string | undefined;
-    const warehouseIdParam = (request.query as any)?.warehouseId as string | undefined;
+    const locationIdParam = ((request.query as any)?.locationId ?? (request.query as any)?.warehouseId) as string | undefined;
     const asOf = asOfStr ? new Date(asOfStr) : new Date();
     if (asOfStr && isNaN(asOf.getTime())) {
       reply.status(400);
       return { error: 'invalid asOf' };
     }
-    const warehouseId = warehouseIdParam ? Number(warehouseIdParam) : null;
-    if (warehouseIdParam && Number.isNaN(warehouseId)) {
+    const locationId = locationIdParam ? Number(locationIdParam) : null;
+    if (locationIdParam && Number.isNaN(locationId)) {
       reply.status(400);
-      return { error: 'invalid warehouseId' };
+      return { error: 'invalid locationId' };
     }
 
     const moves = await prisma.stockMove.findMany({
       where: {
         companyId,
         date: { lte: asOf },
-        ...(warehouseId ? { warehouseId } : {}),
+        ...(locationId ? { locationId } : {}),
       },
       orderBy: [{ date: 'asc' }, { id: 'asc' }],
       include: {
         item: { select: { id: true, name: true, sku: true, type: true, trackInventory: true } },
-        warehouse: { select: { id: true, name: true } },
+        location: { select: { id: true, name: true } },
       },
     });
 
-    type Key = string; // `${warehouseId}:${itemId}`
+    type Key = string; // `${locationId}:${itemId}`
     const state = new Map<Key, { qty: Prisma.Decimal; value: Prisma.Decimal }>();
-    const meta = new Map<Key, { warehouseId: number; warehouseName: string; itemId: number; itemName: string; sku: string | null }>();
+    const meta = new Map<Key, { locationId: number; locationName: string; itemId: number; itemName: string; sku: string | null }>();
 
     for (const m of moves as any[]) {
       if (!m.item?.trackInventory) continue;
-      const key = `${m.warehouseId}:${m.itemId}`;
+      const key = `${m.locationId}:${m.itemId}`;
       if (!state.has(key)) state.set(key, { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) });
       if (!meta.has(key)) {
         meta.set(key, {
-          warehouseId: m.warehouseId,
-          warehouseName: m.warehouse?.name ?? '',
+          locationId: m.locationId,
+          locationName: m.location?.name ?? '',
           itemId: m.itemId,
           itemName: m.item?.name ?? '',
           sku: m.item?.sku ?? null,
@@ -605,8 +612,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         const inventoryValue = st.value.toDecimalPlaces(2);
         const avgUnitCost = qtyOnHand.equals(0) ? new Prisma.Decimal(0) : inventoryValue.div(qtyOnHand).toDecimalPlaces(2);
         return {
-          warehouseId: m.warehouseId,
-          warehouseName: m.warehouseName,
+          locationId: m.locationId,
+          locationName: m.locationName,
           itemId: m.itemId,
           itemName: m.itemName,
           sku: m.sku,
@@ -616,7 +623,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         };
       })
       .filter((r) => Number(r.qtyOnHand) !== 0 || Number(r.inventoryValue) !== 0)
-      .sort((a, b) => (a.itemName || '').localeCompare(b.itemName || '') || (a.warehouseName || '').localeCompare(b.warehouseName || ''));
+      .sort((a, b) => (a.itemName || '').localeCompare(b.itemName || '') || (a.locationName || '').localeCompare(b.locationName || ''));
 
     const totals = rows.reduce(
       (acc, r) => {
@@ -630,7 +637,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     return {
       companyId,
       asOf: asOf.toISOString(),
-      warehouseId: warehouseId ?? null,
+      locationId: locationId ?? null,
       totals: { qtyOnHand: totals.qty.toDecimalPlaces(2).toString(), inventoryValue: totals.value.toDecimalPlaces(2).toString() },
       rows,
     };
@@ -646,7 +653,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       return { error: 'invalid itemId' };
     }
 
-    const q = request.query as { from?: string; to?: string; warehouseId?: string };
+    const q = request.query as { from?: string; to?: string; locationId?: string; warehouseId?: string };
     const from = parseDateInput(q.from) ?? null;
     const to = parseDateInput(q.to) ?? null;
     if (!from) {
@@ -670,10 +677,10 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       ? new Date(`${String(q.to).trim()}T23:59:59.999Z`)
       : new Date(to.getTime());
 
-    const warehouseId = q.warehouseId ? Number(q.warehouseId) : null;
-    if (q.warehouseId && (Number.isNaN(warehouseId) || !warehouseId)) {
+    const locationId = (q.locationId ?? q.warehouseId) ? Number(q.locationId ?? q.warehouseId) : null;
+    if ((q.locationId ?? q.warehouseId) && (Number.isNaN(locationId) || !locationId)) {
       reply.status(400);
-      return { error: 'invalid warehouseId' };
+      return { error: 'invalid locationId' };
     }
 
     const item = await prisma.item.findFirst({
@@ -694,11 +701,11 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         companyId,
         itemId,
         date: { lte: toEnd },
-        ...(warehouseId ? { warehouseId } : {}),
+        ...(locationId ? { locationId } : {}),
       },
       orderBy: [{ date: 'asc' }, { id: 'asc' }],
       include: {
-        warehouse: { select: { id: true, name: true } },
+        location: { select: { id: true, name: true } },
       },
     });
 
@@ -750,7 +757,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       totalCost: null,
       stockOnHand: qty.toDecimalPlaces(2).toString(),
       inventoryAssetValue: value.toDecimalPlaces(2).toString(),
-      warehouseName: warehouseId ? (moves?.[0]?.warehouse?.name ?? null) : null,
+      locationName: locationId ? (moves?.[0]?.location?.name ?? null) : null,
     });
 
     // Now apply and emit in-range moves
@@ -778,8 +785,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         transactionDetails: labelForMove(m),
         type: m.type,
         direction: m.direction,
-        warehouseId: m.warehouseId,
-        warehouseName: m.warehouse?.name ?? null,
+        locationId: m.locationId,
+        locationName: m.location?.name ?? null,
         quantity: q2.toString(),
         unitCost: unit.toString(),
         totalCost: total.toString(),
@@ -805,7 +812,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       item: { id: item.id, name: item.name, sku: item.sku ?? null },
       from: from.toISOString(),
       to: toEnd.toISOString(),
-      warehouseId: warehouseId ?? null,
+      locationId: locationId ?? null,
       rows,
     };
   });
@@ -815,7 +822,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     const companyId = requireCompanyIdParam(request, reply);
     const fromStr = (request.query as any)?.from as string | undefined;
     const toStr = (request.query as any)?.to as string | undefined;
-    const warehouseIdParam = (request.query as any)?.warehouseId as string | undefined;
+    const locationIdParam = ((request.query as any)?.locationId ?? (request.query as any)?.warehouseId) as string | undefined;
     const itemIdParam = (request.query as any)?.itemId as string | undefined;
 
     const from = fromStr ? new Date(fromStr) : null;
@@ -828,11 +835,11 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       reply.status(400);
       return { error: 'invalid to' };
     }
-    const warehouseId = warehouseIdParam ? Number(warehouseIdParam) : null;
+    const locationId = locationIdParam ? Number(locationIdParam) : null;
     const itemId = itemIdParam ? Number(itemIdParam) : null;
-    if (warehouseIdParam && Number.isNaN(warehouseId)) {
+    if (locationIdParam && Number.isNaN(locationId)) {
       reply.status(400);
-      return { error: 'invalid warehouseId' };
+      return { error: 'invalid locationId' };
     }
     if (itemIdParam && Number.isNaN(itemId)) {
       reply.status(400);
@@ -841,12 +848,12 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
     // Movement within range
     const rows = await prisma.stockMove.groupBy({
-      by: ['warehouseId', 'itemId', 'direction'],
+      by: ['locationId', 'itemId', 'direction'],
       where: {
         companyId,
         ...(from ? { date: { gte: from } } : {}),
         ...(to ? { date: { ...(from ? { gte: from } : {}), lte: to } } : {}),
-        ...(warehouseId ? { warehouseId } : {}),
+        ...(locationId ? { locationId } : {}),
         ...(itemId ? { itemId } : {}),
       },
       _sum: { quantity: true, totalCostApplied: true },
@@ -856,11 +863,11 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     const beforeRows =
       from
         ? await prisma.stockMove.groupBy({
-            by: ['warehouseId', 'itemId', 'direction'],
+            by: ['locationId', 'itemId', 'direction'],
             where: {
               companyId,
               date: { lt: from },
-              ...(warehouseId ? { warehouseId } : {}),
+              ...(locationId ? { locationId } : {}),
               ...(itemId ? { itemId } : {}),
             },
             _sum: { quantity: true, totalCostApplied: true },
@@ -868,18 +875,18 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
         : [];
 
     const ids = Array.from(new Set(rows.map((r) => r.itemId)));
-    const whIds = Array.from(new Set(rows.map((r) => r.warehouseId)));
+    const locIds = Array.from(new Set(rows.map((r) => r.locationId)));
     const items = await prisma.item.findMany({ where: { companyId, id: { in: ids } }, select: { id: true, name: true, sku: true, trackInventory: true } });
-    const whs = await prisma.warehouse.findMany({ where: { companyId, id: { in: whIds } }, select: { id: true, name: true } });
+    const locs = await prisma.location.findMany({ where: { companyId, id: { in: locIds } }, select: { id: true, name: true } });
     const itemById = new Map(items.map((i) => [i.id, i]));
-    const whById = new Map(whs.map((w) => [w.id, w]));
+    const locById = new Map(locs.map((l) => [l.id, l]));
 
-    type Key = string; // `${warehouseId}:${itemId}`
+    type Key = string; // `${locationId}:${itemId}`
     const agg = new Map<Key, any>();
     const begin = new Map<Key, { qty: Prisma.Decimal; value: Prisma.Decimal }>();
 
     for (const r of beforeRows as any[]) {
-      const key = `${r.warehouseId}:${r.itemId}`;
+      const key = `${r.locationId}:${r.itemId}`;
       if (!begin.has(key)) begin.set(key, { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) });
       const b = begin.get(key)!;
       const qty = new Prisma.Decimal(r._sum.quantity ?? 0).toDecimalPlaces(2);
@@ -896,12 +903,12 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     for (const r of rows as any[]) {
       const it = itemById.get(r.itemId);
       if (!it?.trackInventory) continue;
-      const key = `${r.warehouseId}:${r.itemId}`;
+      const key = `${r.locationId}:${r.itemId}`;
       if (!agg.has(key)) {
         const b = begin.get(key) ?? { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) };
         agg.set(key, {
-          warehouseId: r.warehouseId,
-          warehouseName: whById.get(r.warehouseId)?.name ?? '',
+          locationId: r.locationId,
+          locationName: locById.get(r.locationId)?.name ?? '',
           itemId: r.itemId,
           itemName: it?.name ?? '',
           sku: it?.sku ?? null,
@@ -931,8 +938,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       const endQty = a.beginQty.add(netQty).toDecimalPlaces(2);
       const endValue = a.beginValue.add(netValue).toDecimalPlaces(2);
       return {
-        warehouseId: a.warehouseId,
-        warehouseName: a.warehouseName,
+        locationId: a.locationId,
+        locationName: a.locationName,
         itemId: a.itemId,
         itemName: a.itemName,
         sku: a.sku,
@@ -1016,13 +1023,13 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     const balances = await prisma.stockBalance.findMany({
       where: { companyId, itemId },
       include: {
-        warehouse: { select: { id: true, name: true, isDefault: true } },
+        location: { select: { id: true, name: true, isDefault: true } },
       },
-      orderBy: [{ warehouseId: 'asc' }],
+      orderBy: [{ locationId: 'asc' }],
     });
 
     return balances.map((b) => ({
-      warehouse: b.warehouse,
+      location: (b as any).location,
       qtyOnHand: b.qtyOnHand.toString(),
       avgUnitCost: b.avgUnitCost.toString(),
       inventoryValue: b.inventoryValue.toString(),
@@ -1051,7 +1058,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     const moves = await prisma.stockMove.findMany({
       where: { companyId, itemId },
       include: {
-        warehouse: { select: { id: true, name: true } },
+        location: { select: { id: true, name: true } },
       },
       orderBy: [{ date: 'desc' }, { id: 'desc' }],
       take,
@@ -1067,7 +1074,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       totalCostApplied: m.totalCostApplied.toString(),
       referenceType: m.referenceType,
       referenceId: m.referenceId,
-      warehouse: m.warehouse,
+      location: (m as any).location,
       journalEntryId: m.journalEntryId ?? null,
       createdAt: m.createdAt,
     }));

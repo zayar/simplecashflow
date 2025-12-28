@@ -467,7 +467,7 @@ export default function ExpenseDetailPage() {
                     <thead className="bg-slate-50 text-slate-500">
                       <tr>
                         <th className="h-10 px-4 text-left font-medium">Account</th>
-                        <th className="h-10 px-4 text-left font-medium">Branch</th>
+                        <th className="h-10 px-4 text-left font-medium">Location</th>
                         <th className="h-10 px-4 text-right font-medium">Debit</th>
                         <th className="h-10 px-4 text-right font-medium">Credit</th>
                       </tr>

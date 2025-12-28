@@ -23,7 +23,7 @@ export default function AdjustmentsPage() {
   const { user } = useAuth();
   const [warehouses, setWarehouses] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
-  const [warehouseId, setWarehouseId] = useState('');
+  const [locationId, setLocationId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [referenceNumber, setReferenceNumber] = useState('');
   const [reason, setReason] = useState('');
@@ -32,7 +32,7 @@ export default function AdjustmentsPage() {
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setWarehouses).catch(console.error);
     fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
   }, [user?.companyId]);
 
@@ -58,7 +58,7 @@ export default function AdjustmentsPage() {
         method: 'POST',
         body: JSON.stringify({
           date,
-          warehouseId: warehouseId ? Number(warehouseId) : undefined,
+          locationId: locationId ? Number(locationId) : undefined,
           referenceNumber: referenceNumber || undefined,
           reason: reason || undefined,
           lines: lines
@@ -96,8 +96,8 @@ export default function AdjustmentsPage() {
             <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
           <div className="grid gap-2">
-            <Label>Warehouse</Label>
-            <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
+            <Label>Location</Label>
+            <SelectNative value={locationId} onChange={(e) => setLocationId(e.target.value)}>
               <option value="">Company default</option>
               {warehouses.map((w) => (
                 <option key={w.id} value={String(w.id)}>

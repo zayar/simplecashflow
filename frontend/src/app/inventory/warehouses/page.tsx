@@ -25,7 +25,7 @@ export default function WarehousesPage() {
 
   async function load() {
     if (!user?.companyId) return;
-    const data = await fetchApi(`/companies/${user.companyId}/warehouses`);
+    const data = await fetchApi(`/companies/${user.companyId}/locations`);
     setRows(data);
   }
 
@@ -34,12 +34,12 @@ export default function WarehousesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId]);
 
-  async function createWarehouse(e: React.FormEvent) {
+  async function createLocation(e: React.FormEvent) {
     e.preventDefault();
     if (!user?.companyId) return;
     setLoading(true);
     try {
-      await fetchApi(`/companies/${user.companyId}/warehouses`, {
+      await fetchApi(`/companies/${user.companyId}/locations`, {
         method: 'POST',
         body: JSON.stringify({ name, isDefault }),
       });
@@ -48,7 +48,7 @@ export default function WarehousesPage() {
       await load();
     } catch (err) {
       console.error(err);
-      alert('Failed to create warehouse');
+      alert('Failed to create location');
     } finally {
       setLoading(false);
     }
@@ -57,16 +57,16 @@ export default function WarehousesPage() {
   return (
     <div className="space-y-6">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Warehouses</h1>
-        <p className="text-sm text-muted-foreground">Manage your inventory locations.</p>
+        <h1 className="text-2xl font-semibold tracking-tight">Locations</h1>
+        <p className="text-sm text-muted-foreground">Manage your locations.</p>
       </div>
 
       <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle className="text-lg">Create warehouse</CardTitle>
+          <CardTitle className="text-lg">Create location</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={createWarehouse} className="grid gap-4 md:grid-cols-3 md:items-end">
+          <form onSubmit={createLocation} className="grid gap-4 md:grid-cols-3 md:items-end">
             <div className="grid gap-2 md:col-span-2">
               <Label htmlFor="name">Name</Label>
               <Input id="name" value={name} onChange={(e) => setName(e.target.value)} required />
@@ -91,7 +91,7 @@ export default function WarehousesPage() {
 
       <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle className="text-lg">All warehouses</CardTitle>
+          <CardTitle className="text-lg">All locations</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
           <Table>
@@ -111,7 +111,7 @@ export default function WarehousesPage() {
               {rows.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={2} className="py-10 text-center text-muted-foreground">
-                    No warehouses yet.
+                    No locations yet.
                   </TableCell>
                 </TableRow>
               )}

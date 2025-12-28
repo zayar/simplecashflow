@@ -33,7 +33,8 @@ export default function NewTaxPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: formData.name,
-          rate: parseFloat(formData.rate) || 0,
+          // Backend stores rate as decimal (e.g. 0.10). UI input is percent (e.g. 10).
+          rate: (parseFloat(formData.rate) || 0) / 100,
           isCompound: formData.isCompound,
         }),
       })

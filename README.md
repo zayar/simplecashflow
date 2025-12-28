@@ -9,6 +9,7 @@ Full‑stack cashflow / bookkeeping app with:
 
 ## Start here (developer onboarding)
 
+- **Docs index**: `docs/INDEX.md`
 - **Architecture + system flow**: `docs/ARCHITECTURE.md`
 - **API usage guide + standards**: `docs/API_GUIDE.md`
 - **How to run locally (backend + DB + frontend)**: `docs/RUN_LOCAL.md`

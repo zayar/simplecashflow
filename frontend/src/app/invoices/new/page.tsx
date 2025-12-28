@@ -76,7 +76,7 @@ export default function NewInvoicePage() {
         fetchApi(`/companies/${user.companyId}/items`),
         fetchApi(`/companies/${user.companyId}/taxes`),
         fetchApi(`/companies/${user.companyId}/accounts`),
-        fetchApi(`/companies/${user.companyId}/warehouses`),
+        fetchApi(`/companies/${user.companyId}/locations`),
         fetchApi(`/companies/${user.companyId}/settings`),
       ])
         .then(([cust, itm, taxes, accounts, whs, settings]) => {
@@ -107,8 +107,8 @@ export default function NewInvoicePage() {
           setTaxOptions(options);
           setWarehouses(whs ?? []);
           const defWhId =
-            settings && typeof settings === 'object' && 'defaultWarehouseId' in settings
-              ? Number((settings as any).defaultWarehouseId || 0) || null
+            settings && typeof settings === 'object'
+              ? Number(((settings as any).defaultLocationId ?? (settings as any).defaultWarehouseId ?? 0) || 0) || null
               : null;
           setDefaultWarehouseId(defWhId);
           setInvoiceWarehouseId((prev) => (prev !== null ? prev : defWhId));
@@ -209,7 +209,7 @@ export default function NewInvoicePage() {
         method: 'POST',
         body: JSON.stringify({
           customerId: Number(formData.customerId),
-          warehouseId: invoiceWarehouseId || undefined,
+          locationId: invoiceWarehouseId || undefined,
           invoiceDate: formData.invoiceDate,
           dueDate: formData.dueDate || undefined,
           customerNotes: formData.customerNotes || undefined,
@@ -289,7 +289,7 @@ export default function NewInvoicePage() {
                 />
               </div>
               <div className="grid gap-2 md:col-span-3">
-                <Label htmlFor="branch">Branch (Warehouse)</Label>
+                <Label htmlFor="branch">Location</Label>
                 <div className="flex gap-2">
                   <SelectNative
                     id="branch"
@@ -300,7 +300,7 @@ export default function NewInvoicePage() {
                     }}
                     className="flex-1"
                   >
-                    <option value="">Select branch</option>
+                    <option value="">Select location</option>
                     {warehouses.map((w: any) => (
                       <option key={w.id} value={w.id}>
                         {w.name}{w.isDefault ? ' (Default)' : ''}
@@ -315,13 +315,13 @@ export default function NewInvoicePage() {
                       try {
                         await fetchApi(`/companies/${user.companyId}/settings`, {
                           method: 'PUT',
-                          body: JSON.stringify({ defaultWarehouseId: invoiceWarehouseId }),
+                          body: JSON.stringify({ defaultLocationId: invoiceWarehouseId }),
                         });
                         setDefaultWarehouseId(invoiceWarehouseId);
-                        alert('Company default warehouse updated.');
+                        alert('Company default location updated.');
                       } catch (err: any) {
                         console.error(err);
-                        alert(err?.message ?? 'Failed to update company default warehouse');
+                        alert(err?.message ?? 'Failed to update company default location');
                       }
                     }}
                     disabled={!invoiceWarehouseId}
@@ -330,7 +330,7 @@ export default function NewInvoicePage() {
                   </Button>
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  This branch is saved on the invoice (and used for tracked inventory posting). “Set as default” updates company settings.
+                  This location is saved on the invoice (and used for tracked inventory posting). “Set as default” updates company settings.
                 </div>
               </div>
             </CardContent>

@@ -28,6 +28,7 @@ export default function CreditNoteDetailPage() {
   const [cn, setCn] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function refresh() {
@@ -62,14 +63,17 @@ export default function CreditNoteDetailPage() {
 
   async function deleteDraft() {
     if (!user?.companyId || !id) return;
+    if (deleting) return;
     if (!confirm('Delete this credit note? This is only allowed for DRAFT/APPROVED credit notes.')) return;
     setError(null);
+    setDeleting(true);
     try {
       await fetchApi(`/companies/${user.companyId}/credit-notes/${id}`, { method: 'DELETE' });
       // back to list
       if (typeof window !== 'undefined') window.location.assign('/credit-notes');
     } catch (e: any) {
       setError(e?.message ?? String(e));
+      setDeleting(false);
     }
   }
 
@@ -142,20 +146,31 @@ export default function CreditNoteDetailPage() {
         </div>
         <div className="flex items-center gap-2">
           <Badge variant={cn.status === 'POSTED' ? 'secondary' : 'outline'}>{cn.status}</Badge>
-          {cn.status === 'DRAFT' ? (
+          {(cn.status === 'DRAFT' || cn.status === 'APPROVED') ? (
             <>
-              <Link href={`/credit-notes/${cn.id}/edit`}>
-                <Button variant="outline" className="gap-2">
-                  <Pencil className="h-4 w-4" /> Edit
+              {cn.status === 'DRAFT' ? (
+                <Link href={`/credit-notes/${cn.id}/edit`}>
+                  <Button variant="outline" className="gap-2">
+                    <Pencil className="h-4 w-4" /> Edit
+                  </Button>
+                </Link>
+              ) : null}
+              {cn.status === 'DRAFT' ? (
+                <Button
+                  onClick={post}
+                  disabled={posting || !canPost}
+                  title={!canPost ? 'Set an income account for all lines before posting.' : undefined}
+                >
+                  {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Post Credit Note
                 </Button>
-              </Link>
-            <Button onClick={post} disabled={posting || !canPost} title={!canPost ? 'Set an income account for all lines before posting.' : undefined}>
-              {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Post Credit Note
-            </Button>
-            <Button variant="destructive" onClick={deleteDraft}>
-              Delete
-            </Button>
+              ) : null}
+              {!cn.journalEntryId ? (
+                <Button variant="destructive" onClick={deleteDraft} disabled={deleting || posting}>
+                  {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  {deleting ? 'Deleting…' : 'Delete'}
+                </Button>
+              ) : null}
             </>
           ) : null}
         </div>
@@ -223,7 +238,9 @@ export default function CreditNoteDetailPage() {
                     <TableCell className="text-right tabular-nums">{formatMoney(l.quantity)}</TableCell>
                     <TableCell className="text-right tabular-nums">{formatMoney(l.unitPrice)}</TableCell>
                     <TableCell className="text-right tabular-nums">{formatMoney(l.taxAmount ?? 0)}</TableCell>
-                    <TableCell className="text-right font-medium tabular-nums">{formatMoney(l.lineTotal)}</TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">
+                      {formatMoney(Number(l.lineTotal ?? 0) + Number(l.taxAmount ?? 0))}
+                    </TableCell>
                   </TableRow>
                 ))}
                 <TableRow className="bg-muted/40">

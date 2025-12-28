@@ -35,8 +35,8 @@ export default function InventoryValuationDetailPage() {
   const itemId = Number(params?.itemId);
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
 
-  const [warehouses, setWarehouses] = useState<any[]>([]);
-  const [warehouseId, setWarehouseId] = useState('');
+  const [locations, setLocations] = useState<any[]>([]);
+  const [locationId, setLocationId] = useState('');
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [loading, setLoading] = useState(false);
@@ -44,15 +44,15 @@ export default function InventoryValuationDetailPage() {
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setLocations).catch(console.error);
   }, [user?.companyId]);
 
   useEffect(() => {
     // Initialize filters from query string or sane defaults.
     const qsFrom = (search?.get('from') ?? '').trim();
     const qsTo = (search?.get('to') ?? '').trim();
-    const qsWh = (search?.get('warehouseId') ?? '').trim();
-    if (qsWh) setWarehouseId(qsWh);
+    const qsLoc = (search?.get('locationId') ?? '').trim();
+    if (qsLoc) setLocationId(qsLoc);
 
     const today = todayInTimeZone(tz); // YYYY-MM-DD
     const year = today.slice(0, 4);
@@ -68,7 +68,7 @@ export default function InventoryValuationDetailPage() {
       const qs = new URLSearchParams();
       qs.set('from', from);
       qs.set('to', to);
-      if (warehouseId) qs.set('warehouseId', warehouseId);
+      if (locationId) qs.set('locationId', locationId);
       const res = await fetchApi(
         `/companies/${user.companyId}/reports/inventory-valuation/items/${itemId}?${qs.toString()}`
       );
@@ -140,13 +140,13 @@ export default function InventoryValuationDetailPage() {
               <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
             </div>
             <div className="grid gap-1 min-w-[240px]">
-              <div className="text-sm text-muted-foreground">Warehouse</div>
-              <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
-                <option value="">All warehouses</option>
-                {warehouses.map((w) => (
-                  <option key={w.id} value={String(w.id)}>
-                    {w.name}
-                    {w.isDefault ? ' (Default)' : ''}
+              <div className="text-sm text-muted-foreground">Location</div>
+              <SelectNative value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+                <option value="">All locations</option>
+                {locations.map((l) => (
+                  <option key={l.id} value={String(l.id)}>
+                    {l.name}
+                    {l.isDefault ? ' (Default)' : ''}
                   </option>
                 ))}
               </SelectNative>
@@ -192,8 +192,8 @@ export default function InventoryValuationDetailPage() {
                             </Link>
                           ) : null}
                         </div>
-                        {!isMarker && r.warehouseName ? (
-                          <div className="text-xs text-muted-foreground">{r.warehouseName}</div>
+                        {!isMarker && r.locationName ? (
+                          <div className="text-xs text-muted-foreground">{r.locationName}</div>
                         ) : null}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">

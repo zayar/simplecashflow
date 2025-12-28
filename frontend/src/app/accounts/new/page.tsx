@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
 import { createAccount } from '@/lib/api';
@@ -54,6 +54,46 @@ export default function NewAccountPage() {
     reportGroup: '',
     cashflowActivity: '',
   });
+
+  const [reportGroupTouched, setReportGroupTouched] = useState(false);
+  const [cashflowTouched, setCashflowTouched] = useState(false);
+
+  const recommendedCashflow = useMemo(() => {
+    const type = formData.type;
+    const rg = formData.reportGroup;
+    if (rg === 'FIXED_ASSET') return 'INVESTING';
+    if (rg === 'LONG_TERM_LIABILITY') return 'FINANCING';
+    if (type === 'EQUITY') return 'FINANCING';
+    return 'OPERATING';
+  }, [formData.type, formData.reportGroup]);
+
+  const recommendedReportGroup = useMemo(() => {
+    const type = formData.type;
+    const code = String(formData.code ?? '').trim();
+    const name = String(formData.name ?? '').trim().toLowerCase();
+    if (type === 'ASSET') {
+      if (['1000', '1010'].includes(code) || /\b(cash|bank|wallet|e-?wallet)\b/.test(name)) return 'CASH_AND_CASH_EQUIVALENTS';
+      if (/receivable/.test(name) || code.startsWith('12')) return 'ACCOUNTS_RECEIVABLE';
+      if (/inventory/.test(name) || code.startsWith('13')) return 'INVENTORY';
+      if (/equipment|furniture|fixture|fixed asset|property|plant/.test(name) || code.startsWith('15')) return 'FIXED_ASSET';
+    }
+    if (type === 'LIABILITY') {
+      if (/payable/.test(name) || code.startsWith('20')) return 'ACCOUNTS_PAYABLE';
+      if (/loan|debt|note payable|mortgage/.test(name) || code.startsWith('25')) return 'LONG_TERM_LIABILITY';
+    }
+    if (type === 'EQUITY') return 'EQUITY';
+    return '';
+  }, [formData.type, formData.code, formData.name]);
+
+  // Auto-fill recommendations unless the user explicitly chose something.
+  useEffect(() => {
+    setFormData((prev) => {
+      const next = { ...prev };
+      if (!cashflowTouched && !next.cashflowActivity) next.cashflowActivity = recommendedCashflow;
+      if (!reportGroupTouched && !next.reportGroup && recommendedReportGroup) next.reportGroup = recommendedReportGroup;
+      return next;
+    });
+  }, [recommendedCashflow, recommendedReportGroup, cashflowTouched, reportGroupTouched]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -119,7 +159,17 @@ export default function NewAccountPage() {
               id="type"
               className="flex h-10 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm ring-offset-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950 focus-visible:ring-offset-2"
               value={formData.type}
-              onChange={(e) => setFormData({ ...formData, type: e.target.value })}
+              onChange={(e) => {
+                const nextType = e.target.value;
+                setFormData((prev) => ({ ...prev, type: nextType }));
+                // When type changes, re-apply cashflow default unless user explicitly chose one.
+                if (!cashflowTouched) {
+                  setFormData((prev) => ({ ...prev, cashflowActivity: '' }));
+                }
+                if (!reportGroupTouched) {
+                  setFormData((prev) => ({ ...prev, reportGroup: '' }));
+                }
+              }}
             >
               {ACCOUNT_TYPES.map((type) => (
                 <option key={type} value={type}>
@@ -136,7 +186,10 @@ export default function NewAccountPage() {
                 id="reportGroup"
                 className="flex h-10 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm ring-offset-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950 focus-visible:ring-offset-2"
                 value={formData.reportGroup}
-                onChange={(e) => setFormData({ ...formData, reportGroup: e.target.value })}
+                onChange={(e) => {
+                  setReportGroupTouched(true);
+                  setFormData({ ...formData, reportGroup: e.target.value });
+                }}
               >
                 <option value="">None</option>
                 {REPORT_GROUPS.map((group) => (
@@ -145,6 +198,11 @@ export default function NewAccountPage() {
                   </option>
                 ))}
               </select>
+              {!reportGroupTouched && recommendedReportGroup ? (
+                <div className="text-xs text-muted-foreground">
+                  Recommended: <span className="font-medium">{recommendedReportGroup}</span>
+                </div>
+              ) : null}
             </div>
 
             <div className="space-y-2">
@@ -153,7 +211,10 @@ export default function NewAccountPage() {
                 id="cashflowActivity"
                 className="flex h-10 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm ring-offset-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950 focus-visible:ring-offset-2"
                 value={formData.cashflowActivity}
-                onChange={(e) => setFormData({ ...formData, cashflowActivity: e.target.value })}
+                onChange={(e) => {
+                  setCashflowTouched(true);
+                  setFormData({ ...formData, cashflowActivity: e.target.value });
+                }}
               >
                 <option value="">None</option>
                 {CASHFLOW_ACTIVITIES.map((activity) => (
@@ -162,6 +223,11 @@ export default function NewAccountPage() {
                   </option>
                 ))}
               </select>
+              {!cashflowTouched ? (
+                <div className="text-xs text-muted-foreground">
+                  Recommended: <span className="font-medium">{recommendedCashflow}</span>
+                </div>
+              ) : null}
             </div>
           </div>
 

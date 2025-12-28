@@ -25,7 +25,7 @@ export default function OpeningBalancePage() {
   const searchParams = useSearchParams();
   const [warehouses, setWarehouses] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
-  const [warehouseId, setWarehouseId] = useState('');
+  const [locationId, setLocationId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [lines, setLines] = useState<Line[]>([{ itemId: '', quantity: '', unitCost: '' }]);
   const [loading, setLoading] = useState(false);
@@ -34,11 +34,11 @@ export default function OpeningBalancePage() {
   const lockedItemId = (searchParams?.get('itemId') ?? '').trim();
   const isSingleItemMode = Boolean(lockedItemId);
 
-  // Optional: prefill from query string (e.g. /inventory/opening-balance?itemId=123&warehouseId=1)
+  // Optional: prefill from query string (e.g. /inventory/opening-balance?itemId=123&locationId=1)
   useEffect(() => {
     const itemId = lockedItemId;
-    const wid = searchParams?.get('warehouseId') ?? '';
-    if (wid) setWarehouseId(wid);
+    const lid = searchParams?.get('locationId') ?? searchParams?.get('warehouseId') ?? '';
+    if (lid) setLocationId(lid);
     if (itemId) {
       // Single-item mode: enforce a single line locked to the item.
       setLines((prev) => {
@@ -52,7 +52,7 @@ export default function OpeningBalancePage() {
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`).then(setWarehouses).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`).then(setWarehouses).catch(console.error);
     fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
   }, [user?.companyId]);
 
@@ -99,7 +99,7 @@ export default function OpeningBalancePage() {
         method: 'POST',
         body: JSON.stringify({
           date,
-          warehouseId: warehouseId ? Number(warehouseId) : undefined,
+          locationId: locationId ? Number(locationId) : undefined,
           lines: payloadLines,
         }),
       });
@@ -138,10 +138,10 @@ export default function OpeningBalancePage() {
             />
           </div>
           <div className="grid gap-2">
-            <Label>Warehouse</Label>
+            <Label>Location</Label>
             <SelectNative
-              value={warehouseId}
-              onChange={(e) => setWarehouseId(e.target.value)}
+              value={locationId}
+              onChange={(e) => setLocationId(e.target.value)}
               disabled={loading}
             >
               <option value="">Company default</option>

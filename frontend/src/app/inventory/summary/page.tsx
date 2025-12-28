@@ -16,20 +16,20 @@ import {
 
 export default function InventorySummaryPage() {
   const { user } = useAuth();
-  const [warehouses, setWarehouses] = useState<any[]>([]);
-  const [warehouseId, setWarehouseId] = useState<string>('');
+  const [locations, setLocations] = useState<any[]>([]);
+  const [locationId, setLocationId] = useState<string>('');
   const [rows, setRows] = useState<any[]>([]);
 
   useEffect(() => {
     if (!user?.companyId) return;
-    fetchApi(`/companies/${user.companyId}/warehouses`)
-      .then((w) => setWarehouses(w))
+    fetchApi(`/companies/${user.companyId}/locations`)
+      .then((l) => setLocations(l))
       .catch(console.error);
   }, [user?.companyId]);
 
   async function load() {
     if (!user?.companyId) return;
-    const qs = warehouseId ? `?warehouseId=${encodeURIComponent(warehouseId)}` : '';
+    const qs = locationId ? `?locationId=${encodeURIComponent(locationId)}` : '';
     const data = await fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`);
     setRows(data);
   }
@@ -37,7 +37,7 @@ export default function InventorySummaryPage() {
   useEffect(() => {
     load().catch(console.error);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.companyId, warehouseId]);
+  }, [user?.companyId, locationId]);
 
   const totals = useMemo(() => {
     const totalValue = rows.reduce((sum, r) => sum + Number(r.inventoryValue ?? 0), 0);
@@ -60,12 +60,12 @@ export default function InventorySummaryPage() {
         </CardHeader>
         <CardContent className="pt-0">
           <div className="grid gap-2 md:max-w-sm">
-            <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
-              <option value="">All warehouses</option>
-              {warehouses.map((w) => (
-                <option key={w.id} value={String(w.id)}>
-                  {w.name}
-                  {w.isDefault ? ' (Default)' : ''}
+            <SelectNative value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+              <option value="">All locations</option>
+              {locations.map((l) => (
+                <option key={l.id} value={String(l.id)}>
+                  {l.name}
+                  {l.isDefault ? ' (Default)' : ''}
                 </option>
               ))}
             </SelectNative>
@@ -81,7 +81,7 @@ export default function InventorySummaryPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[220px]">Warehouse</TableHead>
+                <TableHead className="w-[220px]">Location</TableHead>
                 <TableHead>Item</TableHead>
                 <TableHead className="w-[140px] text-right">Qty</TableHead>
                 <TableHead className="w-[160px] text-right">Avg Cost</TableHead>
@@ -90,8 +90,8 @@ export default function InventorySummaryPage() {
             </TableHeader>
             <TableBody>
               {rows.map((r, idx) => (
-                <TableRow key={`${r.warehouse?.id ?? 'w'}-${r.item?.id ?? 'i'}-${idx}`}>
-                  <TableCell className="text-muted-foreground">{r.warehouse?.name ?? '—'}</TableCell>
+                <TableRow key={`${r.location?.id ?? 'l'}-${r.item?.id ?? 'i'}-${idx}`}>
+                  <TableCell className="text-muted-foreground">{r.location?.name ?? '—'}</TableCell>
                   <TableCell className="font-medium">{r.item?.name ?? '—'}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.qtyOnHand ?? 0).toLocaleString()}</TableCell>
                   <TableCell className="text-right tabular-nums">{Number(r.avgUnitCost ?? 0).toLocaleString()}</TableCell>

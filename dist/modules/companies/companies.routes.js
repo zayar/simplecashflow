@@ -32,7 +32,7 @@ export async function companiesRoutes(fastify) {
                 inventoryAssetAccount: true,
                 cogsAccount: true,
                 openingBalanceEquityAccount: true,
-                defaultWarehouse: true,
+                defaultLocation: true,
             },
         });
         if (!company) {
@@ -93,12 +93,22 @@ export async function companiesRoutes(fastify) {
                     type: company.openingBalanceEquityAccount.type,
                 }
                 : null,
-            defaultWarehouseId: company.defaultWarehouseId ?? null,
-            defaultWarehouse: company.defaultWarehouse
+            // Location (preferred)
+            defaultLocationId: company.defaultLocationId ?? null,
+            defaultLocation: company.defaultLocation
                 ? {
-                    id: company.defaultWarehouse.id,
-                    name: company.defaultWarehouse.name,
-                    isDefault: company.defaultWarehouse.isDefault,
+                    id: company.defaultLocation.id,
+                    name: company.defaultLocation.name,
+                    isDefault: company.defaultLocation.isDefault,
+                }
+                : null,
+            // Backward compatibility (deprecated)
+            defaultWarehouseId: company.defaultLocationId ?? null,
+            defaultWarehouse: company.defaultLocation
+                ? {
+                    id: company.defaultLocation.id,
+                    name: company.defaultLocation.name,
+                    isDefault: company.defaultLocation.isDefault,
                 }
                 : null,
         };
@@ -114,10 +124,11 @@ export async function companiesRoutes(fastify) {
             !('inventoryAssetAccountId' in body) &&
             !('cogsAccountId' in body) &&
             !('openingBalanceEquityAccountId' in body) &&
+            !('defaultLocationId' in body) &&
             !('defaultWarehouseId' in body)) {
             reply.status(400);
             return {
-                error: 'at least one setting field is required (baseCurrency, timeZone, fiscalYearStartMonth, accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultWarehouseId)',
+                error: 'at least one setting field is required (baseCurrency, timeZone, fiscalYearStartMonth, accountsReceivableAccountId, accountsPayableAccountId, inventoryAssetAccountId, cogsAccountId, openingBalanceEquityAccountId, defaultLocationId)',
             };
         }
         const company = await prisma.company.findUnique({ where: { id: companyId } });
@@ -237,16 +248,17 @@ export async function companiesRoutes(fastify) {
                 return { error: 'openingBalanceEquityAccountId must be an EQUITY account in this company' };
             }
         }
-        if (body.defaultWarehouseId !== undefined && body.defaultWarehouseId !== null) {
-            const whId = body.defaultWarehouseId;
-            if (!whId || Number.isNaN(Number(whId))) {
+        const desiredDefaultLocationId = body.defaultLocationId !== undefined ? body.defaultLocationId : body.defaultWarehouseId;
+        if (desiredDefaultLocationId !== undefined && desiredDefaultLocationId !== null) {
+            const locId = desiredDefaultLocationId;
+            if (!locId || Number.isNaN(Number(locId))) {
                 reply.status(400);
-                return { error: 'defaultWarehouseId must be a valid number or null' };
+                return { error: 'defaultLocationId must be a valid number or null' };
             }
-            const wh = await prisma.warehouse.findFirst({ where: { id: whId, companyId } });
-            if (!wh) {
+            const loc = await prisma.location.findFirst({ where: { id: locId, companyId } });
+            if (!loc) {
                 reply.status(400);
-                return { error: 'defaultWarehouseId must be a warehouse in this company' };
+                return { error: 'defaultLocationId must be a location in this company' };
             }
         }
         const updated = await prisma.company.update({
@@ -270,7 +282,7 @@ export async function companiesRoutes(fastify) {
                 ...(body.openingBalanceEquityAccountId !== undefined
                     ? { openingBalanceEquityAccountId: body.openingBalanceEquityAccountId }
                     : {}),
-                ...(body.defaultWarehouseId !== undefined ? { defaultWarehouseId: body.defaultWarehouseId } : {}),
+                ...(desiredDefaultLocationId !== undefined ? { defaultLocationId: desiredDefaultLocationId } : {}),
             },
             include: {
                 accountsReceivableAccount: true,
@@ -278,7 +290,7 @@ export async function companiesRoutes(fastify) {
                 inventoryAssetAccount: true,
                 cogsAccount: true,
                 openingBalanceEquityAccount: true,
-                defaultWarehouse: true,
+                defaultLocation: true,
             },
         });
         const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
@@ -334,12 +346,22 @@ export async function companiesRoutes(fastify) {
                     type: updated.openingBalanceEquityAccount.type,
                 }
                 : null,
-            defaultWarehouseId: updated.defaultWarehouseId ?? null,
-            defaultWarehouse: updated.defaultWarehouse
+            // Location (preferred)
+            defaultLocationId: updated.defaultLocationId ?? null,
+            defaultLocation: updated.defaultLocation
                 ? {
-                    id: updated.defaultWarehouse.id,
-                    name: updated.defaultWarehouse.name,
-                    isDefault: updated.defaultWarehouse.isDefault,
+                    id: updated.defaultLocation.id,
+                    name: updated.defaultLocation.name,
+                    isDefault: updated.defaultLocation.isDefault,
+                }
+                : null,
+            // Backward compatibility (deprecated)
+            defaultWarehouseId: updated.defaultLocationId ?? null,
+            defaultWarehouse: updated.defaultLocation
+                ? {
+                    id: updated.defaultLocation.id,
+                    name: updated.defaultLocation.name,
+                    isDefault: updated.defaultLocation.isDefault,
                 }
                 : null,
         };
@@ -366,6 +388,50 @@ export async function companiesRoutes(fastify) {
             reply.status(400);
             return { error: 'code, name, type are required' };
         }
+        function inferReportGroup(code, name, type) {
+            const c = String(code ?? '').trim();
+            const n = String(name ?? '').trim().toLowerCase();
+            if (type === AccountType.ASSET) {
+                if (['1000', '1010'].includes(c) || /\b(cash|bank|wallet|e-?wallet)\b/.test(n))
+                    return AccountReportGroup.CASH_AND_CASH_EQUIVALENTS;
+                if (/receivable/.test(n) || c.startsWith('12'))
+                    return AccountReportGroup.ACCOUNTS_RECEIVABLE;
+                if (/inventory/.test(n) || c.startsWith('13'))
+                    return AccountReportGroup.INVENTORY;
+                if (/equipment|furniture|fixture|fixed asset|property|plant/.test(n) || c.startsWith('15'))
+                    return AccountReportGroup.FIXED_ASSET;
+                return null;
+            }
+            if (type === AccountType.LIABILITY) {
+                if (/payable/.test(n) || c.startsWith('20'))
+                    return AccountReportGroup.ACCOUNTS_PAYABLE;
+                if (/loan|debt|note payable|mortgage/.test(n) || c.startsWith('25'))
+                    return AccountReportGroup.LONG_TERM_LIABILITY;
+                return null;
+            }
+            if (type === AccountType.EQUITY) {
+                if (/equity|retained|capital/.test(n) || c.startsWith('30'))
+                    return AccountReportGroup.EQUITY;
+                return AccountReportGroup.EQUITY;
+            }
+            return null;
+        }
+        function inferCashflowActivity(type, reportGroup) {
+            // Beginner-friendly defaults:
+            // - Fixed assets => Investing
+            // - Equity + long-term liabilities => Financing
+            // - Everything else => Operating
+            if (reportGroup === AccountReportGroup.FIXED_ASSET)
+                return CashflowActivity.INVESTING;
+            if (reportGroup === AccountReportGroup.LONG_TERM_LIABILITY)
+                return CashflowActivity.FINANCING;
+            if (type === AccountType.EQUITY)
+                return CashflowActivity.FINANCING;
+            // We keep INCOME/EXPENSE as OPERATING too (not used for BS deltas, but harmless).
+            return CashflowActivity.OPERATING;
+        }
+        const inferredReportGroup = body.reportGroup ?? inferReportGroup(body.code, body.name, body.type);
+        const inferredCashflowActivity = body.cashflowActivity ?? inferCashflowActivity(body.type, inferredReportGroup);
         const account = await prisma.account.create({
             data: {
                 companyId,
@@ -373,8 +439,8 @@ export async function companiesRoutes(fastify) {
                 name: body.name,
                 type: body.type,
                 normalBalance: normalBalanceForType(body.type),
-                reportGroup: body.reportGroup ?? null,
-                cashflowActivity: body.cashflowActivity ?? null,
+                reportGroup: inferredReportGroup ?? null,
+                cashflowActivity: inferredCashflowActivity ?? null,
             },
         });
         return account;
@@ -388,6 +454,45 @@ export async function companiesRoutes(fastify) {
             reply.status(400);
             return { error: 'code, name, type are required' };
         }
+        function inferReportGroup(code, name, type) {
+            const c = String(code ?? '').trim();
+            const n = String(name ?? '').trim().toLowerCase();
+            if (type === AccountType.ASSET) {
+                if (['1000', '1010'].includes(c) || /\b(cash|bank|wallet|e-?wallet)\b/.test(n))
+                    return AccountReportGroup.CASH_AND_CASH_EQUIVALENTS;
+                if (/receivable/.test(n) || c.startsWith('12'))
+                    return AccountReportGroup.ACCOUNTS_RECEIVABLE;
+                if (/inventory/.test(n) || c.startsWith('13'))
+                    return AccountReportGroup.INVENTORY;
+                if (/equipment|furniture|fixture|fixed asset|property|plant/.test(n) || c.startsWith('15'))
+                    return AccountReportGroup.FIXED_ASSET;
+                return null;
+            }
+            if (type === AccountType.LIABILITY) {
+                if (/payable/.test(n) || c.startsWith('20'))
+                    return AccountReportGroup.ACCOUNTS_PAYABLE;
+                if (/loan|debt|note payable|mortgage/.test(n) || c.startsWith('25'))
+                    return AccountReportGroup.LONG_TERM_LIABILITY;
+                return null;
+            }
+            if (type === AccountType.EQUITY) {
+                if (/equity|retained|capital/.test(n) || c.startsWith('30'))
+                    return AccountReportGroup.EQUITY;
+                return AccountReportGroup.EQUITY;
+            }
+            return null;
+        }
+        function inferCashflowActivity(type, reportGroup) {
+            if (reportGroup === AccountReportGroup.FIXED_ASSET)
+                return CashflowActivity.INVESTING;
+            if (reportGroup === AccountReportGroup.LONG_TERM_LIABILITY)
+                return CashflowActivity.FINANCING;
+            if (type === AccountType.EQUITY)
+                return CashflowActivity.FINANCING;
+            return CashflowActivity.OPERATING;
+        }
+        const inferredReportGroup = body.reportGroup ?? inferReportGroup(body.code, body.name, body.type);
+        const inferredCashflowActivity = body.cashflowActivity ?? inferCashflowActivity(body.type, inferredReportGroup);
         const account = await prisma.account.create({
             data: {
                 companyId,
@@ -395,8 +500,8 @@ export async function companiesRoutes(fastify) {
                 name: body.name,
                 type: body.type,
                 normalBalance: normalBalanceForType(body.type),
-                reportGroup: body.reportGroup ?? null,
-                cashflowActivity: body.cashflowActivity ?? null,
+                reportGroup: inferredReportGroup ?? null,
+                cashflowActivity: inferredCashflowActivity ?? null,
             },
         });
         return account;
