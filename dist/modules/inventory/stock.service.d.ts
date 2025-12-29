@@ -13,7 +13,7 @@ export type StockMoveInput = {
      * for the same (companyId, locationId, itemId).
      */
     allowBackdated?: boolean;
-    type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'SALE_RETURN' | 'PURCHASE_RECEIPT' | 'TRANSFER_OUT' | 'TRANSFER_IN';
+    type: 'OPENING' | 'ADJUSTMENT' | 'SALE_ISSUE' | 'SALE_RETURN' | 'PURCHASE_RECEIPT' | 'PURCHASE_RETURN' | 'TRANSFER_OUT' | 'TRANSFER_IN';
     direction: 'IN' | 'OUT';
     quantity: Prisma.Decimal;
     unitCostApplied: Prisma.Decimal;
@@ -23,6 +23,43 @@ export type StockMoveInput = {
     correlationId?: string | null;
     createdByUserId?: number | null;
     journalEntryId?: number | null;
+};
+type StockMoveRowForReplay = {
+    id: number;
+    date: Date;
+    type: StockMoveInput['type'];
+    direction: StockMoveInput['direction'];
+    quantity: Prisma.Decimal;
+    unitCostApplied: Prisma.Decimal;
+    totalCostApplied: Prisma.Decimal;
+    referenceType: string | null;
+    referenceId: string | null;
+};
+type ReplayBalance = {
+    qtyOnHand: Prisma.Decimal;
+    avgUnitCost: Prisma.Decimal;
+    inventoryValue: Prisma.Decimal;
+};
+/**
+ * Pure replay helper used by `applyStockMoveWac` for safe backdated inserts.
+ *
+ * Key invariant:
+ * - We DO NOT rewrite existing StockMove costs (immutability/audit).
+ * - For a backdated insert, we compute the inserted move's cost at its position in the move timeline,
+ *   then validate that NO move in the resulting timeline causes negative stock.
+ * - The caller can then rebuild the StockBalance "current snapshot" from the replay result.
+ */
+export declare function _test_replayStockMovesWithBackdatedInsert(args: {
+    existingMoves: StockMoveRowForReplay[];
+    insert: Omit<StockMoveInput, 'totalCostApplied'> & {
+        totalCostApplied?: Prisma.Decimal;
+    };
+}): {
+    computedInsert: {
+        unitCostApplied: Prisma.Decimal;
+        totalCostApplied: Prisma.Decimal;
+    };
+    finalBalance: ReplayBalance;
 };
 export declare function getCompanyInventoryConfig(tx: PrismaTx, companyId: number): Promise<{
     id: number;
@@ -81,4 +118,5 @@ export declare function getStockBalanceForUpdate(tx: PrismaTx, input: {
     avgUnitCost: Prisma.Decimal;
     inventoryValue: Prisma.Decimal;
 } | null>;
+export {};
 //# sourceMappingURL=stock.service.d.ts.map

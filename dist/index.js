@@ -5,11 +5,14 @@ import { authRoutes } from './modules/auth/auth.routes.js';
 import { companiesRoutes } from './modules/companies/companies.routes.js';
 import { ledgerRoutes } from './modules/ledger/ledger.routes.js';
 import { booksRoutes } from './modules/books/books.routes.js';
+import { customerAdvancesRoutes } from './modules/books/customerAdvances.routes.js';
 import { pitiRoutes } from './modules/integrations/piti.routes.js';
 import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
+import { vendorCreditsRoutes } from './modules/purchases/vendorCredits.routes.js';
 import { apAgingRoutes } from './modules/reports/apAging.routes.js';
 import { dashboardRoutes } from './modules/reports/dashboard.routes.js';
+import { arApSummaryRoutes } from './modules/reports/arApSummary.routes.js';
 import { taxesRoutes } from './modules/taxes/taxes.routes.js';
 import { runWithTenant } from './infrastructure/tenantContext.js';
 function requireEnv(name) {
@@ -105,18 +108,29 @@ async function buildApp() {
     });
     // Health check
     fastify.get('/health', async () => {
-        return { status: 'ok' };
+        return {
+            status: 'ok',
+            // Cloud Run injects these automatically; super useful to confirm which revision is serving traffic.
+            service: process.env.K_SERVICE ?? null,
+            revision: process.env.K_REVISION ?? null,
+            configuration: process.env.K_CONFIGURATION ?? null,
+            // Optional custom build metadata if you want it later.
+            buildSha: process.env.BUILD_SHA ?? null,
+        };
     });
     // Register Modules
     await fastify.register(authRoutes);
     await fastify.register(companiesRoutes);
     await fastify.register(ledgerRoutes);
     await fastify.register(booksRoutes);
+    await fastify.register(customerAdvancesRoutes);
     await fastify.register(pitiRoutes);
     await fastify.register(inventoryRoutes);
     await fastify.register(purchaseBillsRoutes);
+    await fastify.register(vendorCreditsRoutes);
     await fastify.register(apAgingRoutes);
     await fastify.register(dashboardRoutes);
+    await fastify.register(arApSummaryRoutes);
     await fastify.register(taxesRoutes);
     // Tenant context (ALS) must be installed AFTER module-level auth hooks are registered,
     // so it can wrap the actual route handler execution with a verified tenant id.

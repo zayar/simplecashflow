@@ -249,6 +249,7 @@ export function AddTransaction({
     accountId: "", // any COA accountId
     reference: "",
     description: "",
+    receivedVia: "BANK" as "CASH" | "BANK" | "E_WALLET",
   })
   const [customerAdvanceCustomerId, setCustomerAdvanceCustomerId] = useState("")
 
@@ -290,7 +291,7 @@ export function AddTransaction({
     } else if (f === "other_income") {
       setOi({ date: today, amount: "", incomeAccountId: "", reference: "", description: "" })
     } else if (f === "other_in") {
-      setOtherIn({ date: today, amount: "", accountId: "", reference: "", description: "" })
+      setOtherIn({ date: today, amount: "", accountId: "", reference: "", description: "", receivedVia: paymentMode })
       setCustomerAdvanceCustomerId("")
     } else if (f === "transfer_in") {
       setTIn({ date: today, amount: "", fromBankAccountId: "", reference: "", description: "" })
@@ -732,23 +733,37 @@ export function AddTransaction({
         if (preset === "customer_advance") {
           if (!warehouseId) throw new Error("Please select a location")
           if (!customerAdvanceCustomerId) throw new Error("Please select a customer")
-          const customerName = String(selectedCustomerAdvanceCustomer?.name ?? "").trim()
-          if (customerName) description = `Customer advance • ${customerName} — ${description}`.trim()
-        }
-        description = decorateDescription(description)
+          // Use the dedicated endpoint so we can track credits per customer and apply later.
+          await fetchApi(`/companies/${companyId}/customer-advances`, {
+            method: "POST",
+            body: JSON.stringify({
+              customerId: Number(customerAdvanceCustomerId),
+              locationId: whId || undefined,
+              advanceDate: otherIn.date,
+              amount,
+              bankAccountId: bankAccountCoaId,
+              liabilityAccountId: accountId,
+              receivedVia: otherIn.receivedVia,
+              reference: otherIn.reference || undefined,
+              description: otherIn.description || undefined,
+            }),
+          })
+        } else {
+          description = decorateDescription(description)
 
-        await fetchApi(`/companies/${companyId}/journal-entries`, {
-          method: "POST",
-          body: JSON.stringify({
-            date: otherIn.date,
-            description,
-            warehouseId: whId || undefined,
-            lines: [
-              { accountId: bankAccountCoaId, debit: amount, credit: 0 },
-              { accountId, debit: 0, credit: amount },
-            ],
-          }),
-        })
+          await fetchApi(`/companies/${companyId}/journal-entries`, {
+            method: "POST",
+            body: JSON.stringify({
+              date: otherIn.date,
+              description,
+              warehouseId: whId || undefined,
+              lines: [
+                { accountId: bankAccountCoaId, debit: amount, credit: 0 },
+                { accountId, debit: 0, credit: amount },
+              ],
+            }),
+          })
+        }
       }
 
       if (flow === "transfer_in") {
@@ -1451,7 +1466,7 @@ export function AddTransaction({
                 {preset === "customer_advance" ? (
                   <div className="grid gap-2">
                     <Label>Received Via</Label>
-                    <SelectNative disabled value={paymentMode}>
+                    <SelectNative value={otherIn.receivedVia ?? paymentMode} onChange={(e) => setOtherIn((p) => ({ ...p, receivedVia: e.target.value as any }))}>
                       <option value="CASH">Cash</option>
                       <option value="BANK">Bank</option>
                       <option value="E_WALLET">E‑wallet</option>

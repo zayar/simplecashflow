@@ -17,7 +17,11 @@ DB_URL_SECRET="cashflow-db-url"
 JWT_SECRET_NAME="cashflow-jwt-secret"
 
 # ---- Require password without echoing ----
-if [[ -z "${DB_PASS:-}" ]]; then
+SKIP_MIGRATIONS="${SKIP_MIGRATIONS:-false}"
+UPDATE_DB_SECRET="${UPDATE_DB_SECRET:-true}"
+
+# If we are skipping migrations and not updating the DB secret, we don't need DB_PASS.
+if [[ -z "${DB_PASS:-}" ]] && { [[ "$SKIP_MIGRATIONS" != "true" ]] || [[ "$UPDATE_DB_SECRET" == "true" ]]; }; then
   read -s -p "Cloud SQL password for ${DB_USER}: " DB_PASS
   echo
 fi
@@ -75,85 +79,89 @@ gcloud builds submit --config deploy/cloudbuild.frontend.yaml .
 gcloud builds submit --config deploy/cloudbuild.publisher.yaml .
 # NOTE: uncomment the line above if you want to rebuild worker every run.
 
-# ---- Apply migrations to Cloud SQL via Proxy ----
-echo "Setting up Cloud SQL Proxy..."
-
-if command -v cloud-sql-proxy >/dev/null; then
-  PROXY_CMD="cloud-sql-proxy"
-elif [ -f "./cloud-sql-proxy" ]; then
-  PROXY_CMD="./cloud-sql-proxy"
+# ---- Apply migrations to Cloud SQL via Proxy (optional) ----
+if [[ "$SKIP_MIGRATIONS" == "true" ]]; then
+  echo "SKIP_MIGRATIONS=true -> skipping Cloud SQL Proxy + Prisma migrate deploy."
 else
-  echo "Downloading cloud-sql-proxy..."
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.darwin.amd64
+  echo "Setting up Cloud SQL Proxy..."
+
+  if command -v cloud-sql-proxy >/dev/null; then
+    PROXY_CMD="cloud-sql-proxy"
+  elif [ -f "./cloud-sql-proxy" ]; then
+    PROXY_CMD="./cloud-sql-proxy"
   else
-    curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.linux.amd64
-  fi
-  chmod +x cloud-sql-proxy
-  PROXY_CMD="./cloud-sql-proxy"
-fi
-
-echo "Starting proxy on port 3307..."
-PROXY_LOG="${ROOT_DIR}/.cloudsql-proxy.log"
-rm -f "$PROXY_LOG" || true
-echo "Proxy logs: ${PROXY_LOG}"
-# Bind explicitly to IPv4 localhost to avoid IPv6 localhost (::1) mismatch issues.
-$PROXY_CMD --address 127.0.0.1 --port 3307 "$INSTANCE_CONN" >"$PROXY_LOG" 2>&1 &
-PROXY_PID=$!
-
-# Ensure proxy is killed on script exit
-trap "kill $PROXY_PID 2>/dev/null" EXIT
-
-echo "Waiting for proxy..."
-for i in {1..30}; do
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    echo "Cloud SQL Proxy exited unexpectedly. Last 50 log lines:"
-    tail -n 50 "$PROXY_LOG" || true
-    exit 1
-  fi
-  # Prefer `nc` if present, fallback to sleep.
-  if command -v nc >/dev/null 2>&1; then
-    if nc -z 127.0.0.1 3307 >/dev/null 2>&1; then
-      break
+    echo "Downloading cloud-sql-proxy..."
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.darwin.amd64
+    else
+      curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2/latest/cloud-sql-proxy.linux.amd64
     fi
+    chmod +x cloud-sql-proxy
+    PROXY_CMD="./cloud-sql-proxy"
   fi
-  sleep 1
-done
 
-echo "Applying Prisma migrations to Cloud SQL..."
-export DATABASE_URL="mysql://${DB_USER}:${DB_PASS_ENC}@127.0.0.1:3307/${DB_NAME}"
+  echo "Starting proxy on port 3307..."
+  PROXY_LOG="${ROOT_DIR}/.cloudsql-proxy.log"
+  rm -f "$PROXY_LOG" || true
+  echo "Proxy logs: ${PROXY_LOG}"
+  # Bind explicitly to IPv4 localhost to avoid IPv6 localhost (::1) mismatch issues.
+  $PROXY_CMD --address 127.0.0.1 --port 3307 "$INSTANCE_CONN" >"$PROXY_LOG" 2>&1 &
+  PROXY_PID=$!
 
-# Quick connectivity check before migrations (gives clearer errors than P1017).
-set +e
-./node_modules/.bin/prisma db execute --schema prisma/schema.prisma --stdin <<'SQL'
+  # Ensure proxy is killed on script exit
+  trap "kill $PROXY_PID 2>/dev/null" EXIT
+
+  echo "Waiting for proxy..."
+  for i in {1..30}; do
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+      echo "Cloud SQL Proxy exited unexpectedly. Last 50 log lines:"
+      tail -n 50 "$PROXY_LOG" || true
+      exit 1
+    fi
+    # Prefer `nc` if present, fallback to sleep.
+    if command -v nc >/dev/null 2>&1; then
+      if nc -z 127.0.0.1 3307 >/dev/null 2>&1; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+
+  echo "Applying Prisma migrations to Cloud SQL..."
+  export DATABASE_URL="mysql://${DB_USER}:${DB_PASS_ENC}@127.0.0.1:3307/${DB_NAME}"
+
+  # Quick connectivity check before migrations (gives clearer errors than P1017).
+  set +e
+  ./node_modules/.bin/prisma db execute --schema prisma/schema.prisma --stdin <<'SQL'
 SELECT 1;
 SQL
-DB_CHECK_EXIT=$?
-set -e
-if [[ "$DB_CHECK_EXIT" != "0" ]]; then
-  echo "DB connectivity check failed. Last 80 proxy log lines:"
-  tail -n 80 "$PROXY_LOG" || true
-  echo ""
-  echo "Most common causes:"
-  echo "  - Wrong DB_PASS (password is hidden while typing)"
-  echo "  - Wrong DB_NAME (database doesn't exist)"
-  echo "  - Cloud SQL user doesn't exist or is blocked"
-  exit 1
-fi
-
-# Prisma can sometimes throw transient P1017 if the proxy is still warming up.
-for attempt in 1 2 3; do
-  if ./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma; then
-    break
-  fi
-  echo "Prisma migrate deploy failed (attempt ${attempt}/3). Retrying in 3s..."
-  sleep 3
-  if [[ "$attempt" == "3" ]]; then
-    echo "Prisma migrate deploy failed after retries. Last 120 proxy log lines:"
-    tail -n 120 "$PROXY_LOG" || true
+  DB_CHECK_EXIT=$?
+  set -e
+  if [[ "$DB_CHECK_EXIT" != "0" ]]; then
+    echo "DB connectivity check failed. Last 80 proxy log lines:"
+    tail -n 80 "$PROXY_LOG" || true
+    echo ""
+    echo "Most common causes:"
+    echo "  - Wrong DB_PASS (password is hidden while typing)"
+    echo "  - Wrong DB_NAME (database doesn't exist)"
+    echo "  - Cloud SQL user doesn't exist or is blocked"
     exit 1
   fi
-done
+
+  # Prisma can sometimes throw transient P1017 if the proxy is still warming up.
+  for attempt in 1 2 3; do
+    if ./node_modules/.bin/prisma migrate deploy --schema prisma/schema.prisma; then
+      break
+    fi
+    echo "Prisma migrate deploy failed (attempt ${attempt}/3). Retrying in 3s..."
+    sleep 3
+    if [[ "$attempt" == "3" ]]; then
+      echo "Prisma migrate deploy failed after retries. Last 120 proxy log lines:"
+      tail -n 120 "$PROXY_LOG" || true
+      exit 1
+    fi
+  done
+fi
 
 # ---- Create runtime service account (if missing) ----
 if ! gcloud iam service-accounts describe "$RUNTIME_SA_EMAIL" >/dev/null 2>&1; then
@@ -172,20 +180,24 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
   --role="roles/pubsub.publisher" >/dev/null
 
-# ---- Secret Manager: store Cloud Run DATABASE_URL using unix socket ----
-SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS_ENC}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
+# ---- Secret Manager: store Cloud Run DATABASE_URL using unix socket (optional) ----
+if [[ "$UPDATE_DB_SECRET" == "true" ]]; then
+  SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS_ENC}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
 
-if ! gcloud secrets describe "$DB_URL_SECRET" >/dev/null 2>&1; then
-  echo "Creating secret ${DB_URL_SECRET}..."
-  printf '%s' "$SOCKET_DB_URL" | gcloud secrets create "$DB_URL_SECRET" --data-file=- >/dev/null
+  if ! gcloud secrets describe "$DB_URL_SECRET" >/dev/null 2>&1; then
+    echo "Creating secret ${DB_URL_SECRET}..."
+    printf '%s' "$SOCKET_DB_URL" | gcloud secrets create "$DB_URL_SECRET" --data-file=- >/dev/null
+  else
+    echo "Updating secret ${DB_URL_SECRET} (new version)..."
+    printf '%s' "$SOCKET_DB_URL" | gcloud secrets versions add "$DB_URL_SECRET" --data-file=- >/dev/null
+  fi
+
+  gcloud secrets add-iam-policy-binding "$DB_URL_SECRET" \
+    --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+    --role="roles/secretmanager.secretAccessor" >/dev/null
 else
-  echo "Updating secret ${DB_URL_SECRET} (new version)..."
-  printf '%s' "$SOCKET_DB_URL" | gcloud secrets versions add "$DB_URL_SECRET" --data-file=- >/dev/null
+  echo "UPDATE_DB_SECRET=false -> leaving Secret Manager DATABASE_URL unchanged."
 fi
-
-gcloud secrets add-iam-policy-binding "$DB_URL_SECRET" \
-  --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
-  --role="roles/secretmanager.secretAccessor" >/dev/null
 
 # ---- Secret Manager: store JWT_SECRET ----
 if ! gcloud secrets describe "$JWT_SECRET_NAME" >/dev/null 2>&1; then

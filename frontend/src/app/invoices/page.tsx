@@ -8,7 +8,6 @@ import { Plus } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { fetchApi } from "@/lib/api"
 import { formatDateInTimeZone } from "@/lib/utils"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
@@ -21,17 +20,23 @@ import {
 } from "@/components/ui/table"
 
 function statusBadge(status: string) {
+  const cls =
+    "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold tracking-wide";
   switch (status) {
+    case "VOID":
+      return <span className={`${cls} border-rose-200 bg-rose-50 text-rose-700`}>Void</span>
     case "PAID":
-      return <Badge variant="secondary">Paid</Badge>
+      return <span className={`${cls} border-emerald-200 bg-emerald-50 text-emerald-700`}>Paid</span>
     case "POSTED":
-      return <Badge variant="outline">Posted</Badge>
+      return <span className={`${cls} border-blue-200 bg-blue-50 text-blue-700`}>Posted</span>
     case "PARTIAL":
-      return <Badge variant="outline">Partial</Badge>
+      return <span className={`${cls} border-amber-200 bg-amber-50 text-amber-800`}>Partial</span>
+    case "APPROVED":
+      return <span className={`${cls} border-violet-200 bg-violet-50 text-violet-700`}>Approved</span>
     case "DRAFT":
-      return <Badge variant="outline">Draft</Badge>
+      return <span className={`${cls} border-slate-200 bg-slate-50 text-slate-700`}>Draft</span>
     default:
-      return <Badge variant="outline">{status}</Badge>
+      return <span className={`${cls} border-slate-200 bg-slate-50 text-slate-700`}>{status}</span>
   }
 }
 

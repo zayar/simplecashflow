@@ -29,50 +29,110 @@ function ZeroBaselineBars({
   selectedLabel,
   onSelect,
 }: {
-  buckets: Array<{ label: string; net: string }>
+  buckets: Array<{ label: string; net: string; inflow?: string; outflow?: string; from?: string; to?: string }>
   selectedLabel: string | null
   onSelect: (label: string) => void
 }) {
-  const values = buckets.map((b) => Number(b.net ?? 0))
-  const maxAbs = Math.max(1, ...values.map((v) => Math.abs(v)))
+  const data = buckets.map((b) => ({
+    label: b.label,
+    inflow: Number(b.inflow ?? (Number(b.net ?? 0) > 0 ? b.net : 0)),
+    outflow: Number(b.outflow ?? (Number(b.net ?? 0) < 0 ? Math.abs(Number(b.net ?? 0)) : 0)),
+    net: Number(b.net ?? 0),
+  }))
+
+  const maxAbs = Math.max(
+    1,
+    ...data.flatMap((d) => [Math.abs(d.inflow), Math.abs(d.outflow), Math.abs(d.net)])
+  )
+
+  const plotH = 160
+  const half = plotH / 2
+  const pad = 6
+  const scale = (half - pad) / maxAbs
+
+  const svgW = 1000
+  const step = data.length > 0 ? svgW / data.length : svgW
+  const points = data.map((d, i) => {
+    const x = i * step + step / 2
+    const y = half - d.net * scale
+    return { x, y }
+  })
+  const pathD =
+    points.length > 0 ? points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ") : ""
+
   return (
     <div className="h-56 w-full rounded-xl border bg-background/60 p-4">
-      <div className="flex h-full items-end gap-3">
-        {buckets.map((b) => {
-          const v = Number(b.net ?? 0)
-          const h = Math.round((Math.abs(v) / maxAbs) * 140) // px height
-          const isNeg = v < 0
-          const active = selectedLabel === b.label
+      <div className="relative h-full">
+        {/* Net line overlay (like the reference image) */}
+        <svg
+          className="pointer-events-none absolute left-0 top-0 h-[160px] w-full"
+          viewBox={`0 0 ${svgW} ${plotH}`}
+          preserveAspectRatio="none"
+        >
+          <line x1="0" y1={half} x2={svgW} y2={half} stroke="hsl(var(--muted))" strokeWidth="1" />
+          {pathD ? <path d={pathD} fill="none" stroke="hsl(var(--foreground))" strokeWidth="2" strokeOpacity="0.8" /> : null}
+          {points.map((p, idx) => (
+            <circle key={idx} cx={p.x} cy={p.y} r="5" fill="hsl(var(--foreground))" fillOpacity="0.85" />
+          ))}
+        </svg>
+
+        <div className="flex h-full items-end gap-3">
+          {data.map((d) => {
+            const inflowH = Math.round(Math.max(0, d.inflow) * scale)
+            const outflowH = Math.round(Math.max(0, d.outflow) * scale)
+            const active = selectedLabel === d.label
           return (
             <button
-              key={b.label}
+              key={d.label}
               type="button"
-              onClick={() => onSelect(b.label)}
+              onClick={() => onSelect(d.label)}
               className={[
                 "flex h-full flex-1 flex-col justify-end gap-2 rounded-md px-1",
                 active ? "bg-primary/5" : "hover:bg-muted/40",
               ].join(" ")}
-              title={`${b.label}: ${fmtMoney(v)}`}
+              title={`${d.label}: Inflow ${fmtMoney(d.inflow)} / Outflow ${fmtMoney(-d.outflow)} / Net ${fmtMoney(d.net)}`}
             >
               <div className="relative h-[160px]">
-                <div className="absolute inset-x-0 top-1/2 h-px bg-muted" />
                 <div
                   className={[
                     "absolute left-1/2 w-8 -translate-x-1/2 rounded-md transition-colors",
-                    isNeg ? "bg-slate-300" : "bg-primary/80",
+                    "bg-emerald-500/70",
                     active ? "ring-2 ring-primary/30" : "",
                   ].join(" ")}
                   style={{
-                    height: `${h}px`,
-                    bottom: isNeg ? "50%" : undefined,
-                    top: isNeg ? undefined : "50%",
+                    height: `${inflowH}px`,
+                    bottom: "50%",
+                  }}
+                />
+                <div
+                  className={[
+                    "absolute left-1/2 w-8 -translate-x-1/2 rounded-md transition-colors",
+                    "bg-sky-500/55",
+                    active ? "ring-2 ring-primary/30" : "",
+                  ].join(" ")}
+                  style={{
+                    height: `${outflowH}px`,
+                    top: "50%",
                   }}
                 />
               </div>
-              <div className="text-center text-xs text-muted-foreground">{b.label}</div>
+              <div className="text-center text-xs text-muted-foreground">{d.label}</div>
             </button>
           )
         })}
+        </div>
+
+        <div className="mt-3 flex items-center gap-4 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-sm bg-emerald-500/70" /> Inflow
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-sm bg-sky-500/55" /> Outflow
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="inline-block h-2 w-2 rounded-full bg-foreground/80" /> Net
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -211,7 +271,10 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }, [user?.companyId, companySettings?.timeZone])
 
-  const buckets = useMemo(() => (data?.cashflow?.buckets ?? []) as Array<{ label: string; net: string }>, [data])
+  const buckets = useMemo(
+    () => (data?.cashflow?.buckets ?? []) as Array<{ label: string; net: string; inflow?: string; outflow?: string; from?: string; to?: string }>,
+    [data]
+  )
   const coa = useMemo(() => (data?.coa?.topMovements ?? []) as Array<any>, [data])
   const trend = useMemo(() => (data?.trend?.incomeVsExpense ?? []) as Array<any>, [data])
   const expTop = useMemo(() => (data?.expenses?.top ?? []) as Array<any>, [data])

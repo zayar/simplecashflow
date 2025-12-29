@@ -56,6 +56,7 @@ const navGroups: { label: string; items: NavItem[] }[] = [
       { href: "/vendors", label: "Vendors", icon: Truck },
       { href: "/expenses", label: "Expenses", icon: ReceiptText },
       { href: "/purchase-bills", label: "Purchase Bills", icon: ReceiptText },
+      { href: "/vendor-credits", label: "Vendor Credits", icon: ReceiptText },
       { href: "/purchases/payments", label: "Payments", icon: CreditCard },
     ],
   },
@@ -91,7 +92,7 @@ const navGroups: { label: string; items: NavItem[] }[] = [
   { label: "", items: [{ href: "/settings", label: "Company Profile", icon: Settings }] },
 ]
 
-export function Sidebar() {
+export function Sidebar({ collapsed = false }: { collapsed?: boolean } = {}) {
   const pathname = usePathname()
   const { user } = useAuth()
 
@@ -99,28 +100,39 @@ export function Sidebar() {
 
   return (
     <div className="flex h-full flex-col">
-      <Link href="/dashboard" className="flex h-14 items-center gap-2 px-4">
+      <Link
+        href="/dashboard"
+        title="Dashboard"
+        className={cn(
+          "flex h-14 items-center gap-2",
+          collapsed ? "justify-center px-2" : "px-4"
+        )}
+      >
         <LogoMark className="h-9 w-9" title="Cashflow" />
-        <div className="min-w-0">
-          <div className="truncate text-sm font-semibold tracking-tight">
-            Cashflow
+        {!collapsed ? (
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold tracking-tight">
+              Cashflow
+            </div>
+            <div className="truncate text-xs text-muted-foreground">
+              Company #{user.companyId}
+            </div>
           </div>
-          <div className="truncate text-xs text-muted-foreground">
-            Company #{user.companyId}
-          </div>
-        </div>
+        ) : (
+          <span className="sr-only">Cashflow</span>
+        )}
       </Link>
 
       <Separator />
 
-      <div className="flex-1 overflow-auto px-2 py-3">
+      <div className={cn("flex-1 overflow-auto py-3", collapsed ? "px-1" : "px-2")}>
         <nav className="space-y-4">
           {navGroups.map((group) => (
             <div key={group.label} className="space-y-1">
-              {group.label ? (
-              <div className="px-2 text-xs font-medium text-muted-foreground">
-                {group.label}
-              </div>
+              {!collapsed && group.label ? (
+                <div className="px-2 text-xs font-medium text-muted-foreground">
+                  {group.label}
+                </div>
               ) : null}
               <div className="space-y-1">
                 {group.items.map((item) => {
@@ -131,18 +143,19 @@ export function Sidebar() {
                     <Link
                       key={item.href}
                       href={item.href}
+                      title={item.label}
                       className={cn(
                         buttonVariants({
                           variant: isActive ? "secondary" : "ghost",
                           size: "sm",
                         }),
-                        "w-full justify-start gap-2",
+                        collapsed ? "w-full justify-center px-2" : "w-full justify-start gap-2",
                         isActive && "font-medium"
                       )}
                     >
-                      <span className="inline-flex items-center gap-2">
+                      <span className={cn("inline-flex items-center", collapsed ? "gap-0" : "gap-2")}>
                         <item.icon className="h-4 w-4" />
-                        {item.label}
+                        {collapsed ? <span className="sr-only">{item.label}</span> : item.label}
                       </span>
                     </Link>
                   )
@@ -156,12 +169,23 @@ export function Sidebar() {
       <Separator />
 
       <div className="p-3">
-        <div className="px-2 py-1">
-          <div className="truncate text-sm font-medium">
-            {user.name || "Account"}
+        {!collapsed ? (
+          <div className="px-2 py-1">
+            <div className="truncate text-sm font-medium">
+              {user.name || "Account"}
+            </div>
+            <div className="truncate text-xs text-muted-foreground">{user.email}</div>
           </div>
-          <div className="truncate text-xs text-muted-foreground">{user.email}</div>
-        </div>
+        ) : (
+          <div className="flex justify-center px-2 py-1">
+            <div
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-muted text-xs font-semibold"
+              title={user.email}
+            >
+              {(user.name || user.email || "U").slice(0, 1).toUpperCase()}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

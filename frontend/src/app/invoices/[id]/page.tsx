@@ -239,6 +239,8 @@ export default function InvoiceDetailPage() {
   }
 
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
+  const creditsAvailable = Number((invoice as any)?.creditsAvailable ?? 0)
+  const canApplyCredits = canReceivePayment && creditsAvailable > 0 && Number((invoice as any)?.remainingBalance ?? 0) > 0
   const invoiceLines = (invoice.lines ?? []) as any[]
   const grossSubtotal = invoiceLines.reduce((sum: number, l: any) => {
     const qty = Number(l.quantity ?? 0)
@@ -360,6 +362,22 @@ export default function InvoiceDetailPage() {
 
       {postError ? (
         <div className="no-print text-sm text-red-600">{postError}</div>
+      ) : null}
+
+      {canApplyCredits ? (
+        <div className="no-print rounded-lg border bg-background px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm">
+              <span className="font-medium">Credits Available:</span>{" "}
+              <span className="font-semibold tabular-nums">
+                {formatMoneyWithCurrency(creditsAvailable, invoice?.currency)}
+              </span>
+            </div>
+            <Link href={`/invoices/${invoice.id}/apply-credits`} className="text-sm text-primary hover:underline">
+              Apply Now
+            </Link>
+          </div>
+        </div>
       ) : null}
 
       {/* Invoice paper preview */}

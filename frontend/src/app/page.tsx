@@ -1,50 +1,43 @@
 import type { Metadata } from "next"
 
 import {
-  DeveloperNotes,
+  CTASection,
   FeaturesSection,
   HeroSection,
-  HowItWorksSection,
-  IntegrationsSection,
   MarketingFooter,
   MarketingNavbar,
-  ModulesSection,
-  SocialProofSection,
+  PricingSection,
+  StepsSection,
+  SupportSection,
   TestimonialsSection,
-  FinalCTASection,
 } from "@/components/marketing/sections"
-import { Separator } from "@/components/ui/separator"
 
 export const metadata: Metadata = {
-  title: "Cashflow App | Immutable ledger, idempotent APIs, tenant-safe",
+  title: "Cashflow App | Simple Accounting for Small Business",
   description:
-    "Modern finance OS with immutable ledger, idempotency by default, tenant enforcement, and Pub/Sub outbox events for invoices, expenses, inventory WAC, and more.",
+    "Automate your bookkeeping and focus on growth. Simple, powerful accounting software trusted by 5,000+ businesses in 40+ countries. Start your 14-day free trial today.",
   openGraph: {
-    title: "Cashflow App | Immutable ledger, idempotent APIs, tenant-safe",
+    title: "Cashflow App | Simple Accounting for Small Business",
     description:
-      "Immutable accounting rails with outbox → Pub/Sub events, idempotent commands, and tenant-safe APIs for invoices, expenses, purchase bills, inventory WAC, reports, and integrations like Piti.",
+      "Save time and get financial clarity with automated bookkeeping. Trusted by thousands of businesses worldwide. Try free for 14 days.",
     type: "website",
   },
 }
 
 export default function LandingPage() {
   return (
-    <div className="min-h-screen bg-gradient-to-b from-background via-background to-muted/30">
+    <div className="min-h-screen">
       <MarketingNavbar />
-      <main className="pb-2">
+      <main>
         <HeroSection />
-        <SocialProofSection />
+        <StepsSection />
         <FeaturesSection />
-        <Separator className="mx-auto max-w-6xl" />
-        <HowItWorksSection />
-        <ModulesSection />
-        <IntegrationsSection />
+        <PricingSection />
+        <SupportSection />
         <TestimonialsSection />
-        <DeveloperNotes />
-        <FinalCTASection />
+        <CTASection />
       </main>
       <MarketingFooter />
     </div>
   )
 }
-

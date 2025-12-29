@@ -306,11 +306,11 @@ export default function ItemDetailPage() {
               </TableHeader>
               <TableBody>
                 {balances.map((b, idx) => (
-                  <TableRow key={`${b.warehouse?.id ?? 'w'}-${idx}`}>
+                  <TableRow key={`${b.location?.id ?? 'loc'}-${idx}`}>
                     <TableCell className="font-medium">
                       <div className="inline-flex items-center gap-2">
-                        <span>{b.warehouse?.name ?? '—'}</span>
-                        {b.warehouse?.isDefault ? (
+                        <span>{b.location?.name ?? '—'}</span>
+                        {b.location?.isDefault ? (
                           <span title="Default location" className="text-amber-500">
                             ★
                           </span>
@@ -367,7 +367,7 @@ export default function ItemDetailPage() {
                         {m.type} {m.direction === 'IN' ? '+' : '-'}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-muted-foreground">{m.warehouse?.name ?? '—'}</TableCell>
+                    <TableCell className="text-muted-foreground">{m.location?.name ?? '—'}</TableCell>
                     <TableCell className="text-right tabular-nums">{Number(m.quantity ?? 0).toLocaleString()}</TableCell>
                     <TableCell className="text-right tabular-nums">{Number(m.unitCostApplied ?? 0).toLocaleString()}</TableCell>
                     <TableCell className="text-right tabular-nums">{Number(m.totalCostApplied ?? 0).toLocaleString()}</TableCell>

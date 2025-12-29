@@ -53,6 +53,10 @@ export async function nextCreditNoteNumber(tx, companyId) {
     const n = await nextCompanySequenceNumber(tx, companyId, 'CREDIT_NOTE');
     return `CN-${padNumber(n, 5)}`;
 }
+export async function nextVendorCreditNumber(tx, companyId) {
+    const n = await nextCompanySequenceNumber(tx, companyId, 'VENDOR_CREDIT');
+    return `VC-${padNumber(n, 6)}`;
+}
 export async function nextJournalEntryNumber(tx, companyId, date) {
     if (!(date instanceof Date) || isNaN(date.getTime())) {
         throw new Error('invalid journal entry date for sequencing');

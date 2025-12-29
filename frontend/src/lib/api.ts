@@ -225,6 +225,129 @@ export async function getVendors(companyId: number): Promise<Vendor[]> {
   return fetchApi(`/companies/${companyId}/vendors`);
 }
 
+// --- Vendor Credits (AP Credits) ---
+export interface VendorCreditListRow {
+  id: number;
+  creditNumber: string;
+  status: 'DRAFT' | 'APPROVED' | 'POSTED' | 'VOID';
+  creditDate: string;
+  vendorName: string | null;
+  locationName: string | null;
+  total: string;
+  amountApplied: string;
+  remaining: string;
+}
+
+export interface VendorCreditLineInput {
+  itemId: number;
+  quantity: number;
+  unitCost: number;
+  description?: string;
+  accountId?: number;
+}
+
+export interface VendorCreditDetail {
+  id: number;
+  creditNumber: string;
+  status: 'DRAFT' | 'APPROVED' | 'POSTED' | 'VOID';
+  creditDate: string;
+  currency: string | null;
+  vendor: Vendor | null;
+  location: any | null;
+  total: string;
+  amountApplied: string;
+  remaining: string;
+  journalEntryId: number | null;
+  lines: Array<{
+    id: number;
+    itemId: number;
+    item: any;
+    accountId: number | null;
+    account: { id: number; code: string; name: string; type: string } | null;
+    description: string | null;
+    quantity: string;
+    unitCost: string;
+    lineTotal: string;
+  }>;
+  applications: Array<{
+    id: number;
+    appliedDate: string;
+    amount: string;
+    purchaseBill: { id: number; billNumber: string; billDate: string; vendorName: string | null; locationName: string | null; total: string } | null;
+  }>;
+}
+
+export async function getVendorCredits(companyId: number): Promise<VendorCreditListRow[]> {
+  return fetchApi(`/companies/${companyId}/vendor-credits`);
+}
+
+export async function createVendorCredit(
+  companyId: number,
+  data: { vendorId?: number | null; creditDate?: string; locationId?: number; lines: VendorCreditLineInput[] }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/vendor-credits`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function getVendorCredit(companyId: number, vendorCreditId: number): Promise<VendorCreditDetail> {
+  return fetchApi(`/companies/${companyId}/vendor-credits/${vendorCreditId}`);
+}
+
+export async function postVendorCredit(companyId: number, vendorCreditId: number): Promise<any> {
+  return fetchApi(`/companies/${companyId}/vendor-credits/${vendorCreditId}/post`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function voidVendorCredit(companyId: number, vendorCreditId: number, reason: string): Promise<any> {
+  return fetchApi(`/companies/${companyId}/vendor-credits/${vendorCreditId}/void`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+}
+
+export async function applyVendorCreditToBill(
+  companyId: number,
+  purchaseBillId: number,
+  data: { vendorCreditId: number; amount: number; appliedDate?: string }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/purchase-bills/${purchaseBillId}/apply-credits`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// --- Customer Advances (AR Credits) ---
+export interface CustomerAdvanceListRow {
+  id: number;
+  advanceDate: string;
+  currency: string | null;
+  amount: string;
+  amountApplied: string;
+  remaining: string;
+  receivedVia: 'CASH' | 'BANK' | 'E_WALLET' | 'CREDIT_CARD' | null;
+  reference: string | null;
+  description: string | null;
+  location: { id: number; name: string } | null;
+  journalEntryId: number | null;
+}
+
+export async function getCustomerAdvances(companyId: number, customerId: number, onlyOpen = true): Promise<CustomerAdvanceListRow[]> {
+  const qp = new URLSearchParams({ onlyOpen: onlyOpen ? '1' : '0' }).toString();
+  return fetchApi(`/companies/${companyId}/customers/${customerId}/customer-advances?${qp}`);
+}
+
+export async function applyCustomerAdvanceToInvoice(
+  companyId: number,
+  invoiceId: number,
+  data: { customerAdvanceId: number; amount: number; appliedDate?: string }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/invoices/${invoiceId}/apply-credits`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
 export async function createVendor(
   companyId: number,
   data: { name: string; email?: string; phone?: string }

@@ -290,17 +290,32 @@ export async function booksRoutes(fastify) {
                     },
                     orderBy: { paymentDate: 'desc' },
                 },
+                customerAdvanceApplications: {
+                    include: {
+                        customerAdvance: { select: { id: true, advanceDate: true, receivedVia: true, reference: true } },
+                    },
+                    orderBy: { appliedDate: 'desc' },
+                },
             },
         });
         if (!invoice) {
             reply.status(404);
             return { error: 'invoice not found' };
         }
-        // Calculate total paid from payments (source of truth), excluding reversed payments.
+        // Calculate total paid from payments + applied customer advances (source of truth), excluding reversed payments.
         // This keeps UI correct even if Invoice.amountPaid wasn't backfilled for older invoices.
-        const totalPaid = invoice.payments
+        const totalPayments = invoice.payments
             .filter((p) => !p.reversedAt)
             .reduce((sum, p) => sum + Number(p.amount), 0);
+        const totalCredits = (invoice.customerAdvanceApplications ?? []).reduce((sum, a) => sum + Number(a.amount), 0);
+        const totalPaid = totalPayments + totalCredits;
+        const creditsAgg = await prisma.customerAdvance.aggregate({
+            where: { companyId, customerId: invoice.customerId },
+            _sum: { amount: true, amountApplied: true },
+        });
+        const totalAdv = new Prisma.Decimal(creditsAgg._sum.amount ?? 0).toDecimalPlaces(2);
+        const totalApplied = new Prisma.Decimal(creditsAgg._sum.amountApplied ?? 0).toDecimalPlaces(2);
+        const creditsAvailable = totalAdv.sub(totalApplied).toDecimalPlaces(2);
         const journalEntries = [];
         if (invoice.status !== 'DRAFT' && invoice.journalEntry) {
             journalEntries.push({
@@ -331,6 +346,8 @@ export async function booksRoutes(fastify) {
                 });
             }
         }
+        // Note: customer advance applications have their own journal entries, but we don't
+        // include them in `journalEntries` UI yet (to keep the invoice JE list focused).
         return {
             id: invoice.id,
             invoiceNumber: invoice.invoiceNumber,
@@ -362,6 +379,13 @@ export async function booksRoutes(fastify) {
                 reversalReason: p.reversalReason ?? null,
                 reversalJournalEntryId: p.reversalJournalEntryId ?? null,
             })),
+            creditsApplied: (invoice.customerAdvanceApplications ?? []).map((a) => ({
+                id: a.id,
+                appliedDate: a.appliedDate,
+                amount: a.amount,
+                customerAdvanceId: a.customerAdvanceId,
+            })),
+            creditsAvailable: creditsAvailable.toString(),
             totalPaid: totalPaid,
             remainingBalance: Number(invoice.total) - totalPaid,
             journalEntries,
@@ -1650,6 +1674,7 @@ export async function booksRoutes(fastify) {
                             locationId: Number(lid),
                             itemId: Number(line.itemId),
                             date: invoice.invoiceDate,
+                            allowBackdated: true,
                             type: 'SALE_ISSUE',
                             direction: 'OUT',
                             quantity: qty,

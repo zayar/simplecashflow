@@ -7,6 +7,7 @@ type PrismaTx = Prisma.TransactionClient;
 export declare function nextCompanySequenceNumber(tx: PrismaTx, companyId: number, key: string): Promise<number>;
 export declare function nextPurchaseBillNumber(tx: PrismaTx, companyId: number): Promise<string>;
 export declare function nextCreditNoteNumber(tx: PrismaTx, companyId: number): Promise<string>;
+export declare function nextVendorCreditNumber(tx: PrismaTx, companyId: number): Promise<string>;
 export declare function nextJournalEntryNumber(tx: PrismaTx, companyId: number, date: Date): Promise<string>;
 export {};
 //# sourceMappingURL=sequence.service.d.ts.map

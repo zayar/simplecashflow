@@ -184,6 +184,12 @@ export async function purchaseBillsRoutes(fastify) {
                 vendor: true,
                 location: true,
                 lines: { include: { item: true, account: true } },
+                creditApplications: {
+                    include: {
+                        vendorCredit: { select: { id: true, creditNumber: true, creditDate: true, status: true } },
+                    },
+                    orderBy: { appliedDate: 'desc' },
+                },
                 payments: {
                     include: {
                         bankAccount: true,
@@ -206,9 +212,11 @@ export async function purchaseBillsRoutes(fastify) {
             reply.status(404);
             return { error: 'purchase bill not found' };
         }
-        const totalPaid = (bill.payments ?? [])
+        const totalPayments = (bill.payments ?? [])
             .filter((p) => !p.reversedAt)
             .reduce((sum, p) => sum + Number(p.amount), 0);
+        const totalCredits = (bill.creditApplications ?? []).reduce((sum, a) => sum + Number(a.amount), 0);
+        const totalPaid = totalPayments + totalCredits;
         return {
             id: bill.id,
             billNumber: bill.billNumber,
@@ -242,6 +250,14 @@ export async function purchaseBillsRoutes(fastify) {
                 reversedAt: p.reversedAt ?? null,
                 reversalReason: p.reversalReason ?? null,
                 reversalJournalEntryId: p.reversalJournalEntryId ?? null,
+            })),
+            creditsApplied: (bill.creditApplications ?? []).map((a) => ({
+                id: a.id,
+                appliedDate: a.appliedDate,
+                amount: a.amount,
+                vendorCredit: a.vendorCredit
+                    ? { id: a.vendorCredit.id, creditNumber: a.vendorCredit.creditNumber, creditDate: a.vendorCredit.creditDate, status: a.vendorCredit.status }
+                    : null,
             })),
         };
     });
@@ -1298,10 +1314,16 @@ export async function purchaseBillsRoutes(fastify) {
                         _sum: { amount: true },
                     });
                     const totalPaid = (sumAgg2._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
-                    const newStatus = totalPaid.greaterThanOrEqualTo(bill.total) ? 'PAID' : 'PARTIAL';
+                    const creditsAgg = await tx.vendorCreditApplication.aggregate({
+                        where: { purchaseBillId: bill.id, companyId },
+                        _sum: { amount: true },
+                    });
+                    const totalCredits = (creditsAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const totalSettled = totalPaid.add(totalCredits).toDecimalPlaces(2);
+                    const newStatus = totalSettled.greaterThanOrEqualTo(bill.total) ? 'PAID' : 'PARTIAL';
                     const updBill = await tx.purchaseBill.updateMany({
                         where: { id: bill.id, companyId },
-                        data: { amountPaid: totalPaid, status: newStatus },
+                        data: { amountPaid: totalSettled, status: newStatus },
                     });
                     if (updBill.count !== 1) {
                         throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
@@ -1357,6 +1379,152 @@ export async function purchaseBillsRoutes(fastify) {
                 purchaseBillId,
                 purchaseBillPaymentId: result.purchaseBillPaymentId,
                 journalEntryId: result.journalEntryId,
+                status: result.status,
+            };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
+    });
+    // Apply vendor credit to purchase bill (sub-ledger only; no new journal entry).
+    // POST /companies/:companyId/purchase-bills/:purchaseBillId/apply-credits
+    fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/apply-credits', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const purchaseBillId = Number(request.params?.purchaseBillId);
+        if (!companyId || Number.isNaN(purchaseBillId)) {
+            reply.status(400);
+            return { error: 'invalid companyId or purchaseBillId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        if (!body.vendorCreditId || !body.amount || body.amount <= 0) {
+            reply.status(400);
+            return { error: 'vendorCreditId and amount (>0) are required' };
+        }
+        const amount = toMoneyDecimal(body.amount);
+        const appliedDate = parseDateInput(body.appliedDate) ?? new Date();
+        if (body.appliedDate && isNaN(appliedDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid appliedDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:purchase-bill:apply-credit:${companyId}:${purchaseBillId}`;
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM PurchaseBill
+              WHERE id = ${purchaseBillId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const bill = await tx.purchaseBill.findFirst({
+                        where: { id: purchaseBillId, companyId },
+                        select: { id: true, status: true, total: true, vendorId: true, billNumber: true },
+                    });
+                    if (!bill)
+                        throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+                    if (bill.status !== 'POSTED' && bill.status !== 'PARTIAL') {
+                        throw Object.assign(new Error('credits can be applied only to POSTED or PARTIAL bills'), { statusCode: 400 });
+                    }
+                    const vc = await tx.vendorCredit.findFirst({
+                        where: { id: Number(body.vendorCreditId), companyId },
+                        select: { id: true, status: true, total: true, amountApplied: true, vendorId: true, creditNumber: true },
+                    });
+                    if (!vc)
+                        throw Object.assign(new Error('vendor credit not found'), { statusCode: 404 });
+                    if (vc.status !== 'POSTED')
+                        throw Object.assign(new Error('only POSTED vendor credits can be applied'), { statusCode: 400 });
+                    if (bill.vendorId && vc.vendorId && bill.vendorId !== vc.vendorId) {
+                        throw Object.assign(new Error('vendor credit vendor does not match bill vendor'), { statusCode: 400 });
+                    }
+                    const creditsAggForVc = await tx.vendorCreditApplication.aggregate({
+                        where: { companyId, vendorCreditId: vc.id },
+                        _sum: { amount: true },
+                    });
+                    const appliedSoFar = (creditsAggForVc._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const remainingCredit = new Prisma.Decimal(vc.total).sub(appliedSoFar).toDecimalPlaces(2);
+                    if (amount.greaterThan(remainingCredit)) {
+                        throw Object.assign(new Error(`amount cannot exceed remaining vendor credit of ${remainingCredit.toString()}`), { statusCode: 400 });
+                    }
+                    const paymentsAgg = await tx.purchaseBillPayment.aggregate({
+                        where: { purchaseBillId: bill.id, companyId, reversedAt: null },
+                        _sum: { amount: true },
+                    });
+                    const paid = (paymentsAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const creditsAggForBill = await tx.vendorCreditApplication.aggregate({
+                        where: { purchaseBillId: bill.id, companyId },
+                        _sum: { amount: true },
+                    });
+                    const creditsAlready = (creditsAggForBill._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                    const settled = paid.add(creditsAlready).toDecimalPlaces(2);
+                    const remainingBill = new Prisma.Decimal(bill.total).sub(settled).toDecimalPlaces(2);
+                    if (amount.greaterThan(remainingBill)) {
+                        throw Object.assign(new Error(`amount cannot exceed remaining bill balance of ${remainingBill.toString()}`), { statusCode: 400 });
+                    }
+                    const app = await tx.vendorCreditApplication.create({
+                        data: {
+                            companyId,
+                            vendorCreditId: vc.id,
+                            purchaseBillId: bill.id,
+                            appliedDate,
+                            amount,
+                            createdByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    const newCreditsForBill = creditsAlready.add(amount).toDecimalPlaces(2);
+                    const newSettled = paid.add(newCreditsForBill).toDecimalPlaces(2);
+                    const newStatus = newSettled.greaterThanOrEqualTo(bill.total) ? 'PAID' : 'PARTIAL';
+                    const updBill = await tx.purchaseBill.updateMany({
+                        where: { id: bill.id, companyId },
+                        data: { amountPaid: newSettled, status: newStatus },
+                    });
+                    if (updBill.count !== 1) {
+                        throw Object.assign(new Error('purchase bill not found'), { statusCode: 404 });
+                    }
+                    const newAppliedForVc = appliedSoFar.add(amount).toDecimalPlaces(2);
+                    const updVc = await tx.vendorCredit.updateMany({
+                        where: { id: vc.id, companyId },
+                        data: { amountApplied: newAppliedForVc },
+                    });
+                    if (updVc.count !== 1) {
+                        throw Object.assign(new Error('vendor credit not found'), { statusCode: 404 });
+                    }
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'purchase_bill.credit.apply',
+                        entityType: 'VendorCreditApplication',
+                        entityId: app.id,
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            purchaseBillId: bill.id,
+                            billNumber: bill.billNumber,
+                            vendorCreditId: vc.id,
+                            creditNumber: vc.creditNumber,
+                            amount: amount.toString(),
+                            appliedDate,
+                            newStatus,
+                            occurredAt,
+                        },
+                    });
+                    return { purchaseBillId: bill.id, vendorCreditApplicationId: app.id, status: newStatus };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            return {
+                purchaseBillId: result.purchaseBillId,
+                vendorCreditApplicationId: result.vendorCreditApplicationId,
                 status: result.status,
             };
         }

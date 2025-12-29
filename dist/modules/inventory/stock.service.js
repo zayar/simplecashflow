@@ -5,6 +5,122 @@ function d0() {
 function d2(x) {
     return x.toDecimalPlaces(2);
 }
+/**
+ * Pure replay helper used by `applyStockMoveWac` for safe backdated inserts.
+ *
+ * Key invariant:
+ * - We DO NOT rewrite existing StockMove costs (immutability/audit).
+ * - For a backdated insert, we compute the inserted move's cost at its position in the move timeline,
+ *   then validate that NO move in the resulting timeline causes negative stock.
+ * - The caller can then rebuild the StockBalance "current snapshot" from the replay result.
+ */
+export function _test_replayStockMovesWithBackdatedInsert(args) {
+    const moves = (args.existingMoves ?? []).slice().sort((a, b) => {
+        const da = new Date(a.date).getTime();
+        const db = new Date(b.date).getTime();
+        if (da !== db)
+            return da - db;
+        return (a.id ?? 0) - (b.id ?? 0);
+    });
+    const insert = args.insert;
+    const insertQty = d2(new Prisma.Decimal(insert.quantity));
+    if (insertQty.lessThanOrEqualTo(0)) {
+        throw Object.assign(new Error('quantity must be > 0'), { statusCode: 400 });
+    }
+    // In v1 we treat date as the ordering key (no intra-day ordering).
+    // The DB autoincrement id means the inserted move will come AFTER any existing moves on the same date.
+    const insertTime = insert.date.getTime();
+    let Q = d0();
+    let A = d0();
+    let V = d0();
+    const applyIn = (qty, unitCostApplied, totalCostApplied) => {
+        const q = d2(qty);
+        const unit = d2(unitCostApplied);
+        const value = d2(totalCostApplied);
+        const newQ = d2(Q.add(q));
+        const newV = d2(V.add(value));
+        const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : unit;
+        Q = newQ;
+        V = newV;
+        A = newA;
+    };
+    const applyOut = (qty, totalCostApplied, meta) => {
+        const q = d2(qty);
+        if (Q.lessThan(q)) {
+            throw Object.assign(new Error('insufficient stock (timeline replay)'), {
+                statusCode: 400,
+                atDate: meta?.date ? new Date(meta.date).toISOString() : null,
+                qtyOnHand: Q.toString(),
+                qtyRequested: q.toString(),
+                causedByMove: meta ?? null,
+            });
+        }
+        const outValue = d2(totalCostApplied);
+        const unitCost = q.greaterThan(0) ? d2(outValue.div(q)) : d2(A);
+        const newQ = d2(Q.sub(q));
+        const newV = d2(V.sub(outValue));
+        const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : unitCost;
+        Q = newQ;
+        V = newV;
+        A = newA;
+    };
+    const computeInsertCost = () => {
+        if (insert.direction === 'IN') {
+            const unit = d2(new Prisma.Decimal(insert.unitCostApplied));
+            const inValue = d2(insertQty.mul(unit));
+            return { unitCostApplied: unit, totalCostApplied: inValue };
+        }
+        // OUT: compute using current average cost unless caller overrides totalCostApplied.
+        if (Q.lessThan(insertQty)) {
+            throw Object.assign(new Error('insufficient stock (backdated insert)'), {
+                statusCode: 400,
+                atDate: new Date(insert.date).toISOString(),
+                qtyOnHand: Q.toString(),
+                qtyRequested: insertQty.toString(),
+            });
+        }
+        const overrideOutValue = insert.totalCostApplied !== undefined && insert.totalCostApplied !== null;
+        const outValue = overrideOutValue ? d2(new Prisma.Decimal(insert.totalCostApplied)) : d2(insertQty.mul(d2(A)));
+        if (outValue.lessThan(0)) {
+            throw Object.assign(new Error('totalCostApplied cannot be negative'), { statusCode: 400 });
+        }
+        const unitCost = insertQty.greaterThan(0) ? d2(outValue.div(insertQty)) : d2(A);
+        return { unitCostApplied: unitCost, totalCostApplied: outValue };
+    };
+    let inserted = false;
+    let computedInsert = null;
+    for (const m of moves) {
+        const mt = new Date(m.date).getTime();
+        if (!inserted && mt > insertTime) {
+            computedInsert = computeInsertCost();
+            if (insert.direction === 'IN')
+                applyIn(insertQty, computedInsert.unitCostApplied, computedInsert.totalCostApplied);
+            else
+                applyOut(insertQty, computedInsert.totalCostApplied, { type: insert.type, date: insert.date, referenceType: insert.referenceType, referenceId: insert.referenceId });
+            inserted = true;
+        }
+        if (m.direction === 'IN') {
+            applyIn(m.quantity, m.unitCostApplied, m.totalCostApplied);
+        }
+        else {
+            applyOut(m.quantity, m.totalCostApplied, { id: m.id, type: m.type, date: m.date, referenceType: m.referenceType, referenceId: m.referenceId });
+        }
+    }
+    if (!inserted) {
+        computedInsert = computeInsertCost();
+        if (insert.direction === 'IN')
+            applyIn(insertQty, computedInsert.unitCostApplied, computedInsert.totalCostApplied);
+        else
+            applyOut(insertQty, computedInsert.totalCostApplied, { type: insert.type, date: insert.date, referenceType: insert.referenceType, referenceId: insert.referenceId });
+    }
+    if (!computedInsert) {
+        throw Object.assign(new Error('internal error computing backdated move cost'), { statusCode: 500 });
+    }
+    return {
+        computedInsert,
+        finalBalance: { qtyOnHand: d2(Q), avgUnitCost: d2(A), inventoryValue: d2(V) },
+    };
+}
 export async function getCompanyInventoryConfig(tx, companyId) {
     const company = await tx.company.findUnique({
         where: { id: companyId },
@@ -187,6 +303,81 @@ export async function applyStockMoveWac(tx, input) {
         locationId: input.locationId,
         itemId: input.itemId,
     });
+    // Safe backdated inserts (v1): if caller allows backdating and the move is truly backdated (date < last move),
+    // we cannot use the current StockBalance snapshot. Instead we replay the full move timeline, compute the inserted
+    // move's cost at its chronological position, validate no negative stock occurs, then rebuild StockBalance.
+    if (input.allowBackdated) {
+        const lastMove = await tx.stockMove.findFirst({
+            where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
+            orderBy: [{ date: 'desc' }, { id: 'desc' }],
+            select: { date: true },
+        });
+        const isTrulyBackdated = lastMove?.date && input.date.getTime() < new Date(lastMove.date).getTime();
+        if (isTrulyBackdated) {
+            const existingMoves = (await tx.stockMove.findMany({
+                where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
+                orderBy: [{ date: 'asc' }, { id: 'asc' }],
+                select: {
+                    id: true,
+                    date: true,
+                    type: true,
+                    direction: true,
+                    quantity: true,
+                    unitCostApplied: true,
+                    totalCostApplied: true,
+                    referenceType: true,
+                    referenceId: true,
+                },
+            }));
+            const simulated = _test_replayStockMovesWithBackdatedInsert({ existingMoves, insert: input });
+            const move = await tx.stockMove.create({
+                data: {
+                    companyId: input.companyId,
+                    locationId: input.locationId,
+                    itemId: input.itemId,
+                    date: input.date,
+                    type: input.type,
+                    direction: input.direction,
+                    quantity: qty,
+                    unitCostApplied: simulated.computedInsert.unitCostApplied,
+                    totalCostApplied: simulated.computedInsert.totalCostApplied,
+                    referenceType: input.referenceType ?? null,
+                    referenceId: input.referenceId ?? null,
+                    correlationId: input.correlationId ?? null,
+                    createdByUserId: input.createdByUserId ?? null,
+                    journalEntryId: input.journalEntryId ?? null,
+                },
+            });
+            const balance = await tx.stockBalance.upsert({
+                where: {
+                    companyId_locationId_itemId: {
+                        companyId: input.companyId,
+                        locationId: input.locationId,
+                        itemId: input.itemId,
+                    },
+                },
+                update: {
+                    qtyOnHand: simulated.finalBalance.qtyOnHand,
+                    avgUnitCost: simulated.finalBalance.avgUnitCost,
+                    inventoryValue: simulated.finalBalance.inventoryValue,
+                },
+                create: {
+                    companyId: input.companyId,
+                    locationId: input.locationId,
+                    itemId: input.itemId,
+                    qtyOnHand: simulated.finalBalance.qtyOnHand,
+                    avgUnitCost: simulated.finalBalance.avgUnitCost,
+                    inventoryValue: simulated.finalBalance.inventoryValue,
+                },
+            });
+            return {
+                balance,
+                move,
+                unitCostApplied: simulated.computedInsert.unitCostApplied,
+                totalCostApplied: simulated.computedInsert.totalCostApplied,
+            };
+        }
+    }
     // Prevent backdated stock moves (fixes "sell 7 after buying 4" when a sale is posted later but backdated).
     // Without this, StockBalance represents "now", so a backdated sale can incorrectly pass the stock check
     // after later purchases were already posted.

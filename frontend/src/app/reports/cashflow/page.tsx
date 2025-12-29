@@ -28,11 +28,18 @@ function fmtAxis(n: number) {
 function ZeroBaselineChart({
   buckets,
 }: {
-  buckets: Array<{ label: string; net: string; from?: string; to?: string }>;
+  buckets: Array<{ label: string; net: string; inflow?: string; outflow?: string; from?: string; to?: string }>;
 }) {
   const [selected, setSelected] = useState<string | null>(buckets[0]?.label ?? null);
-  const values = buckets.map((b) => Number(b.net ?? 0));
-  const maxAbs = Math.max(1, ...values.map((v) => Math.abs(v)));
+  const maxAbs = Math.max(
+    1,
+    ...buckets.flatMap((b) => {
+      const inflow = Number(b.inflow ?? 0);
+      const outflow = Number(b.outflow ?? 0);
+      const net = Number(b.net ?? 0);
+      return [Math.abs(inflow), Math.abs(outflow), Math.abs(net)];
+    })
+  );
 
   const selectedBucket = buckets.find((b) => b.label === selected) ?? null;
   const selectedValue = selectedBucket ? Number(selectedBucket.net ?? 0) : 0;
@@ -84,9 +91,10 @@ function ZeroBaselineChart({
             {/* Bars */}
             <div className="absolute inset-0 flex items-end gap-2 px-2">
               {buckets.map((b) => {
-                const v = Number(b.net ?? 0);
-                const h = Math.round((Math.abs(v) / maxAbs) * 150);
-                const neg = v < 0;
+                const inflow = Number(b.inflow ?? (Number(b.net ?? 0) > 0 ? b.net : 0));
+                const outflow = Number(b.outflow ?? (Number(b.net ?? 0) < 0 ? Math.abs(Number(b.net ?? 0)) : 0));
+                const inflowH = Math.round((Math.abs(inflow) / maxAbs) * 150);
+                const outflowH = Math.round((Math.abs(outflow) / maxAbs) * 150);
                 const active = b.label === selected;
                 return (
                   <button
@@ -97,19 +105,29 @@ function ZeroBaselineChart({
                       'relative flex h-full flex-1 flex-col justify-end gap-2 rounded-md px-1',
                       active ? 'z-10' : 'z-0',
                     ].join(' ')}
-                    title={`${b.label}: ${fmtAxis(v)}`}
+                    title={`${b.label}: Inflow ${fmtAxis(inflow)} / Outflow ${fmtAxis(-outflow)} / Net ${fmtAxis(Number(b.net ?? 0))}`}
                   >
                     <div className="relative h-[180px]">
                       <div
                         className={[
                           'absolute left-1/2 w-8 -translate-x-1/2 rounded-md transition-colors',
-                          neg ? 'bg-slate-300' : 'bg-primary/80',
+                          'bg-emerald-500/70',
                           active ? 'ring-2 ring-primary/30' : '',
                         ].join(' ')}
                         style={{
-                          height: `${h}px`,
-                          bottom: neg ? '50%' : undefined,
-                          top: neg ? undefined : '50%',
+                          height: `${inflowH}px`,
+                          bottom: '50%',
+                        }}
+                      />
+                      <div
+                        className={[
+                          'absolute left-1/2 w-8 -translate-x-1/2 rounded-md transition-colors',
+                          'bg-sky-500/55',
+                          active ? 'ring-2 ring-primary/30' : '',
+                        ].join(' ')}
+                        style={{
+                          height: `${outflowH}px`,
+                          top: '50%',
                         }}
                       />
                     </div>
@@ -122,10 +140,31 @@ function ZeroBaselineChart({
             {/* Tooltip bubble (simple) */}
             {selectedBucket ? (
               <div className="pointer-events-none absolute left-1/2 top-8 -translate-x-1/2 rounded-xl border bg-background px-4 py-2 shadow-sm">
-                <div className="text-xs text-muted-foreground">{isNeg ? 'Outflow' : 'Inflow'}</div>
-                <div className="text-sm font-semibold tabular-nums">{fmtAxis(selectedValue)}</div>
+                <div className="text-xs text-muted-foreground">Selected period</div>
+                <div className="mt-1 space-y-0.5 text-sm">
+                  <div className="flex items-center justify-between gap-6">
+                    <span className="text-muted-foreground">Inflow</span>
+                    <span className="font-medium tabular-nums">{fmtAxis(Number(selectedBucket.inflow ?? 0))}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-6">
+                    <span className="text-muted-foreground">Outflow</span>
+                    <span className="font-medium tabular-nums">{fmtAxis(-Number(selectedBucket.outflow ?? 0))}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-6 border-t pt-1">
+                    <span className="text-muted-foreground">Net</span>
+                    <span className="font-semibold tabular-nums">{fmtAxis(selectedValue)}</span>
+                  </div>
+                </div>
               </div>
             ) : null}
+          </div>
+          <div className="mt-3 flex items-center gap-4 text-xs text-muted-foreground">
+            <div className="flex items-center gap-2">
+              <span className="inline-block h-2 w-2 rounded-sm bg-emerald-500/70" /> Inflow
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-block h-2 w-2 rounded-sm bg-sky-500/55" /> Outflow
+            </div>
           </div>
         </div>
       </CardContent>
@@ -182,7 +221,10 @@ export default function CashflowPage() {
   const { user, companySettings } = useAuth();
   const [report, setReport] = useState<CashflowStatement | null>(null);
   const [loading, setLoading] = useState(false);
-  const [chartBuckets, setChartBuckets] = useState<Array<{ label: string; net: string; from?: string; to?: string }>>([]);
+  const [chartBuckets, setChartBuckets] = useState<
+    Array<{ label: string; net: string; inflow?: string; outflow?: string; from?: string; to?: string }>
+  >([]);
+  const [error, setError] = useState<string | null>(null);
 
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -204,7 +246,12 @@ export default function CashflowPage() {
 
   async function run() {
     if (!user?.companyId) return;
+    if (!from || !to) {
+      setError('Please select both From and To dates.');
+      return;
+    }
     setLoading(true);
+    setError(null);
     try {
       const [data, dash] = await Promise.all([
         getCashflowStatement(user.companyId, from, to),
@@ -214,16 +261,17 @@ export default function CashflowPage() {
       setChartBuckets((dash?.cashflow?.buckets ?? []) as any[]);
     } catch (err: any) {
       console.error(err);
-      alert(err.message || 'Failed to load cashflow statement');
+      setError(err?.message ?? 'Failed to load cashflow statement');
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    if (user?.companyId) run();
+    // Auto-run only once we have a valid date range
+    if (user?.companyId && from && to) run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.companyId]);
+  }, [user?.companyId, from, to]);
 
   return (
     <div className="space-y-6">
@@ -253,6 +301,12 @@ export default function CashflowPage() {
           </Button>
         </CardContent>
       </Card>
+
+      {error ? (
+        <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {error}
+        </div>
+      ) : null}
 
       {report && (
         <>

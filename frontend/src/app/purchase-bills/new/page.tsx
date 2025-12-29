@@ -193,7 +193,7 @@ export default function NewPurchaseBillPage() {
                   <TableHeader>
                       <TableRow className="bg-muted/40">
                         <TableHead className="w-[420px]">ITEM</TableHead>
-                        <TableHead className="w-[90px] text-right">QTY</TableHead>
+                        <TableHead className="w-[140px] text-right">QTY</TableHead>
                         <TableHead className="w-[160px]">UNIT</TableHead>
                         <TableHead className="w-[160px] text-right">PRICE</TableHead>
                         <TableHead className="w-[220px]">ACCOUNT</TableHead>
@@ -244,7 +244,7 @@ export default function NewPurchaseBillPage() {
                             inputMode="numeric"
                             step="1"
                             min="1"
-                                className="text-right"
+                            className="w-[120px] text-right text-base tabular-nums"
                             value={l.quantity}
                             onChange={(e) => {
                               const next = e.target.value;

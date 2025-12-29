@@ -3,7 +3,7 @@
 import * as React from "react"
 import { usePathname, useRouter } from "next/navigation"
 import Link from "next/link"
-import { Menu, LogOut } from "lucide-react"
+import { Menu, LogOut, PanelLeftClose, PanelLeftOpen } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
 import { cn } from "@/lib/utils"
@@ -80,6 +80,25 @@ function AuthGate({ children }: { children: React.ReactNode }) {
 export function AppFrame({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const { user, logout } = useAuth()
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false)
+
+  // Persist user preference (desktop sidebar collapse)
+  React.useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem("cf.sidebar.collapsed")
+      if (raw === "1") setSidebarCollapsed(true)
+    } catch {
+      // ignore
+    }
+  }, [])
+
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem("cf.sidebar.collapsed", sidebarCollapsed ? "1" : "0")
+    } catch {
+      // ignore
+    }
+  }, [sidebarCollapsed])
 
   const isAuthRoute = pathname === "/login" || pathname === "/register"
   if (isAuthRoute) {
@@ -93,13 +112,31 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
       <div className="min-h-screen bg-background">
         <div className="flex min-h-screen">
           {/* Desktop sidebar */}
-          <aside className="hidden w-64 shrink-0 border-r bg-background lg:block">
-            <Sidebar />
+          <aside
+            className={cn(
+              "hidden shrink-0 border-r bg-background transition-[width] duration-200 lg:block",
+              sidebarCollapsed ? "w-[76px]" : "w-64"
+            )}
+          >
+            <Sidebar collapsed={sidebarCollapsed} />
           </aside>
 
           <div className="flex min-w-0 flex-1 flex-col">
             {/* Header */}
             <header className="sticky top-0 z-40 flex h-14 items-center gap-3 border-b bg-background/80 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60 lg:px-6">
+              {/* Desktop sidebar toggle */}
+              <div className="hidden lg:block">
+                <button
+                  type="button"
+                  aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                  title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                  onClick={() => setSidebarCollapsed((v) => !v)}
+                  className={buttonVariants({ variant: "ghost", size: "icon" })}
+                >
+                  {sidebarCollapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
+                </button>
+              </div>
+
               {/* Mobile menu */}
               <div className="lg:hidden">
                 <Sheet>

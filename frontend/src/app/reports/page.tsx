@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
-import { BarChart, Scale, PieChart, Waves, CalendarCheck2, Package, TrendingUp, ShoppingCart, Users } from 'lucide-react';
+import { BarChart, Scale, PieChart, Waves, CalendarCheck2, Package, TrendingUp, ShoppingCart, Users, HandCoins, ReceiptText } from 'lucide-react';
 
 const reports = [
   {
@@ -58,6 +58,42 @@ const reports = [
     description: 'Outstanding payables grouped by vendor and aging buckets.',
     href: '/reports/ap-aging',
     icon: Users,
+  },
+  {
+    title: 'Vendor Balance Summary',
+    description: 'Billed, paid, and closing balance by vendor for a date range.',
+    href: '/reports/vendor-balance-summary',
+    icon: ReceiptText,
+  },
+  {
+    title: 'Customer Balance Summary',
+    description: 'Invoiced, received, and closing balance by customer for a date range.',
+    href: '/reports/customer-balance-summary',
+    icon: Users,
+  },
+  {
+    title: 'Receivable Summary',
+    description: 'Invoice-level receivables for a date range (total and remaining balance).',
+    href: '/reports/receivable-summary',
+    icon: HandCoins,
+  },
+  {
+    title: 'Receivable Details',
+    description: 'Invoice line-level receivables for a date range.',
+    href: '/reports/receivable-details',
+    icon: HandCoins,
+  },
+  {
+    title: 'Payable Summary',
+    description: 'Bill-level payables for a date range (total and remaining balance).',
+    href: '/reports/payable-summary',
+    icon: ReceiptText,
+  },
+  {
+    title: 'Payable Details',
+    description: 'Bill line-level payables for a date range.',
+    href: '/reports/payable-details',
+    icon: ReceiptText,
   },
 ];
 

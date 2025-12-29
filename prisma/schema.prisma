@@ -105,6 +105,7 @@ enum StockMoveType {
   SALE_ISSUE
   SALE_RETURN
   PURCHASE_RECEIPT
+  PURCHASE_RETURN
   TRANSFER_OUT
   TRANSFER_IN
 }
@@ -120,6 +121,13 @@ enum PurchaseBillStatus {
   POSTED
   PARTIAL
   PAID
+  VOID
+}
+
+enum VendorCreditStatus {
+  DRAFT
+  APPROVED
+  POSTED
   VOID
 }
 
@@ -159,6 +167,11 @@ model Company {
   purchaseBills        PurchaseBill[]
   purchaseBillLines    PurchaseBillLine[]
   purchaseBillPayments PurchaseBillPayment[]
+  vendorCredits        VendorCredit[]
+  vendorCreditLines    VendorCreditLine[]
+  vendorCreditApplications VendorCreditApplication[]
+  customerAdvances     CustomerAdvance[]
+  customerAdvanceApplications CustomerAdvanceApplication[]
 
   // Default account settings for this company (multi-tenant safe).
   // Used when posting invoices (Debit AR).
@@ -236,6 +249,9 @@ model Account {
   expenses                Expense[]             @relation("Expense_ExpenseAccount")
   purchaseBillLines       PurchaseBillLine[]
   purchaseBillPayments    PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
+  vendorCreditLines       VendorCreditLine[]    @relation("VendorCreditLine_Account")
+  customerAdvanceBankMovements      CustomerAdvance[] @relation("CustomerAdvance_BankAccount")
+  customerAdvanceLiabilityMovements CustomerAdvance[] @relation("CustomerAdvance_LiabilityAccount")
 
   // Income account mapping on document lines (required opposite relations for Prisma named relations)
   invoiceLinesIncome    InvoiceLine[]    @relation("InvoiceLine_IncomeAccount")
@@ -355,6 +371,11 @@ model JournalEntry {
   creditNote                    CreditNote?          @relation("CreditNote_JournalEntry")
   creditNoteVoidFor             CreditNote?          @relation("CreditNote_VoidJournalEntry")
   creditNoteLastAdjustmentFor   CreditNote[]         @relation("CreditNote_LastAdjustmentJournalEntry")
+  vendorCredit                  VendorCredit?        @relation("VendorCredit_JournalEntry")
+  vendorCreditVoidFor           VendorCredit?        @relation("VendorCredit_VoidJournalEntry")
+  vendorCreditLastAdjustmentFor VendorCredit[]       @relation("VendorCredit_LastAdjustmentJournalEntry")
+  customerAdvance               CustomerAdvance?     @relation("CustomerAdvance_JournalEntry")
+  customerAdvanceApplication    CustomerAdvanceApplication? @relation("CustomerAdvanceApplication_JournalEntry")
   periodClose                   PeriodClose?
 
   @@unique([companyId, entryNumber])
@@ -453,6 +474,7 @@ model Customer {
 
   invoices    Invoice[]
   creditNotes CreditNote[]
+  customerAdvances CustomerAdvance[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -492,6 +514,7 @@ model Item {
   stockBalances     StockBalance[]
   stockMoves        StockMove[]
   purchaseBillLines PurchaseBillLine[]
+  vendorCreditLines VendorCreditLine[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -515,6 +538,9 @@ model Location {
   defaultForCompanies Company[]          @relation("Company_DefaultLocation")
   invoices            Invoice[]
   journalEntries      JournalEntry[]
+  vendorCredits       VendorCredit[]     @relation("VendorCredit_Location")
+  vendorCreditLines   VendorCreditLine[] @relation("VendorCreditLine_Location")
+  customerAdvances    CustomerAdvance[]  @relation("CustomerAdvance_Location")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -634,6 +660,7 @@ model Invoice {
   lines       InvoiceLine[]
   payments    Payment[]
   creditNotes CreditNote[]
+  customerAdvanceApplications CustomerAdvanceApplication[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -813,6 +840,7 @@ model Vendor {
 
   expenses      Expense[]
   purchaseBills PurchaseBill[]
+  vendorCredits VendorCredit[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -858,6 +886,7 @@ model PurchaseBill {
 
   lines    PurchaseBillLine[]
   payments PurchaseBillPayment[]
+  creditApplications VendorCreditApplication[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -865,6 +894,185 @@ model PurchaseBill {
   @@unique([companyId, billNumber])
   @@index([companyId, billDate])
   @@index([companyId, status])
+}
+
+model VendorCredit {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  vendorId Int?
+  vendor   Vendor? @relation(fields: [vendorId], references: [id])
+
+  // Optional location tagging (same as other purchase documents).
+  locationId Int      @map("warehouseId")
+  location   Location @relation("VendorCredit_Location", fields: [locationId], references: [id])
+
+  creditNumber String
+  status       VendorCreditStatus
+  creditDate   DateTime
+  currency     String?
+
+  total        Decimal @db.Decimal(18, 2)
+  amountApplied Decimal @default(0) @db.Decimal(18, 2)
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation("VendorCredit_JournalEntry", fields: [journalEntryId], references: [id])
+
+  voidedAt           DateTime?
+  voidReason         String?       @db.Text
+  voidedByUserId     Int?
+  voidedByUser       User?         @relation("User_VoidedVendorCredits", fields: [voidedByUserId], references: [id])
+  voidJournalEntryId Int?          @unique
+  voidJournalEntry   JournalEntry? @relation("VendorCredit_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+
+  lastAdjustmentJournalEntryId Int?
+  lastAdjustmentJournalEntry   JournalEntry? @relation("VendorCredit_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+
+  updatedByUserId Int?
+  updatedByUser   User? @relation("User_UpdatedVendorCredits", fields: [updatedByUserId], references: [id])
+
+  lines         VendorCreditLine[]
+  applications  VendorCreditApplication[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, creditNumber])
+  @@index([companyId, creditDate])
+  @@index([companyId, status])
+  @@index([companyId, vendorId])
+}
+
+model VendorCreditLine {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  vendorCreditId Int
+  vendorCredit   VendorCredit @relation(fields: [vendorCreditId], references: [id])
+
+  locationId Int      @map("warehouseId")
+  location   Location @relation("VendorCreditLine_Location", fields: [locationId], references: [id])
+
+  itemId Int
+  item   Item @relation(fields: [itemId], references: [id])
+
+  // Account to credit (inventory asset or expense). Posting will enforce tenant + type rules.
+  accountId Int?
+  account   Account? @relation("VendorCreditLine_Account", fields: [accountId], references: [id])
+
+  description String?
+  quantity    Decimal @db.Decimal(18, 2)
+  unitCost    Decimal @db.Decimal(18, 2)
+  lineTotal   Decimal @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId])
+  @@index([vendorCreditId])
+  @@index([companyId, itemId])
+}
+
+model VendorCreditApplication {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  vendorCreditId Int
+  vendorCredit   VendorCredit @relation(fields: [vendorCreditId], references: [id])
+
+  purchaseBillId Int
+  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
+
+  appliedDate DateTime
+  amount      Decimal @db.Decimal(18, 2)
+
+  createdByUserId Int?
+  createdByUser   User? @relation("User_CreatedVendorCreditApplications", fields: [createdByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, vendorCreditId])
+  @@index([companyId, purchaseBillId])
+}
+
+// Customer advance / deposit (liability) that can be applied to invoices later.
+// GL:
+// - On receipt:   Dr Bank/Cash, Cr Customer Deposits (LIABILITY)
+// - On apply:     Dr Customer Deposits, Cr Accounts Receivable
+model CustomerAdvance {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  customerId Int
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  // Optional location tagging (same as invoices/purchase docs).
+  locationId Int      @map("warehouseId")
+  location   Location @relation("CustomerAdvance_Location", fields: [locationId], references: [id])
+
+  advanceDate DateTime
+  currency    String?
+
+  amount        Decimal @db.Decimal(18, 2)
+  amountApplied Decimal @default(0) @db.Decimal(18, 2)
+
+  // Deposit (liquidity) account used on receipt (ASSET)
+  bankAccountId Int
+  bankAccount   Account @relation("CustomerAdvance_BankAccount", fields: [bankAccountId], references: [id])
+
+  // Liability account for customer deposits/advances (LIABILITY)
+  liabilityAccountId Int
+  liabilityAccount   Account @relation("CustomerAdvance_LiabilityAccount", fields: [liabilityAccountId], references: [id])
+
+  receivedVia BankingAccountKind?
+  reference   String?
+  description String? @db.Text
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation("CustomerAdvance_JournalEntry", fields: [journalEntryId], references: [id])
+
+  applications CustomerAdvanceApplication[]
+
+  createdByUserId Int?
+  createdByUser   User? @relation("User_CreatedCustomerAdvances", fields: [createdByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, advanceDate])
+  @@index([companyId, customerId])
+}
+
+model CustomerAdvanceApplication {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  customerAdvanceId Int
+  customerAdvance   CustomerAdvance @relation(fields: [customerAdvanceId], references: [id])
+
+  invoiceId Int
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
+
+  appliedDate DateTime
+  amount      Decimal  @db.Decimal(18, 2)
+
+  journalEntryId Int?          @unique
+  journalEntry   JournalEntry? @relation("CustomerAdvanceApplication_JournalEntry", fields: [journalEntryId], references: [id])
+
+  createdByUserId Int?
+  createdByUser   User? @relation("User_CreatedCustomerAdvanceApplications", fields: [createdByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, customerAdvanceId])
+  @@index([companyId, invoiceId])
 }
 
 model PurchaseBillLine {
@@ -1036,6 +1244,11 @@ model User {
   updatedExpenses              Expense[]             @relation("User_UpdatedExpenses")
   voidedPurchaseBills          PurchaseBill[]        @relation("User_VoidedPurchaseBills")
   updatedPurchaseBills         PurchaseBill[]        @relation("User_UpdatedPurchaseBills")
+  voidedVendorCredits          VendorCredit[]        @relation("User_VoidedVendorCredits")
+  updatedVendorCredits         VendorCredit[]        @relation("User_UpdatedVendorCredits")
+  vendorCreditApplicationsCreated VendorCreditApplication[] @relation("User_CreatedVendorCreditApplications")
+  customerAdvancesCreated      CustomerAdvance[]     @relation("User_CreatedCustomerAdvances")
+  customerAdvanceApplicationsCreated CustomerAdvanceApplication[] @relation("User_CreatedCustomerAdvanceApplications")
   reversedPayments             Payment[]             @relation("User_ReversedPayments")
   reversedExpensePayments      ExpensePayment[]      @relation("User_ReversedExpensePayments")
   reversedPurchaseBillPayments PurchaseBillPayment[]

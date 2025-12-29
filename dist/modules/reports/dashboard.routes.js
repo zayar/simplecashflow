@@ -103,9 +103,14 @@ export async function dashboardRoutes(fastify) {
             })
             : [];
         const cashSeries = cashByDay.map((d) => {
-            // cash accounts are ASSET/DEBIT-normal: net movement = debit - credit
-            const net = new Prisma.Decimal(d._sum.debitTotal ?? 0).sub(new Prisma.Decimal(d._sum.creditTotal ?? 0)).toDecimalPlaces(2);
-            return { date: fmtYmd(d.date), net: net.toString() };
+            // cash accounts are ASSET/DEBIT-normal:
+            // - inflow  = debit movement
+            // - outflow = credit movement
+            // - net     = inflow - outflow
+            const inflow = new Prisma.Decimal(d._sum.debitTotal ?? 0).toDecimalPlaces(2);
+            const outflow = new Prisma.Decimal(d._sum.creditTotal ?? 0).toDecimalPlaces(2);
+            const net = inflow.sub(outflow).toDecimalPlaces(2);
+            return { date: fmtYmd(d.date), inflow: inflow.toString(), outflow: outflow.toString(), net: net.toString() };
         });
         async function movementForAccounts(accountIds, from, to, normalBalance) {
             if (accountIds.length === 0)
@@ -147,17 +152,31 @@ export async function dashboardRoutes(fastify) {
         const buckets = [];
         let cursor = new Date(fromDate);
         cursor.setHours(0, 0, 0, 0);
-        const netByDate = new Map(cashSeries.map((p) => [p.date, new Prisma.Decimal(p.net)]));
+        const byDate = new Map(cashSeries.map((p) => [p.date, p]));
         while (cursor.getTime() <= toDate.getTime()) {
             const bFrom = new Date(cursor);
             const bTo = addDays(bFrom, 6);
             const end = bTo.getTime() > toDate.getTime() ? new Date(toDate) : bTo;
-            let sum = new Prisma.Decimal(0);
+            let inflowSum = new Prisma.Decimal(0);
+            let outflowSum = new Prisma.Decimal(0);
+            let netSum = new Prisma.Decimal(0);
             for (let d = new Date(bFrom); d.getTime() <= end.getTime(); d = addDays(d, 1)) {
-                sum = sum.add(netByDate.get(fmtYmd(d)) ?? new Prisma.Decimal(0));
+                const row = byDate.get(fmtYmd(d));
+                if (!row)
+                    continue;
+                inflowSum = inflowSum.add(new Prisma.Decimal(row.inflow));
+                outflowSum = outflowSum.add(new Prisma.Decimal(row.outflow));
+                netSum = netSum.add(new Prisma.Decimal(row.net));
             }
             const label = `${bFrom.getDate()} - ${end.getDate()}`;
-            buckets.push({ label, from: fmtYmd(bFrom), to: fmtYmd(end), net: sum.toDecimalPlaces(2).toString() });
+            buckets.push({
+                label,
+                from: fmtYmd(bFrom),
+                to: fmtYmd(end),
+                inflow: inflowSum.toDecimalPlaces(2).toString(),
+                outflow: outflowSum.toDecimalPlaces(2).toString(),
+                net: netSum.toDecimalPlaces(2).toString(),
+            });
             cursor = addDays(end, 1);
         }
         // --- COA movements for the month (top 6 by absolute movement) ---

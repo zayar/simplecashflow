@@ -67,6 +67,11 @@ export async function nextCreditNoteNumber(tx: PrismaTx, companyId: number): Pro
   return `CN-${padNumber(n, 5)}`;
 }
 
+export async function nextVendorCreditNumber(tx: PrismaTx, companyId: number): Promise<string> {
+  const n = await nextCompanySequenceNumber(tx, companyId, 'VENDOR_CREDIT');
+  return `VC-${padNumber(n, 6)}`;
+}
+
 export async function nextJournalEntryNumber(
   tx: PrismaTx,
   companyId: number,

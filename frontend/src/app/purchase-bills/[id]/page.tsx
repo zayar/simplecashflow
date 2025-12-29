@@ -62,6 +62,14 @@ export default function PurchaseBillDetailPage() {
   const total = useMemo(() => Number(bill?.total ?? 0), [bill]);
   const totalPaid = useMemo(() => Number(bill?.totalPaid ?? 0), [bill]);
   const remaining = useMemo(() => Number(bill?.remainingBalance ?? 0), [bill]);
+  const paidByCash = useMemo(() => {
+    return (bill?.payments ?? [])
+      .filter((p: any) => !p.reversedAt)
+      .reduce((sum: number, p: any) => sum + Number(p.amount ?? 0), 0);
+  }, [bill]);
+  const paidByCredits = useMemo(() => {
+    return (bill?.creditsApplied ?? []).reduce((sum: number, c: any) => sum + Number(c.amount ?? 0), 0);
+  }, [bill]);
 
   const missingAccountLines = useMemo(() => {
     const lines = (bill?.lines ?? []) as any[];
@@ -128,6 +136,11 @@ export default function PurchaseBillDetailPage() {
             </h1>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               {bill?.status ? statusBadge(bill.status) : null}
+              {bill?.status === 'PAID' && paidByCredits > 0 ? (
+                <Badge variant="outline">Paid by Credits</Badge>
+              ) : paidByCredits > 0 ? (
+                <Badge variant="outline">Credits applied</Badge>
+              ) : null}
               <span>•</span>
               <span>{bill?.warehouse?.name ?? '—'}</span>
               <span>•</span>
@@ -161,9 +174,14 @@ export default function PurchaseBillDetailPage() {
             </Button>
           ) : null}
           {(bill?.status === 'POSTED' || bill?.status === 'PARTIAL') && remaining > 0 ? (
-            <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
-              Record payment
-            </Link>
+            <>
+              <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
+                Record payment
+              </Link>
+              <Link href={`/purchase-bills/${id}/apply-credits`} className={buttonVariants({ variant: 'outline' })}>
+                Apply credits
+              </Link>
+            </>
           ) : null}
           {bill?.journalEntryId ? (
             <Link
@@ -245,6 +263,18 @@ export default function PurchaseBillDetailPage() {
               <span className="text-muted-foreground">Paid</span>
               <span className="font-medium text-green-700 tabular-nums">{totalPaid.toLocaleString()}</span>
             </div>
+            {paidByCredits > 0 ? (
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Paid via credits</span>
+                <span className="font-medium tabular-nums">{paidByCredits.toLocaleString()}</span>
+              </div>
+            ) : null}
+            {paidByCash > 0 ? (
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Paid via cash</span>
+                <span className="font-medium tabular-nums">{paidByCash.toLocaleString()}</span>
+              </div>
+            ) : null}
             <div className="flex justify-between gap-4 pt-2 border-t">
               <span className="font-semibold">Remaining</span>
               <span className={`font-semibold tabular-nums ${remaining > 0 ? 'text-orange-600' : 'text-green-600'}`}>
@@ -295,6 +325,40 @@ export default function PurchaseBillDetailPage() {
               )}
             </TableBody>
           </Table>
+
+          {(bill?.creditsApplied ?? []).length > 0 ? (
+            <div className="mt-6">
+              <div className="mb-2 text-sm font-medium">Credits applied</div>
+              <div className="rounded-lg border">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-muted/40">
+                      <TableHead className="w-[160px]">Date</TableHead>
+                      <TableHead>Vendor Credit</TableHead>
+                      <TableHead className="text-right">Amount</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(bill?.creditsApplied ?? []).map((c: any) => (
+                      <TableRow key={c.id}>
+                        <TableCell className="text-muted-foreground">{String(c.appliedDate ?? '').slice(0, 10)}</TableCell>
+                        <TableCell className="font-medium">
+                          {c.vendorCredit?.id ? (
+                            <Link href={`/vendor-credits/${c.vendorCredit.id}`} className="text-primary hover:underline">
+                              {c.vendorCredit.creditNumber}
+                            </Link>
+                          ) : (
+                            '—'
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right font-medium tabular-nums">{Number(c.amount ?? 0).toLocaleString()}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
     </div>
