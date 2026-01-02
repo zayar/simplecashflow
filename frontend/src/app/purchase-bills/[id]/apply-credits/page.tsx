@@ -30,12 +30,15 @@ export default function ApplyCreditsToBillPage() {
   useEffect(() => {
     if (!user?.companyId || !purchaseBillId || Number.isNaN(purchaseBillId)) return;
     setLoading(true);
-    Promise.all([
-      fetchApi(`/companies/${user.companyId}/purchase-bills/${purchaseBillId}`),
-      getVendorCredits(user.companyId),
-    ])
-      .then(([b, cs]) => {
+    fetchApi(`/companies/${user.companyId}/purchase-bills/${purchaseBillId}`)
+      .then(async (b) => {
         setBill(b);
+        const vendorId = Number(b?.vendor?.id ?? 0) || null;
+        if (!vendorId) {
+          setCredits([]);
+          return;
+        }
+        const cs = await getVendorCredits(user.companyId!, { vendorId, eligibleOnly: true });
         setCredits(cs);
       })
       .finally(() => setLoading(false));
@@ -112,6 +115,19 @@ export default function ApplyCreditsToBillPage() {
           <CardTitle className="text-lg">Apply</CardTitle>
         </CardHeader>
         <CardContent>
+          {!loading && eligibleCredits.length === 0 ? (
+            <div className="space-y-2 text-sm">
+              <div className="font-medium">No credits available</div>
+              <div className="text-muted-foreground">
+                This vendor has no posted credits with remaining balance.
+              </div>
+              <div className="pt-2">
+                <Link href={`/purchase-bills/${purchaseBillId}`}>
+                  <Button variant="outline">Back to bill</Button>
+                </Link>
+              </div>
+            </div>
+          ) : (
           <form onSubmit={submit} className="space-y-4">
             <div className="grid gap-4 md:grid-cols-3">
               <div className="grid gap-2 md:col-span-2">
@@ -161,6 +177,7 @@ export default function ApplyCreditsToBillPage() {
               </Button>
             </div>
           </form>
+          )}
         </CardContent>
       </Card>
     </div>

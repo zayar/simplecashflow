@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Plus } from 'lucide-react';
+import Link from 'next/link';
 import {
   Table,
   TableBody,
@@ -112,6 +113,7 @@ export default function VendorsPage() {
                 <TableHead>Name</TableHead>
                 <TableHead>Email</TableHead>
                 <TableHead>Phone</TableHead>
+                <TableHead className="w-[120px] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -120,11 +122,18 @@ export default function VendorsPage() {
                   <TableCell className="font-medium">{v.name}</TableCell>
                   <TableCell className="text-muted-foreground">{v.email ?? '—'}</TableCell>
                   <TableCell className="text-muted-foreground">{v.phone ?? '—'}</TableCell>
+                  <TableCell className="text-right">
+                    <Link href={`/vendors/${v.id}/edit`}>
+                      <Button variant="outline" size="sm">
+                        Edit
+                      </Button>
+                    </Link>
+                  </TableCell>
                 </TableRow>
               ))}
               {vendors.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={3} className="py-10 text-center text-muted-foreground">
+                  <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
                     No vendors yet.
                   </TableCell>
                 </TableRow>

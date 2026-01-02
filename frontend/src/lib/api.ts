@@ -105,6 +105,36 @@ export async function fetchApi(endpoint: string, options: RequestInit = {}) {
   return await readResponseBody(res);
 }
 
+// --- Invoice Template (print/design settings) ---
+export type InvoiceTemplate = {
+  version: 1;
+  logoUrl: string | null;
+  accentColor: string;
+  fontFamily: string;
+  headerText: string | null;
+  footerText: string | null;
+  tableHeaderBg: string;
+  tableHeaderText: string;
+};
+
+export async function getInvoiceTemplate(companyId: number): Promise<InvoiceTemplate> {
+  return fetchApi(`/companies/${companyId}/invoice-template`);
+}
+
+export async function updateInvoiceTemplate(companyId: number, template: Partial<InvoiceTemplate>): Promise<InvoiceTemplate> {
+  return fetchApi(`/companies/${companyId}/invoice-template`, {
+    method: 'PUT',
+    body: JSON.stringify(template),
+  });
+}
+
+export async function clearInvoiceTemplate(companyId: number): Promise<InvoiceTemplate> {
+  return fetchApi(`/companies/${companyId}/invoice-template`, {
+    method: 'PUT',
+    body: JSON.stringify({ clear: true }),
+  });
+}
+
 // Report types based on our backend response
 export interface TrialBalanceReport {
   companyId: number;
@@ -225,12 +255,32 @@ export async function getVendors(companyId: number): Promise<Vendor[]> {
   return fetchApi(`/companies/${companyId}/vendors`);
 }
 
+export async function getVendor(companyId: number, vendorId: number): Promise<Vendor> {
+  return fetchApi(`/companies/${companyId}/vendors/${vendorId}`);
+}
+
+export async function updateVendor(
+  companyId: number,
+  vendorId: number,
+  data: { name: string; email?: string; phone?: string }
+): Promise<Vendor> {
+  return fetchApi(`/companies/${companyId}/vendors/${vendorId}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: data.name,
+      email: data.email ?? null,
+      phone: data.phone ?? null,
+    }),
+  });
+}
+
 // --- Vendor Credits (AP Credits) ---
 export interface VendorCreditListRow {
   id: number;
   creditNumber: string;
   status: 'DRAFT' | 'APPROVED' | 'POSTED' | 'VOID';
   creditDate: string;
+  vendorId: number | null;
   vendorName: string | null;
   locationName: string | null;
   total: string;
@@ -277,8 +327,16 @@ export interface VendorCreditDetail {
   }>;
 }
 
-export async function getVendorCredits(companyId: number): Promise<VendorCreditListRow[]> {
-  return fetchApi(`/companies/${companyId}/vendor-credits`);
+export async function getVendorCredits(
+  companyId: number,
+  opts?: { vendorId?: number; eligibleOnly?: boolean; status?: string }
+): Promise<VendorCreditListRow[]> {
+  const qs = new URLSearchParams();
+  if (opts?.vendorId) qs.set('vendorId', String(opts.vendorId));
+  if (opts?.eligibleOnly) qs.set('eligibleOnly', 'true');
+  if (opts?.status) qs.set('status', String(opts.status));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return fetchApi(`/companies/${companyId}/vendor-credits${suffix}`);
 }
 
 export async function createVendorCredit(
@@ -355,6 +413,55 @@ export async function createVendor(
   return fetchApi(`/companies/${companyId}/vendors`, {
     method: 'POST',
     body: JSON.stringify(data),
+  });
+}
+
+export interface Customer {
+  id: number;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  currency: string | null;
+  openingBalance: string | null;
+  createdAt: string;
+}
+
+export async function getCustomers(companyId: number): Promise<Customer[]> {
+  return fetchApi(`/companies/${companyId}/customers`);
+}
+
+export async function getCustomer(companyId: number, customerId: number): Promise<Customer> {
+  return fetchApi(`/companies/${companyId}/customers/${customerId}`);
+}
+
+export async function createCustomer(
+  companyId: number,
+  data: { name: string; email?: string; phone?: string; currency?: string }
+): Promise<Customer> {
+  return fetchApi(`/companies/${companyId}/customers`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name: data.name,
+      email: data.email ?? null,
+      phone: data.phone ?? null,
+      currency: data.currency ?? null,
+    }),
+  });
+}
+
+export async function updateCustomer(
+  companyId: number,
+  customerId: number,
+  data: { name: string; email?: string; phone?: string; currency?: string }
+): Promise<Customer> {
+  return fetchApi(`/companies/${companyId}/customers/${customerId}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      name: data.name,
+      email: data.email ?? null,
+      phone: data.phone ?? null,
+      currency: data.currency ?? null,
+    }),
   });
 }
 
@@ -511,5 +618,74 @@ export async function closePeriod(companyId: number, from: string, to: string): 
   return fetchApi(`/companies/${companyId}/period-close?from=${from}&to=${to}`, {
     method: 'POST',
     body: JSON.stringify({}),
+  });
+}
+
+// --- Currencies (Option 1: reference-only exchange rates) ---
+export type CurrencyOverviewRow = {
+  id: number;
+  code: string;
+  name: string | null;
+  symbol: string | null;
+  isBase: boolean;
+  latestRateToBase: string | null;
+  latestAsOfDate: string | null;
+};
+
+export type CurrenciesOverview = {
+  baseCurrency: string | null;
+  currencies: CurrencyOverviewRow[];
+};
+
+export async function getCurrenciesOverview(companyId: number): Promise<CurrenciesOverview> {
+  return fetchApi(`/companies/${companyId}/currencies/overview`);
+}
+
+export async function createCurrency(
+  companyId: number,
+  data: { code: string; name?: string | null; symbol?: string | null }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/currencies`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateCurrency(
+  companyId: number,
+  currencyId: number,
+  data: { name?: string | null; symbol?: string | null; isActive?: boolean }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/currencies/${currencyId}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteCurrency(companyId: number, currencyId: number): Promise<{ ok: boolean }> {
+  return fetchApi(`/companies/${companyId}/currencies/${currencyId}`, { method: 'DELETE' });
+}
+
+export type ExchangeRateRow = {
+  id: number;
+  currencyCode: string;
+  baseCurrency: string;
+  rateToBase: string;
+  asOfDate: string;
+  createdAt: string;
+};
+
+export async function getExchangeRates(companyId: number, code: string): Promise<ExchangeRateRow[]> {
+  return fetchApi(`/companies/${companyId}/currencies/${code}/rates`);
+}
+
+export async function createExchangeRate(
+  companyId: number,
+  code: string,
+  data: { rateToBase: number; asOfDate: string }
+): Promise<ExchangeRateRow> {
+  return fetchApi(`/companies/${companyId}/currencies/${code}/rates`, {
+    method: 'POST',
+    body: JSON.stringify(data),
   });
 }

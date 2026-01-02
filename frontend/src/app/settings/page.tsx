@@ -193,6 +193,20 @@ export default function SettingsPage() {
           )}
         </CardContent>
       </Card>
+
+      <Card className="shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg">Documents</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-sm text-muted-foreground">
+            Customize how invoices look when printed (logo, colors, font, header/footer).
+          </div>
+          <Link href="/settings/invoice-template">
+            <Button variant="outline">Invoice Template</Button>
+          </Link>
+        </CardContent>
+      </Card>
     </div>
   )
 }

@@ -6,7 +6,7 @@ import { useParams, useRouter } from "next/navigation"
 import { ArrowLeft, ChevronDown, Loader2, Pencil } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
-import { fetchApi } from "@/lib/api"
+import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import { cn, formatDateInTimeZone } from "@/lib/utils"
+import { InvoicePaper } from "@/components/invoice/InvoicePaper"
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0)
@@ -74,6 +75,7 @@ export default function InvoiceDetailPage() {
 
   const [invoice, setInvoice] = useState<any>(null)
   const [loading, setLoading] = useState(true)
+  const [template, setTemplate] = useState<InvoiceTemplate | null>(null)
   const [posting, setPosting] = useState(false)
   const [postError, setPostError] = useState<string | null>(null)
   const [reversingPaymentId, setReversingPaymentId] = useState<number | null>(
@@ -107,6 +109,22 @@ export default function InvoiceDetailPage() {
     loadInvoice()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId, invoiceId])
+
+  useEffect(() => {
+    if (!user?.companyId) return
+    let cancelled = false
+    getInvoiceTemplate(user.companyId)
+      .then((t) => {
+        if (cancelled) return
+        setTemplate(t)
+      })
+      .catch(() => {
+        // best-effort; invoice can still render with defaults
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [user?.companyId])
 
   const postInvoice = async () => {
     if (!user?.companyId || !invoiceId) return
@@ -241,17 +259,6 @@ export default function InvoiceDetailPage() {
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
   const creditsAvailable = Number((invoice as any)?.creditsAvailable ?? 0)
   const canApplyCredits = canReceivePayment && creditsAvailable > 0 && Number((invoice as any)?.remainingBalance ?? 0) > 0
-  const invoiceLines = (invoice.lines ?? []) as any[]
-  const grossSubtotal = invoiceLines.reduce((sum: number, l: any) => {
-    const qty = Number(l.quantity ?? 0)
-    const rate = Number(l.unitPrice ?? 0)
-    return sum + qty * rate
-  }, 0)
-  const discountTotal = invoiceLines.reduce((sum: number, l: any) => {
-    return sum + Math.max(0, Number(l.discountAmount ?? 0))
-  }, 0)
-  const netSubtotal = Math.max(0, grossSubtotal - discountTotal)
-  const taxAmount = Number(invoice.taxAmount ?? 0)
 
   return (
     <div className="space-y-6">
@@ -383,189 +390,12 @@ export default function InvoiceDetailPage() {
       {/* Invoice paper preview */}
       <div className="print-area rounded-lg border bg-muted/20 p-4 sm:p-6">
         <div className="print-paper mx-auto max-w-4xl rounded-lg border bg-white shadow-sm">
-          <div className="p-6 sm:p-10">
-            {/* Header */}
-            <div className="flex flex-col gap-6 sm:flex-row sm:items-start sm:justify-between">
-              <div className="space-y-2">
-                <div className="text-xl font-semibold tracking-tight">{companyName}</div>
-                <div className="text-sm text-muted-foreground">
-                  <div>Address line (optional)</div>
-                  <div>City, Country</div>
-                </div>
-              </div>
-
-              <div className="space-y-2 text-left sm:text-right">
-                <div className="text-3xl font-semibold tracking-tight">Invoice</div>
-                <div className="text-sm text-muted-foreground">
-                  <div>
-                    <span className="font-medium text-foreground">#{invoice.invoiceNumber}</span>
-                  </div>
-                  <div className="mt-1">{statusBadge(invoice.status)}</div>
-                </div>
-                <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
-                  <div className="text-xs font-medium text-muted-foreground">Balance Due</div>
-                  <div className="text-lg font-semibold tabular-nums">
-                    {formatMoneyWithCurrency(invoice.remainingBalance, invoice.currency)}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="my-8 border-t" />
-
-            {/* Bill to + meta */}
-            <div className="grid gap-6 sm:grid-cols-2">
-              <div className="space-y-2">
-                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Bill To
-                </div>
-                <div className="text-base font-semibold">{invoice.customer?.name ?? "—"}</div>
-                <div className="text-sm text-muted-foreground">Customer address (optional)</div>
-              </div>
-
-              <div className="space-y-2 sm:justify-self-end sm:text-right">
-                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-                  <div className="text-muted-foreground">Invoice Date</div>
-                  <div className="font-medium">{formatDateInTimeZone(invoice.invoiceDate, tz)}</div>
-                  <div className="text-muted-foreground">Due Date</div>
-                  <div className="font-medium">
-                    {invoice.dueDate ? formatDateInTimeZone(invoice.dueDate, tz) : "—"}
-                  </div>
-                  <div className="text-muted-foreground">Location</div>
-                  <div className="font-medium">{invoice.location?.name ?? invoice.warehouse?.name ?? "—"}</div>
-                  <div className="text-muted-foreground">Terms</div>
-                  <div className="font-medium">{invoice.dueDate ? "Net" : "—"}</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="my-8 border-t" />
-
-            {/* Lines */}
-            <div className="overflow-hidden rounded-md border">
-              <table className="w-full text-sm">
-                <thead className="bg-slate-50 text-slate-600">
-                  <tr>
-                    <th className="px-4 py-3 text-left font-medium">#</th>
-                    <th className="px-4 py-3 text-left font-medium">Item</th>
-                    <th className="px-4 py-3 text-right font-medium">Qty</th>
-                    <th className="px-4 py-3 text-right font-medium">Rate</th>
-                    <th className="px-4 py-3 text-right font-medium">Amount</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {invoiceLines.length === 0 ? (
-                    <tr>
-                      <td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">
-                        No invoice lines.
-                      </td>
-                    </tr>
-                  ) : (
-                    invoiceLines.map((l: any, idx: number) => {
-                      const qty = Number(l.quantity ?? 0)
-                      const rate = Number(l.unitPrice ?? 0)
-                      const discount = Math.max(0, Number(l.discountAmount ?? 0))
-                      const amount = Math.max(0, qty * rate - discount)
-                      const itemName = l.item?.name ?? (l.description ?? "—")
-                      const desc = String(l.description ?? "").trim()
-                      const showDesc = Boolean(desc && l.item?.name && desc !== l.item.name)
-                      return (
-                        <tr key={l.id ?? idx} className={idx % 2 === 0 ? "bg-white" : "bg-slate-50/30"}>
-                          <td className="px-4 py-3 text-muted-foreground">{idx + 1}</td>
-                          <td className="px-4 py-3">
-                            <div className="font-medium text-slate-900">{itemName}</div>
-                            {showDesc ? <div className="mt-1 text-xs text-muted-foreground">{desc}</div> : null}
-                            {discount > 0 ? (
-                              <div className="mt-1 text-xs text-muted-foreground">
-                                Discount: {formatMoneyWithCurrency(discount, invoice.currency)}
-                              </div>
-                            ) : null}
-                          </td>
-                          <td className="px-4 py-3 text-right font-medium tabular-nums">{formatMoney(qty)}</td>
-                          <td className="px-4 py-3 text-right font-medium tabular-nums">
-                            {formatMoneyWithCurrency(rate, invoice.currency)}
-                          </td>
-                          <td className="px-4 py-3 text-right font-medium tabular-nums">
-                            {formatMoneyWithCurrency(amount, invoice.currency)}
-                          </td>
-                        </tr>
-                      )
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Totals */}
-            <div className="mt-6 grid gap-6 sm:grid-cols-2">
-              <div className="text-sm text-muted-foreground space-y-4">
-                {(invoice.customerNotes ?? "").trim() ? (
-                  <div>
-                    <div className="font-medium text-slate-900">Customer Notes</div>
-                    <div className="mt-1 whitespace-pre-wrap">{invoice.customerNotes}</div>
-                  </div>
-                ) : null}
-
-                {(invoice.termsAndConditions ?? "").trim() ? (
-                  <div>
-                    <div className="font-medium text-slate-900">Terms &amp; Conditions</div>
-                    <div className="mt-1 whitespace-pre-wrap">{invoice.termsAndConditions}</div>
-                  </div>
-                ) : null}
-
-                {!(invoice.customerNotes ?? "").trim() && !(invoice.termsAndConditions ?? "").trim() ? (
-                  <div>
-                    <div className="font-medium text-slate-900">Notes</div>
-                    <div className="mt-1">—</div>
-                  </div>
-                ) : null}
-              </div>
-
-              <div className="sm:justify-self-end sm:text-right">
-                <div className="ml-auto w-full max-w-sm space-y-2 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Sub Total</span>
-                    <span className="font-medium tabular-nums">
-                      {formatMoneyWithCurrency(grossSubtotal, invoice.currency)}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Discount</span>
-                    <span className="font-medium tabular-nums">
-                      {formatMoneyWithCurrency(discountTotal, invoice.currency)}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Tax</span>
-                    <span className="font-medium tabular-nums">
-                      {formatMoneyWithCurrency(taxAmount, invoice.currency)}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Total</span>
-                    <span className="font-semibold tabular-nums">
-                      {formatMoneyWithCurrency(invoice.total, invoice.currency)}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Payment Made</span>
-                    <span className="font-medium tabular-nums">
-                      {formatMoneyWithCurrency(invoice.totalPaid, invoice.currency)}
-                    </span>
-                  </div>
-                  <div className="mt-2 flex items-center justify-between border-t pt-2">
-                    <span className="font-semibold">Balance Due</span>
-                    <span className="font-semibold tabular-nums">
-                      {formatMoneyWithCurrency(invoice.remainingBalance, invoice.currency)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
+          <div className="p-0">
+            <InvoicePaper invoice={invoice} companyName={companyName} tz={tz} template={template} />
 
             {/* Payment info */}
             {(invoice.payments ?? []).length > 0 ? (
-              <div className="no-print mt-10">
+              <div className="no-print mt-10 px-6 pb-6 sm:px-10 sm:pb-10">
                 <div className="mb-2 flex items-center justify-between">
                   <div className="text-sm font-semibold">Payments Received</div>
                   <Badge variant="secondary">{(invoice.payments ?? []).length}</Badge>

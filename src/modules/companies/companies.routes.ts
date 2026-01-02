@@ -7,6 +7,8 @@ import {
   CashflowActivity,
   NormalBalance,
 } from '@prisma/client';
+import { Storage } from '@google-cloud/storage';
+import { v4 as uuidv4 } from 'uuid';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
 import {
   enforceCompanyScope,
@@ -14,6 +16,87 @@ import {
   getAuthCompanyId,
   requireCompanyIdParam,
 } from '../../utils/tenant.js';
+import { requireAnyRole, Roles } from '../../utils/rbac.js';
+
+type InvoiceTemplateV1 = {
+  version: 1;
+  logoUrl: string | null;
+  accentColor: string;
+  fontFamily: string;
+  headerText: string | null;
+  footerText: string | null;
+  tableHeaderBg: string;
+  tableHeaderText: string;
+};
+
+const DEFAULT_INVOICE_TEMPLATE: InvoiceTemplateV1 = {
+  version: 1,
+  logoUrl: null,
+  accentColor: '#2F81B7',
+  fontFamily: 'Inter',
+  headerText: null,
+  footerText: null,
+  tableHeaderBg: '#2F81B7',
+  tableHeaderText: '#FFFFFF',
+};
+
+function requireEnv(name: string): string {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) throw new Error(`Missing required env var: ${name}`);
+  return String(v);
+}
+
+function isHexColor(s: string): boolean {
+  const v = String(s ?? '').trim();
+  return /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v);
+}
+
+function sanitizeInvoiceTemplate(input: any): InvoiceTemplateV1 {
+  const obj = input && typeof input === 'object' ? input : {};
+
+  const logoUrl =
+    typeof obj.logoUrl === 'string' && obj.logoUrl.trim()
+      ? obj.logoUrl.trim()
+      : obj.logoUrl === null
+        ? null
+        : DEFAULT_INVOICE_TEMPLATE.logoUrl;
+
+  const accentColor =
+    typeof obj.accentColor === 'string' && isHexColor(obj.accentColor)
+      ? obj.accentColor.toUpperCase()
+      : DEFAULT_INVOICE_TEMPLATE.accentColor;
+
+  const tableHeaderBg =
+    typeof obj.tableHeaderBg === 'string' && isHexColor(obj.tableHeaderBg)
+      ? obj.tableHeaderBg.toUpperCase()
+      : accentColor;
+
+  const tableHeaderText =
+    typeof obj.tableHeaderText === 'string' && isHexColor(obj.tableHeaderText)
+      ? obj.tableHeaderText.toUpperCase()
+      : DEFAULT_INVOICE_TEMPLATE.tableHeaderText;
+
+  const fontFamily =
+    typeof obj.fontFamily === 'string' && obj.fontFamily.trim()
+      ? obj.fontFamily.trim()
+      : DEFAULT_INVOICE_TEMPLATE.fontFamily;
+
+  const headerText =
+    typeof obj.headerText === 'string' ? obj.headerText : obj.headerText === null ? null : DEFAULT_INVOICE_TEMPLATE.headerText;
+  const footerText =
+    typeof obj.footerText === 'string' ? obj.footerText : obj.footerText === null ? null : DEFAULT_INVOICE_TEMPLATE.footerText;
+
+  return {
+    version: 1,
+    logoUrl,
+    accentColor,
+    fontFamily,
+    headerText,
+    footerText,
+    tableHeaderBg,
+    tableHeaderText,
+  };
+}
 
 export async function companiesRoutes(fastify: FastifyInstance) {
   // Company endpoints are tenant scoped; require JWT.
@@ -418,6 +501,110 @@ export async function companiesRoutes(fastify: FastifyInstance) {
             isDefault: (updated as any).defaultLocation.isDefault,
           }
         : null,
+    };
+  });
+
+  // --- Invoice Template (print/design settings) ---
+  fastify.get('/companies/:companyId/invoice-template', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { id: true, invoiceTemplate: true },
+    });
+    if (!company) {
+      reply.status(404);
+      return { error: 'company not found' };
+    }
+
+    const stored = (company as any).invoiceTemplate ?? null;
+    const merged = sanitizeInvoiceTemplate(stored);
+    return merged;
+  });
+
+  fastify.put('/companies/:companyId/invoice-template', async (request, reply) => {
+    // Only allow privileged roles to change print templates.
+    requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+
+    const companyId = requireCompanyIdParam(request, reply);
+    const body: any = request.body;
+
+    // Allow clearing via { clear: true }
+    if (body && typeof body === 'object' && body.clear === true) {
+      const updated = await prisma.company.update({
+        where: { id: companyId },
+        data: { invoiceTemplate: null as any },
+        select: { invoiceTemplate: true },
+      });
+      return sanitizeInvoiceTemplate((updated as any).invoiceTemplate);
+    }
+
+    if (!body || typeof body !== 'object') {
+      reply.status(400);
+      return { error: 'template body must be an object' };
+    }
+
+    const template = sanitizeInvoiceTemplate(body);
+    const updated = await prisma.company.update({
+      where: { id: companyId },
+      data: { invoiceTemplate: template as any },
+      select: { invoiceTemplate: true },
+    });
+
+    return sanitizeInvoiceTemplate((updated as any).invoiceTemplate);
+  });
+
+  // Upload logo to GCS and update invoice template.logoUrl
+  fastify.post('/companies/:companyId/invoice-template/logo', async (request, reply) => {
+    requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+    const companyId = requireCompanyIdParam(request, reply);
+
+    // @fastify/multipart
+    const file = await (request as any).file?.();
+    if (!file) {
+      reply.status(400);
+      return { error: 'file is required (multipart/form-data field: file)' };
+    }
+
+    const mimetype = String(file.mimetype ?? '');
+    if (!mimetype.startsWith('image/')) {
+      reply.status(400);
+      return { error: 'only image uploads are allowed' };
+    }
+
+    const bucketName = requireEnv('INVOICE_TEMPLATE_ASSETS_BUCKET');
+    const storage = new Storage();
+    const ext = mimetype === 'image/png' ? '.png' : mimetype === 'image/jpeg' ? '.jpg' : '';
+    const objectName = `companies/${companyId}/invoice-template/logo/${uuidv4()}${ext}`;
+
+    // Save to GCS (buffering is fine for small 1MB default)
+    const buf: Buffer = await file.toBuffer();
+    await storage.bucket(bucketName).file(objectName).save(buf, {
+      contentType: mimetype,
+      resumable: false,
+      metadata: {
+        cacheControl: 'public, max-age=31536000',
+      },
+    });
+
+    const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectName}`;
+
+    // Update stored template with the new logoUrl
+    const company = await prisma.company.findUnique({
+      where: { id: companyId },
+      select: { invoiceTemplate: true },
+    });
+    const next = sanitizeInvoiceTemplate((company as any)?.invoiceTemplate ?? null);
+    next.logoUrl = publicUrl;
+
+    const updated = await prisma.company.update({
+      where: { id: companyId },
+      data: { invoiceTemplate: next as any },
+      select: { invoiceTemplate: true },
+    });
+
+    return {
+      logoUrl: publicUrl,
+      template: sanitizeInvoiceTemplate((updated as any).invoiceTemplate),
     };
   });
 

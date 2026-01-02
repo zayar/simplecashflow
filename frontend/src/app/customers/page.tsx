@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Plus } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
-import { fetchApi } from "@/lib/api"
+import { getCustomers } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
@@ -23,9 +23,7 @@ export default function CustomersPage() {
 
   useEffect(() => {
     if (user?.companyId) {
-      fetchApi(`/companies/${user.companyId}/customers`)
-        .then(setCustomers)
-        .catch(console.error);
+      getCustomers(user.companyId).then(setCustomers).catch(console.error);
     }
   }, [user?.companyId]);
 
@@ -57,6 +55,7 @@ export default function CustomersPage() {
                 <TableHead>Email</TableHead>
                 <TableHead>Phone</TableHead>
                 <TableHead className="w-[140px]">Currency</TableHead>
+                <TableHead className="w-[120px] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -66,11 +65,18 @@ export default function CustomersPage() {
                   <TableCell className="text-muted-foreground">{c.email || "—"}</TableCell>
                   <TableCell className="text-muted-foreground">{c.phone || "—"}</TableCell>
                   <TableCell className="text-muted-foreground">{c.currency || "—"}</TableCell>
+                  <TableCell className="text-right">
+                    <Link href={`/customers/${c.id}/edit`}>
+                      <Button variant="outline" size="sm">
+                        Edit
+                      </Button>
+                    </Link>
+                  </TableCell>
                 </TableRow>
               ))}
               {customers.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                  <TableCell colSpan={5} className="py-10 text-center text-muted-foreground">
                     No customers yet.
                   </TableCell>
                 </TableRow>

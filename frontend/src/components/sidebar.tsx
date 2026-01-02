@@ -17,6 +17,7 @@ import {
   Settings,
   Percent,
   CreditCard,
+  Coins,
 } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -89,7 +90,13 @@ const navGroups: { label: string; items: NavItem[] }[] = [
   { label: "Reports", items: [{ href: "/reports", label: "Reports", icon: BarChart }] },
 
   // Company Profile
-  { label: "", items: [{ href: "/settings", label: "Company Profile", icon: Settings }] },
+  {
+    label: "",
+    items: [
+      { href: "/currencies", label: "Currencies", icon: Coins },
+      { href: "/settings", label: "Company Profile", icon: Settings },
+    ],
+  },
 ]
 
 export function Sidebar({ collapsed = false }: { collapsed?: boolean } = {}) {

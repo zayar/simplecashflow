@@ -36,6 +36,7 @@ export default function PurchaseBillDetailPage() {
   const [bill, setBill] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
+  const [hasEligibleCredits, setHasEligibleCredits] = useState(false);
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -58,6 +59,31 @@ export default function PurchaseBillDetailPage() {
     load().catch(console.error);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId, id]);
+
+  // Determine whether to show "Apply credits" based on eligible credits for this bill's vendor.
+  useEffect(() => {
+    if (!user?.companyId) return;
+    const vendorId = Number(bill?.vendor?.id ?? 0) || null;
+    const isPostedOrPartial = bill?.status === 'POSTED' || bill?.status === 'PARTIAL';
+    const remainingBalance = Number(bill?.remainingBalance ?? 0);
+    if (!vendorId || !isPostedOrPartial || remainingBalance <= 0) {
+      setHasEligibleCredits(false);
+      return;
+    }
+    let cancelled = false;
+    fetchApi(`/companies/${user.companyId}/vendor-credits?vendorId=${vendorId}&eligibleOnly=true`)
+      .then((rows: any[]) => {
+        if (cancelled) return;
+        setHasEligibleCredits(Array.isArray(rows) && rows.length > 0);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setHasEligibleCredits(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, bill?.vendor?.id, bill?.status, bill?.remainingBalance]);
 
   const total = useMemo(() => Number(bill?.total ?? 0), [bill]);
   const totalPaid = useMemo(() => Number(bill?.totalPaid ?? 0), [bill]);
@@ -178,9 +204,11 @@ export default function PurchaseBillDetailPage() {
               <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
                 Record payment
               </Link>
-              <Link href={`/purchase-bills/${id}/apply-credits`} className={buttonVariants({ variant: 'outline' })}>
-                Apply credits
-              </Link>
+              {hasEligibleCredits ? (
+                <Link href={`/purchase-bills/${id}/apply-credits`} className={buttonVariants({ variant: 'outline' })}>
+                  Apply credits
+                </Link>
+              ) : null}
             </>
           ) : null}
           {bill?.journalEntryId ? (

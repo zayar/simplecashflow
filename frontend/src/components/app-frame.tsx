@@ -59,7 +59,7 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   if (isLoading) {
     return (
       <div className="min-h-screen bg-background">
-        <div className="mx-auto max-w-7xl px-6 py-10">
+        <div className="w-full px-4 py-10 lg:px-6">
           <div className="space-y-6">
             <Skeleton className="h-8 w-48" />
             <div className="grid gap-4 md:grid-cols-3">
@@ -212,14 +212,14 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
 
             {/* Main */}
             <main className="flex-1">
-              <div className="mx-auto w-full max-w-7xl px-4 py-6 lg:px-6">
+              <div className="w-full px-4 py-6 lg:px-6">
                 {children}
               </div>
             </main>
 
             {/* Footer */}
             <footer className="border-t py-4">
-              <div className="mx-auto max-w-7xl px-4 text-xs text-muted-foreground lg:px-6">
+              <div className="w-full px-4 text-xs text-muted-foreground lg:px-6">
                 {user ? `Signed in as ${user.email}` : null}
               </div>
             </footer>

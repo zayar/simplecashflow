@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import jwt from 'fastify-jwt';
 import { authRoutes } from './modules/auth/auth.routes.js';
 import { companiesRoutes } from './modules/companies/companies.routes.js';
@@ -14,6 +15,7 @@ import { apAgingRoutes } from './modules/reports/apAging.routes.js';
 import { dashboardRoutes } from './modules/reports/dashboard.routes.js';
 import { arApSummaryRoutes } from './modules/reports/arApSummary.routes.js';
 import { taxesRoutes } from './modules/taxes/taxes.routes.js';
+import { currenciesRoutes } from './modules/currencies/currencies.routes.js';
 import { runWithTenant } from './infrastructure/tenantContext.js';
 
 function requireEnv(name: string): string {
@@ -42,6 +44,14 @@ async function buildApp() {
       'X-Integration-Key',
       'x-integration-key',
     ],
+  });
+
+  // File uploads (used for invoice logo upload).
+  await fastify.register(multipart, {
+    limits: {
+      fileSize: Number(process.env.UPLOAD_MAX_BYTES ?? 1_000_000), // 1MB default
+      files: 1,
+    },
   });
 
   fastify.register(jwt as any, {
@@ -149,6 +159,7 @@ async function buildApp() {
   await fastify.register(dashboardRoutes);
   await fastify.register(arApSummaryRoutes);
   await fastify.register(taxesRoutes);
+  await fastify.register(currenciesRoutes);
 
   // Tenant context (ALS) must be installed AFTER module-level auth hooks are registered,
   // so it can wrap the actual route handler execution with a verified tenant id.

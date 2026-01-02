@@ -16,6 +16,10 @@ RUNTIME_SA_EMAIL="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 DB_URL_SECRET="cashflow-db-url"
 JWT_SECRET_NAME="cashflow-jwt-secret"
 
+# Publicly readable bucket for invoice template assets (logo). Writes are restricted to runtime SA.
+# You can override by exporting INVOICE_TEMPLATE_ASSETS_BUCKET before running this script.
+INVOICE_TEMPLATE_ASSETS_BUCKET="${INVOICE_TEMPLATE_ASSETS_BUCKET:-cashflow-invoice-assets-${PROJECT_ID}}"
+
 # ---- Require password without echoing ----
 SKIP_MIGRATIONS="${SKIP_MIGRATIONS:-false}"
 UPDATE_DB_SECRET="${UPDATE_DB_SECRET:-true}"
@@ -180,6 +184,24 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
   --role="roles/pubsub.publisher" >/dev/null
 
+# ---- GCS bucket for invoice template assets (logo) ----
+echo "Ensuring GCS bucket for invoice template assets: gs://${INVOICE_TEMPLATE_ASSETS_BUCKET} ..."
+if ! gcloud storage buckets describe "gs://${INVOICE_TEMPLATE_ASSETS_BUCKET}" >/dev/null 2>&1; then
+  gcloud storage buckets create "gs://${INVOICE_TEMPLATE_ASSETS_BUCKET}" \
+    --location="${REGION}" \
+    --uniform-bucket-level-access
+fi
+
+# Runtime SA can write objects (upload logo)
+gcloud storage buckets add-iam-policy-binding "gs://${INVOICE_TEMPLATE_ASSETS_BUCKET}" \
+  --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+  --role="roles/storage.objectAdmin" >/dev/null
+
+# Public read for logos (so invoices can render/print without auth)
+gcloud storage buckets add-iam-policy-binding "gs://${INVOICE_TEMPLATE_ASSETS_BUCKET}" \
+  --member="allUsers" \
+  --role="roles/storage.objectViewer" >/dev/null
+
 # ---- Secret Manager: store Cloud Run DATABASE_URL using unix socket (optional) ----
 if [[ "$UPDATE_DB_SECRET" == "true" ]]; then
   SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS_ENC}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
@@ -227,7 +249,7 @@ gcloud run deploy cashflow-api \
   --image "gcr.io/${PROJECT_ID}/cashflow-api" \
   --region "$REGION" \
   --add-cloudsql-instances "$INSTANCE_CONN" \
-  --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC}" \
+  --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC},INVOICE_TEMPLATE_ASSETS_BUCKET=${INVOICE_TEMPLATE_ASSETS_BUCKET}" \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest,JWT_SECRET=${JWT_SECRET_NAME}:latest" \
   --service-account "$RUNTIME_SA_EMAIL"
 

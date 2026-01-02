@@ -134,6 +134,8 @@ enum VendorCreditStatus {
 model Company {
   id                   Int                   @id @default(autoincrement())
   name                 String
+  // Invoice print/template customization (simple JSON blob; evolve with versioning).
+  invoiceTemplate      Json?
   // --- Company profile / reporting preferences ---
   // Base currency for the tenant. Treat as immutable after transactions exist.
   baseCurrency         String? // e.g. "MMK"
@@ -172,6 +174,9 @@ model Company {
   vendorCreditApplications VendorCreditApplication[]
   customerAdvances     CustomerAdvance[]
   customerAdvanceApplications CustomerAdvanceApplication[]
+  // Reference-only currencies + exchange rates (Option 1)
+  currencies           Currency[]
+  exchangeRates        ExchangeRate[]
 
   // Default account settings for this company (multi-tenant safe).
   // Used when posting invoices (Debit AR).
@@ -1429,4 +1434,53 @@ model IntegrationEntityMap {
 
   @@unique([companyId, integration, entityType, externalId])
   @@index([companyId, integration, entityType])
+}
+
+// --- Reference-only multi-currency support (Option 1) ---
+// These tables are for display/reference exchange rates only.
+// They do NOT affect posting, ledger balances, or reports today.
+
+model Currency {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  // ISO 4217-like 3-letter currency code (stored normalized uppercase).
+  code   String  @db.VarChar(3)
+  name   String?
+  symbol String? @db.VarChar(16)
+
+  isActive Boolean @default(true)
+
+  exchangeRates ExchangeRate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, code])
+  @@index([companyId])
+}
+
+model ExchangeRate {
+  id        Int     @id @default(autoincrement())
+  companyId Int
+  company   Company @relation(fields: [companyId], references: [id])
+
+  currencyId Int
+  currency   Currency @relation(fields: [currencyId], references: [id], onDelete: Cascade)
+
+  // Snapshot base currency code at the time this rate was created.
+  // Rates are interpreted as: 1 unit of `currency.code` = `rateToBase` units of `baseCurrency`.
+  baseCurrency String @db.VarChar(3)
+
+  // Store with enough precision for most SMEs.
+  rateToBase Decimal @db.Decimal(18, 8)
+  asOfDate   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, currencyId, asOfDate])
+  @@index([companyId, currencyId, asOfDate])
+  @@index([companyId, asOfDate])
 }

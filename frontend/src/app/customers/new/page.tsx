@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { createCustomer } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -28,10 +28,7 @@ export default function NewCustomerPage() {
     
     setLoading(true);
     try {
-      await fetchApi(`/companies/${user.companyId}/customers`, {
-        method: 'POST',
-        body: JSON.stringify(formData),
-      });
+      await createCustomer(user.companyId, formData);
       router.push('/customers');
     } catch (err) {
       console.error(err);
