@@ -69,10 +69,13 @@ export default function InvoiceLine() {
   }
 
   const errors = useMemo(() => {
-    const desc = String(line.itemName ?? '').trim();
-    const hasDesc = desc.length > 0;
-    return { description: hasDesc ? null : 'Description is required' };
-  }, [line.itemName]);
+    const name = String(line.itemName ?? '').trim();
+    const hasName = name.length > 0;
+    const isCustom = !Number(line.itemId ?? 0);
+    const unit = clampMoney(toNumber(line.unitPrice));
+    const unitErr = isCustom && unit <= 0 ? 'Unit cost is required for custom items' : null;
+    return { itemName: hasName ? null : 'Item name is required', unitPrice: unitErr };
+  }, [line.itemId, line.itemName, line.unitPrice]);
 
   const total = useMemo(() => {
     const qty = clampQty(toNumber(line.quantity));
@@ -110,8 +113,8 @@ export default function InvoiceLine() {
 
       <div className="mx-auto max-w-xl px-3 pt-3">
         <Card className="rounded-2xl shadow-sm">
-          <div className="px-4 py-4">
-            <Label className="text-muted-foreground">Description</Label>
+          <div className="px-4 py-3">
+            <Label className="text-sm text-muted-foreground">Item Name</Label>
             <Input
               value={String(line.itemName ?? '')}
               onChange={(e) => {
@@ -130,26 +133,33 @@ export default function InvoiceLine() {
                   updateLine({ itemName: typed, itemId: null });
                 }
               }}
-              placeholder="Description"
-              className="mt-2"
+              placeholder="e.g. Calculator"
+              className="mt-2 h-9"
               list="invoice-items-datalist"
+              autoComplete="off"
             />
             <datalist id="invoice-items-datalist">
               {items.map((it) => (
                 <option key={it.id} value={it.name} />
               ))}
             </datalist>
-            {touched && errors.description ? (
-              <div className="mt-1 text-sm text-destructive">{errors.description}</div>
-            ) : null}
-            <div className="mt-2 text-xs text-muted-foreground">
-              Type a free item, or pick from your items list (tap search icon).
+            {touched && errors.itemName ? <div className="mt-1 text-sm text-destructive">{errors.itemName}</div> : null}
+            <div className="mt-1 text-xs text-muted-foreground">Type a custom item, or tap search to pick from your items list.</div>
+
+            <div className="mt-4">
+              <Label className="text-sm text-muted-foreground">Description</Label>
+              <Textarea
+                value={String(line.description ?? '')}
+                onChange={(e) => updateLine({ description: e.target.value })}
+                placeholder="Optional details…"
+                className="mt-2 min-h-16"
+              />
             </div>
           </div>
 
           <div className="border-t border-border px-4 py-4">
             <div className="flex items-center justify-between">
-              <div className="text-xl font-semibold">Unit Cost</div>
+              <div className="text-base font-semibold">Unit Cost</div>
               <div className="flex items-center gap-2">
                 <div className="text-lg text-muted-foreground">K</div>
                 <Input
@@ -159,29 +169,30 @@ export default function InvoiceLine() {
                   inputMode="decimal"
                   value={clampMoney(toNumber(line.unitPrice))}
                   onChange={(e) => updateLine({ unitPrice: clampMoney(Number(e.target.value)) })}
-                  className="w-28 text-right"
+                  className="h-9 w-28 text-right"
                 />
               </div>
             </div>
+            {touched && errors.unitPrice ? <div className="mt-2 text-sm text-destructive">{errors.unitPrice}</div> : null}
           </div>
 
           <div className="border-t border-border px-4 py-4">
             <div className="flex items-center justify-between">
-              <div className="text-xl font-semibold">Quantity</div>
+              <div className="text-base font-semibold">Quantity</div>
               <Input
                 type="number"
                 min={1}
                 inputMode="numeric"
                 value={clampQty(toNumber(line.quantity))}
                 onChange={(e) => updateLine({ quantity: clampQty(Number(e.target.value)) })}
-                className="w-28 text-right"
+                className="h-9 w-28 text-right"
               />
             </div>
           </div>
 
           <div className="border-t border-border px-4 py-4">
             <div className="flex items-center justify-between">
-              <div className="text-xl font-semibold">Discount Amount</div>
+              <div className="text-base font-semibold">Discount</div>
               <div className="flex items-center gap-2">
                 <div className="text-lg text-muted-foreground">K</div>
                 <Input
@@ -191,7 +202,7 @@ export default function InvoiceLine() {
                   inputMode="decimal"
                   value={clampMoney(toNumber(line.discountAmount ?? 0))}
                   onChange={(e) => updateLine({ discountAmount: clampMoney(Number(e.target.value)) })}
-                  className="w-28 text-right"
+                  className="h-9 w-28 text-right"
                 />
               </div>
             </div>
@@ -200,7 +211,7 @@ export default function InvoiceLine() {
           {/* We only implement tax using existing API field (taxRate). */}
           <div className="border-t border-border px-4 py-4">
             <div className="flex items-center justify-between">
-              <div className="text-xl font-semibold">Tax rate</div>
+              <div className="text-base font-semibold">Tax</div>
               <div className="flex items-center gap-2">
                 <Input
                   type="number"
@@ -209,7 +220,7 @@ export default function InvoiceLine() {
                   inputMode="decimal"
                   value={clampMoney(toNumber(line.taxRate ?? 0)) * 100}
                   onChange={(e) => updateLine({ taxRate: clampMoney(Number(e.target.value)) / 100 })}
-                  className="w-28 text-right"
+                  className="h-9 w-28 text-right"
                 />
                 <div className="text-lg text-muted-foreground">%</div>
               </div>
@@ -218,21 +229,9 @@ export default function InvoiceLine() {
 
           <div className="border-t border-border px-4 py-4">
             <div className="flex items-center justify-between">
-              <div className="text-2xl font-semibold">Total</div>
-              <div className="text-2xl font-semibold">{formatMoneyK(total)}</div>
+              <div className="text-lg font-semibold">Total</div>
+              <div className="text-lg font-semibold">{formatMoneyK(total)}</div>
             </div>
-          </div>
-        </Card>
-
-        <Card className="mt-3 rounded-2xl shadow-sm">
-          <div className="px-4 py-4">
-            <Label className="text-muted-foreground">Additional Details</Label>
-            <Textarea
-              value={String(line.description ?? '')}
-              onChange={(e) => updateLine({ description: e.target.value })}
-              placeholder="Additional details"
-              className="mt-2 min-h-24"
-            />
           </div>
         </Card>
 
@@ -240,7 +239,7 @@ export default function InvoiceLine() {
           <Button
             onClick={() => {
               setTouched(true);
-              if (errors.description) return;
+              if (errors.itemName || errors.unitPrice) return;
               goBack();
             }}
             className="w-full rounded-xl"

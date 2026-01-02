@@ -96,6 +96,23 @@ export async function booksRoutes(fastify) {
             orderBy: { createdAt: 'desc' },
         });
     });
+    // Customer detail (for UI)
+    fastify.get('/companies/:companyId/customers/:customerId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const customerId = Number(request.params?.customerId);
+        if (Number.isNaN(customerId)) {
+            reply.status(400);
+            return { error: 'invalid customerId' };
+        }
+        const customer = await prisma.customer.findFirst({
+            where: { id: customerId, companyId },
+        });
+        if (!customer) {
+            reply.status(404);
+            return { error: 'customer not found' };
+        }
+        return customer;
+    });
     fastify.post('/companies/:companyId/customers', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
         const body = request.body;
@@ -115,6 +132,34 @@ export async function booksRoutes(fastify) {
         });
         return customer;
     });
+    fastify.put('/companies/:companyId/customers/:customerId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const customerId = Number(request.params?.customerId);
+        if (Number.isNaN(customerId)) {
+            reply.status(400);
+            return { error: 'invalid customerId' };
+        }
+        const body = request.body;
+        if (!body.name) {
+            reply.status(400);
+            return { error: 'name is required' };
+        }
+        const existing = await prisma.customer.findFirst({ where: { id: customerId, companyId } });
+        if (!existing) {
+            reply.status(404);
+            return { error: 'customer not found' };
+        }
+        const updated = await prisma.customer.update({
+            where: { id: customerId },
+            data: {
+                name: body.name,
+                email: body.email ?? null,
+                phone: body.phone ?? null,
+                currency: body.currency ?? null,
+            },
+        });
+        return updated;
+    });
     // --- Books: Vendors (for Accounts Payable / Bills) ---
     fastify.get('/companies/:companyId/vendors', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -122,6 +167,23 @@ export async function booksRoutes(fastify) {
             where: { companyId },
             orderBy: { createdAt: 'desc' },
         });
+    });
+    // Vendor detail (for UI)
+    fastify.get('/companies/:companyId/vendors/:vendorId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const vendorId = Number(request.params?.vendorId);
+        if (Number.isNaN(vendorId)) {
+            reply.status(400);
+            return { error: 'invalid vendorId' };
+        }
+        const vendor = await prisma.vendor.findFirst({
+            where: { id: vendorId, companyId },
+        });
+        if (!vendor) {
+            reply.status(404);
+            return { error: 'vendor not found' };
+        }
+        return vendor;
     });
     fastify.post('/companies/:companyId/vendors', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
@@ -138,6 +200,33 @@ export async function booksRoutes(fastify) {
                 phone: body.phone ?? null,
             },
         });
+    });
+    fastify.put('/companies/:companyId/vendors/:vendorId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const vendorId = Number(request.params?.vendorId);
+        if (Number.isNaN(vendorId)) {
+            reply.status(400);
+            return { error: 'invalid vendorId' };
+        }
+        const body = request.body;
+        if (!body.name) {
+            reply.status(400);
+            return { error: 'name is required' };
+        }
+        const existing = await prisma.vendor.findFirst({ where: { id: vendorId, companyId } });
+        if (!existing) {
+            reply.status(404);
+            return { error: 'vendor not found' };
+        }
+        const updated = await prisma.vendor.update({
+            where: { id: vendorId },
+            data: {
+                name: body.name,
+                email: body.email ?? null,
+                phone: body.phone ?? null,
+            },
+        });
+        return updated;
     });
     // --- Books: Items ---
     fastify.get('/companies/:companyId/items', async (request, reply) => {

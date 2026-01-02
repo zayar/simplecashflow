@@ -13,6 +13,11 @@ set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-aiaccount-1c845}"
 REGION="${REGION:-asia-southeast1}"
+# Prefer resolving the current Cloud Run URL for the API (more robust than hardcoding a revision URL).
+if [[ -z "${VITE_API_URL:-}" ]]; then
+  VITE_API_URL="$(gcloud run services describe cashflow-api --region "${REGION}" --project "${PROJECT_ID}" --format="value(status.url)" 2>/dev/null || true)"
+fi
+# Final fallback (older hardcoded URL)
 VITE_API_URL="${VITE_API_URL:-https://cashflow-api-291129507535.asia-southeast1.run.app}"
 
 gcloud config set project "$PROJECT_ID" 1>/dev/null

@@ -770,6 +770,35 @@ export async function booksRoutes(fastify: FastifyInstance) {
     return invoice;
   });
 
+  // Create a public customer view link (no-login) for an invoice.
+  // Returns a signed token that can be used with GET /public/invoices/:token.
+  fastify.post('/companies/:companyId/invoices/:invoiceId/public-link', async (request, reply) => {
+    requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT, Roles.CLERK, Roles.VIEWER]);
+    const companyId = requireCompanyIdParam(request, reply);
+    const invoiceId = Number((request.params as any)?.invoiceId ?? 0);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+      reply.status(400);
+      return { error: 'invalid invoiceId' };
+    }
+
+    const inv = await prisma.invoice.findFirst({
+      where: { id: invoiceId, companyId },
+      select: { id: true },
+    });
+    if (!inv) {
+      reply.status(404);
+      return { error: 'invoice not found' };
+    }
+
+    // Signed link, avoids DB schema changes. Rotates automatically when expired.
+    const token = fastify.jwt.sign(
+      { typ: 'invoice_public', companyId, invoiceId, nonce: randomUUID() },
+      { expiresIn: process.env.PUBLIC_INVOICE_LINK_EXPIRES_IN ?? '180d' }
+    );
+
+    return { token };
+  });
+
   // Update invoice (DRAFT only)
   fastify.put('/companies/:companyId/invoices/:invoiceId', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);

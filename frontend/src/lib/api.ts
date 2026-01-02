@@ -135,6 +135,53 @@ export async function clearInvoiceTemplate(companyId: number): Promise<InvoiceTe
   });
 }
 
+// --- Public Invoice Share Link (customer view, no login) ---
+export type PublicInvoiceResponse = {
+  company: {
+    id: number;
+    name: string;
+    timeZone: string | null;
+    template: InvoiceTemplate;
+  };
+  invoice: {
+    id: number;
+    invoiceNumber: string;
+    status: string;
+    invoiceDate: string;
+    dueDate: string | null;
+    currency: string | null;
+    subtotal: any;
+    taxAmount: any;
+    total: any;
+    totalPaid: number;
+    remainingBalance: number;
+    customerName: string | null;
+    locationName: string | null;
+    customerNotes: string | null;
+    termsAndConditions: string | null;
+    lines: Array<{
+      id: number;
+      quantity: any;
+      unitPrice: any;
+      discountAmount: any;
+      description: string | null;
+      itemName: string | null;
+    }>;
+  };
+};
+
+export async function createPublicInvoiceLink(companyId: number, invoiceId: number): Promise<{ token: string }> {
+  return fetchApi(`/companies/${companyId}/invoices/${invoiceId}/public-link`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function getPublicInvoice(token: string): Promise<PublicInvoiceResponse> {
+  const safe = encodeURIComponent(token);
+  return fetchApi(`/public/invoices/${safe}`);
+}
+
 // Report types based on our backend response
 export interface TrialBalanceReport {
   companyId: number;

@@ -82,6 +82,51 @@ export type CompanySettings = {
   defaultWarehouseId?: number | null;
 };
 
+export type InvoiceTemplate = {
+  version: 1;
+  logoUrl: string | null;
+  accentColor: string;
+  fontFamily: string;
+  headerText: string | null;
+  footerText: string | null;
+  tableHeaderBg: string;
+  tableHeaderText: string;
+};
+
+export type PublicInvoiceResponse = {
+  company: {
+    id: number;
+    name: string;
+    timeZone: string | null;
+    template: InvoiceTemplate;
+  };
+  invoice: {
+    id: number;
+    invoiceNumber: string;
+    status: string;
+    invoiceDate: string;
+    dueDate: string | null;
+    currency: string | null;
+    subtotal: string | number;
+    taxAmount: string | number;
+    total: string | number;
+    totalPaid: number;
+    remainingBalance: number;
+    customerName: string | null;
+    locationName: string | null;
+    customerNotes: string | null;
+    termsAndConditions: string | null;
+    lines: {
+      id: number;
+      quantity: string | number;
+      unitPrice: string | number;
+      discountAmount: string | number;
+      description: string | null;
+      itemName: string | null;
+    }[];
+  };
+};
+
 export async function getInvoices(companyId: number): Promise<InvoiceListRow[]> {
   return (await fetchApi(`/companies/${companyId}/invoices`)) as InvoiceListRow[];
 }
@@ -120,6 +165,22 @@ export async function getCompanySettings(companyId: number): Promise<CompanySett
     defaultLocationId: s.defaultLocationId ?? s.defaultWarehouseId ?? null,
     defaultWarehouseId: s.defaultWarehouseId ?? null,
   };
+}
+
+export async function getInvoiceTemplate(companyId: number): Promise<InvoiceTemplate> {
+  return (await fetchApi(`/companies/${companyId}/invoice-template`)) as InvoiceTemplate;
+}
+
+export async function createPublicInvoiceLink(companyId: number, invoiceId: number): Promise<{ token: string }> {
+  return (await fetchApi(`/companies/${companyId}/invoices/${invoiceId}/public-link`, {
+    method: 'POST',
+    body: JSON.stringify({})
+  })) as { token: string };
+}
+
+export async function getPublicInvoice(token: string): Promise<PublicInvoiceResponse> {
+  const safe = encodeURIComponent(token);
+  return (await fetchApi(`/public/invoices/${safe}`)) as PublicInvoiceResponse;
 }
 
 export async function updateCompanySettings(companyId: number, payload: { defaultLocationId?: number | null; defaultWarehouseId?: number | null }) {

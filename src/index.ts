@@ -7,6 +7,7 @@ import { companiesRoutes } from './modules/companies/companies.routes.js';
 import { ledgerRoutes } from './modules/ledger/ledger.routes.js';
 import { booksRoutes } from './modules/books/books.routes.js';
 import { customerAdvancesRoutes } from './modules/books/customerAdvances.routes.js';
+import { invoicePublicRoutes } from './modules/books/invoicePublic.routes.js';
 import { pitiRoutes } from './modules/integrations/piti.routes.js';
 import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
@@ -29,7 +30,9 @@ function requireEnv(name: string): string {
 const JWT_SECRET = requireEnv('JWT_SECRET');
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '8h';
 
-const fastify = Fastify({ logger: true });
+// Important for public invoice share links: JWT tokens are >100 chars, and the router has a default max param length.
+// Without this, GET /public/invoices/:token may not match and will return 404 "Route ... not found".
+const fastify = Fastify({ logger: true, maxParamLength: 5000 });
 
 async function buildApp() {
   await fastify.register(cors, {
@@ -150,6 +153,7 @@ async function buildApp() {
   await fastify.register(companiesRoutes);
   await fastify.register(ledgerRoutes);
   await fastify.register(booksRoutes);
+  await fastify.register(invoicePublicRoutes);
   await fastify.register(customerAdvancesRoutes);
   await fastify.register(pitiRoutes);
   await fastify.register(inventoryRoutes);

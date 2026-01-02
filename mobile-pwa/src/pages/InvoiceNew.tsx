@@ -21,6 +21,18 @@ function clampMoney(n: number): number {
   return n;
 }
 
+function isEmptyDraftLine(l: DraftLine): boolean {
+  const itemId = l.itemId ? Number(l.itemId) : 0;
+  if (itemId > 0) return false;
+  const title = String(l.itemName ?? '').trim();
+  const details = String(l.description ?? '').trim();
+  const unitPrice = clampMoney(toNumber(l.unitPrice));
+  const discount = clampMoney(toNumber(l.discountAmount ?? 0));
+  const taxRate = clampMoney(toNumber(l.taxRate ?? 0));
+  // Treat the default placeholder line (no name/desc, no price/discount/tax) as empty so we don't POST it.
+  return !title && !details && unitPrice <= 0 && discount <= 0 && taxRate <= 0;
+}
+
 export default function InvoiceNew() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
@@ -81,7 +93,25 @@ export default function InvoiceNew() {
       if (!draft.invoiceDate) throw new Error('Please select invoice date');
       if (!draft.lines.length) throw new Error('Please add at least 1 item');
 
-      const lines = draft.lines
+      const usableLines = draft.lines.filter((l) => !isEmptyDraftLine(l));
+      if (!usableLines.length) throw new Error('Please add at least 1 item');
+
+      // Backend rule: custom lines (no itemId) must include description AND unitPrice > 0.
+      // We always build description from itemName/description, so enforce name + unitPrice here.
+      for (let i = 0; i < usableLines.length; i++) {
+        const l = usableLines[i];
+        const itemId = l.itemId ? Number(l.itemId) : 0;
+        const title = String(l.itemName ?? '').trim();
+        const details = String(l.description ?? '').trim();
+        const unitPrice = clampMoney(toNumber(l.unitPrice));
+        if (itemId <= 0) {
+          // Description is required for custom items; we generate it from (title + details).
+          if (!title && !details) throw new Error(`Line ${i + 1}: Item name or description is required`);
+          if (unitPrice <= 0) throw new Error(`Line ${i + 1}: Unit cost must be > 0 for custom items`);
+        }
+      }
+
+      const lines = usableLines
         .filter((l) => clampQty(toNumber(l.quantity)) > 0)
         .map((l) => {
           const itemId = l.itemId ? Number(l.itemId) : 0;

@@ -12,6 +12,7 @@ import Items from './pages/Items';
 import InvoiceDetail from './pages/InvoiceDetail';
 import InvoicePayment from './pages/InvoicePayment';
 import Warehouses from './pages/Warehouses';
+import PublicInvoice from './pages/PublicInvoice';
 
 function NotFound() {
   return (
@@ -27,6 +28,7 @@ function NotFound() {
 export default function App() {
   return (
     <Routes>
+      <Route path="/public/invoices/:token" element={<PublicInvoice />} />
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route

@@ -1,19 +1,23 @@
 import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
-import { getInvoice, postInvoice } from '../lib/ar';
+import { createPublicInvoiceLink, getCompanySettings, getInvoice, getInvoiceTemplate, postInvoice } from '../lib/ar';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
 import { formatMMDDYYYY, formatMoneyK, toNumber } from '../lib/format';
 import { Card } from '../components/ui/card';
 import { Button } from '../components/ui/button';
+import { InvoicePaper } from '../components/invoice/InvoicePaper';
 
 export default function InvoiceDetail() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const params = useParams();
   const invoiceId = Number(params.id ?? 0);
+  const [actionError, setActionError] = React.useState<string | null>(null);
+  const [shareError, setShareError] = React.useState<string | null>(null);
 
   const invoiceQuery = useQuery({
     queryKey: ['invoice', companyId, invoiceId],
@@ -21,7 +25,43 @@ export default function InvoiceDetail() {
     enabled: companyId > 0 && invoiceId > 0
   });
 
+  const settingsQuery = useQuery({
+    queryKey: ['company-settings', companyId],
+    queryFn: async () => await getCompanySettings(companyId),
+    enabled: companyId > 0,
+  });
+
+  const templateQuery = useQuery({
+    queryKey: ['invoice-template', companyId],
+    queryFn: async () => await getInvoiceTemplate(companyId),
+    enabled: companyId > 0,
+  });
+
+  const postInvoiceMutation = useMutation({
+    mutationFn: async () => {
+      if (companyId <= 0 || invoiceId <= 0) throw new Error('Missing company or invoice id.');
+      return await postInvoice(companyId, invoiceId);
+    },
+    onMutate: () => {
+      setActionError(null);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['invoice', companyId, invoiceId] });
+      await invoiceQuery.refetch();
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : 'Failed to post invoice.';
+      setActionError(msg);
+      // Minimal UX for mobile: ensure user sees something even if the card is off-screen.
+      if (typeof window !== 'undefined') window.alert(msg);
+    }
+  });
+
   const inv = invoiceQuery.data ?? null;
+  const companyName = settingsQuery.data?.name ?? 'Company';
+  const tz = settingsQuery.data?.timeZone ?? null;
+  const template = templateQuery.data ?? null;
+
   const discountTotal = React.useMemo(() => {
     if (!inv?.lines?.length) return 0;
     return inv.lines.reduce((sum, l: any) => sum + toNumber(l.discountAmount ?? 0), 0);
@@ -53,6 +93,42 @@ export default function InvoiceDetail() {
     return Math.max(0, toNumber(inv.total) - paid);
   }, [inv, paid]);
 
+  async function shareInvoiceLink() {
+    setShareError(null);
+    try {
+      if (typeof window === 'undefined') return;
+      const title = inv?.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : 'Invoice';
+      const text = inv?.customerName ? `Invoice for ${inv.customerName}` : 'Invoice link';
+
+      // Preferred: public customer link (no login).
+      let url = `${window.location.origin}/invoices/${invoiceId}`;
+      if (companyId > 0 && invoiceId > 0) {
+        const { token } = await createPublicInvoiceLink(companyId, invoiceId);
+        url = `${window.location.origin}/public/invoices/${encodeURIComponent(token)}`;
+      }
+
+      if (navigator.share) {
+        try {
+          await navigator.share({ title, text, url });
+          return;
+        } catch (e: any) {
+          // User canceled share sheet — do not show as an error; fall back to copy.
+          const name = String(e?.name ?? '');
+          const msg = String(e?.message ?? '');
+          if (name !== 'AbortError' && !msg.toLowerCase().includes('canceled')) throw e;
+        }
+      }
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+        window.alert('Invoice link copied.');
+        return;
+      }
+      window.prompt('Copy invoice link:', url);
+    } catch (e) {
+      setShareError(e instanceof Error ? e.message : 'Failed to share link.');
+    }
+  }
+
   return (
     <div className="min-h-dvh bg-background">
       <AppBar
@@ -62,7 +138,15 @@ export default function InvoiceDetail() {
             <BackIcon />
           </IconButton>
         }
-        right={<div className="h-10 w-10" />}
+        right={
+          <IconButton ariaLabel="Share" onClick={shareInvoiceLink}>
+            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16 6l-4-4-4 4" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 2v14" />
+            </svg>
+          </IconButton>
+        }
       />
 
       <div className="mx-auto max-w-xl px-3 py-3">
@@ -74,69 +158,37 @@ export default function InvoiceDetail() {
           <Card className="rounded-2xl p-4 text-sm text-muted-foreground shadow-sm">Not found.</Card>
         ) : (
           <div className="space-y-3">
+            {/* Real invoice preview (same idea as web "InvoicePaper") */}
             <Card className="overflow-hidden rounded-2xl shadow-sm">
-            <div className="flex items-start justify-between px-4 py-3">
-              <div>
-                <div className="text-2xl font-semibold tracking-tight">{inv.invoiceNumber}</div>
-                <div className="mt-1 text-sm text-muted-foreground">{inv.customerName ?? 'No Client'}</div>
-              </div>
-              <div className="text-right">
-                <div className="text-sm text-muted-foreground">{inv.status}</div>
-                <div className="mt-1 text-sm text-muted-foreground">{formatMMDDYYYY(inv.invoiceDate)}</div>
-              </div>
-            </div>
-            <div className="border-t border-border px-4 py-3">
-              <div className="flex justify-between text-sm">
-                <div className="text-muted-foreground">Sub Total</div>
-                <div className="text-foreground">{formatMoneyK(grossSubtotal)}</div>
-              </div>
-              <div className="mt-2 flex justify-between text-sm">
-                <div className="text-muted-foreground">Discount</div>
-                <div className="text-foreground">{formatMoneyK(discountTotal)}</div>
-              </div>
-              <div className="mt-2 flex justify-between text-sm">
-                <div className="text-muted-foreground">Tax</div>
-                <div className="text-foreground">{formatMoneyK(taxAmount)}</div>
-              </div>
-              <div className="mt-2 flex justify-between text-sm font-semibold">
-                <div className="text-foreground">Total</div>
-                <div className="text-foreground">{formatMoneyK(inv.total)}</div>
-              </div>
-              <div className="mt-2 flex justify-between text-sm">
-                <div className="text-muted-foreground">Payment Made</div>
-                <div className="text-foreground">{formatMoneyK(paid)}</div>
-              </div>
-              <div className="mt-2 flex justify-between text-sm font-semibold">
-                <div className="text-foreground">Balance Due</div>
-                <div className="text-foreground">{formatMoneyK(balance)}</div>
-              </div>
-              {/* netSubtotal is shown implicitly; keep for debugging parity if needed */}
-              <div className="mt-2 hidden text-xs text-muted-foreground">Net subtotal: {netSubtotal}</div>
-            </div>
-
-            {inv.lines?.length ? (
-              <div className="border-t border-border">
-                {inv.lines.map((l) => (
-                  <div key={l.id} className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-foreground">{l.description ?? 'Line'}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {toNumber(l.quantity)} × {formatMoneyK(l.unitPrice)}
-                        {toNumber((l as any).discountAmount ?? 0) > 0 ? `  •  Disc ${formatMoneyK((l as any).discountAmount)}` : ''}
-                      </div>
-                    </div>
-                    <div className="shrink-0 text-right text-sm font-semibold text-foreground">
-                      {formatMoneyK(
-                        Math.max(
-                          0,
-                          toNumber(l.quantity) * toNumber(l.unitPrice) - toNumber((l as any).discountAmount ?? 0)
-                        )
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
+              <InvoicePaper
+                invoice={{
+                  invoiceNumber: inv.invoiceNumber,
+                  status: inv.status,
+                  invoiceDate: inv.invoiceDate,
+                  dueDate: inv.dueDate,
+                  currency: (inv as any).currency ?? null,
+                  total: inv.total,
+                  totalPaid: (inv as any).totalPaid ?? (inv as any).amountPaid ?? 0,
+                  remainingBalance: (inv as any).remainingBalance ?? balance,
+                  customer: { name: inv.customerName ?? null },
+                  location: null,
+                  warehouse: null,
+                  customerNotes: (inv as any).customerNotes ?? null,
+                  termsAndConditions: (inv as any).termsAndConditions ?? null,
+                  taxAmount: (inv as any).taxAmount ?? 0,
+                  lines: (inv.lines ?? []).map((l: any) => ({
+                    id: l.id,
+                    quantity: l.quantity,
+                    unitPrice: l.unitPrice,
+                    discountAmount: (l as any).discountAmount ?? 0,
+                    description: l.description ?? null,
+                    item: null,
+                  })),
+                }}
+                companyName={companyName}
+                tz={tz}
+                template={template as any}
+              />
             </Card>
 
             {/* Actions */}
@@ -144,18 +196,21 @@ export default function InvoiceDetail() {
               {inv.status === 'DRAFT' ? (
                 <Button
                   className="w-full"
-                  onClick={async () => {
-                    await postInvoice(companyId, invoiceId);
-                    window.location.reload();
-                  }}
+                  type="button"
+                  disabled={postInvoiceMutation.isPending}
+                  onClick={() => postInvoiceMutation.mutate()}
                 >
-                  Post Invoice
+                  {postInvoiceMutation.isPending ? 'Posting…' : 'Post Invoice'}
                 </Button>
               ) : null}
+
+              {actionError ? <div className="mt-3 text-sm text-destructive">{actionError}</div> : null}
+              {shareError ? <div className="mt-3 text-sm text-destructive">{shareError}</div> : null}
 
               <Button
                 className={`${inv.status === 'DRAFT' ? 'mt-3' : ''} w-full`}
                 variant={inv.status === 'DRAFT' ? 'outline' : 'default'}
+                type="button"
                 onClick={() => navigate(`/invoices/${invoiceId}/payment`)}
               >
                 Record Payment

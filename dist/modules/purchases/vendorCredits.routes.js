@@ -19,16 +19,33 @@ export async function vendorCreditsRoutes(fastify) {
     // List vendor credits
     fastify.get('/companies/:companyId/vendor-credits', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        const query = (request.query ?? {});
+        const vendorIdRaw = query.vendorId ?? query.vendor_id ?? null;
+        const vendorId = vendorIdRaw === null || vendorIdRaw === undefined || vendorIdRaw === ''
+            ? null
+            : Number(vendorIdRaw);
+        if (vendorId !== null && (!Number.isInteger(vendorId) || vendorId <= 0)) {
+            reply.status(400);
+            return { error: 'invalid vendorId' };
+        }
+        const eligibleOnly = String(query.eligibleOnly ?? query.eligible ?? 'false').toLowerCase() === 'true';
+        const statusFilter = (query.status ? String(query.status).trim().toUpperCase() : null);
         const rows = await prisma.vendorCredit.findMany({
-            where: { companyId },
+            where: {
+                companyId,
+                ...(vendorId ? { vendorId } : {}),
+                ...(statusFilter ? { status: statusFilter } : {}),
+                ...(eligibleOnly ? { status: 'POSTED' } : {}),
+            },
             orderBy: [{ creditDate: 'desc' }, { id: 'desc' }],
             include: { vendor: true, location: true },
         });
-        return rows.map((c) => ({
+        const mapped = rows.map((c) => ({
             id: c.id,
             creditNumber: c.creditNumber,
             status: c.status,
             creditDate: c.creditDate,
+            vendorId: c.vendorId ?? null,
             vendorName: c.vendor?.name ?? null,
             locationName: c.location?.name ?? null,
             total: c.total.toString(),
@@ -36,6 +53,10 @@ export async function vendorCreditsRoutes(fastify) {
             remaining: new Prisma.Decimal(c.total).sub(new Prisma.Decimal(c.amountApplied)).toDecimalPlaces(2).toString(),
             createdAt: c.createdAt,
         }));
+        if (eligibleOnly) {
+            return mapped.filter((c) => Number(c.remaining) > 0);
+        }
+        return mapped;
     });
     // Create vendor credit (DRAFT)
     fastify.post('/companies/:companyId/vendor-credits', async (request, reply) => {

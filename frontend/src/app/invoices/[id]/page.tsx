@@ -6,7 +6,7 @@ import { useParams, useRouter } from "next/navigation"
 import { ArrowLeft, ChevronDown, Loader2, Pencil } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
-import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from "@/lib/api"
+import { createPublicInvoiceLink, fetchApi, getInvoiceTemplate, type InvoiceTemplate } from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -85,6 +85,8 @@ export default function InvoiceDetailPage() {
   const [refundModalOpen, setRefundModalOpen] = useState(false)
   const [refundPayment, setRefundPayment] = useState<any>(null)
   const [refundReason, setRefundReason] = useState("")
+  const [shareError, setShareError] = useState<string | null>(null)
+  const [sharing, setSharing] = useState(false)
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -144,6 +146,41 @@ export default function InvoiceDetailPage() {
       setPostError(err?.message ?? "Failed to post invoice")
     } finally {
       setPosting(false)
+    }
+  }
+
+  const shareInvoice = async () => {
+    if (!user?.companyId || !invoiceId) return
+    if (sharing) return
+    setShareError(null)
+    setSharing(true)
+    try {
+      const { token } = await createPublicInvoiceLink(user.companyId, Number(invoiceId))
+      const url = `${window.location.origin}/public/invoices/${encodeURIComponent(token)}`
+      const title = invoice?.invoiceNumber ? `Invoice ${invoice.invoiceNumber}` : "Invoice"
+      const text = invoice?.customer?.name ? `Invoice for ${invoice.customer.name}` : "Invoice link"
+
+      // Try native share sheet first (mobile). If it fails or is cancelled, fall back to copy/prompt.
+      if (navigator.share) {
+        try {
+          await navigator.share({ title, text, url })
+          return
+        } catch {
+          // ignore and fall back
+        }
+      }
+
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url)
+        window.alert("Invoice link copied.")
+        return
+      }
+
+      window.prompt("Copy invoice link:", url)
+    } catch (e: any) {
+      setShareError(e?.message ?? "Failed to generate share link")
+    } finally {
+      setSharing(false)
     }
   }
 
@@ -319,6 +356,10 @@ export default function InvoiceDetailPage() {
           <Button variant="outline" onClick={() => window.print()}>
             Print
           </Button>
+          <Button variant="outline" onClick={shareInvoice} disabled={sharing}>
+            {sharing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Share link
+          </Button>
           {invoice.status === "DRAFT" ? (
             <>
               <Link href={`/invoices/${invoice.id}/edit`}>
@@ -370,6 +411,8 @@ export default function InvoiceDetailPage() {
       {postError ? (
         <div className="no-print text-sm text-red-600">{postError}</div>
       ) : null}
+
+      {shareError ? <div className="no-print text-sm text-red-600">{shareError}</div> : null}
 
       {canApplyCredits ? (
         <div className="no-print rounded-lg border bg-background px-4 py-3">
