@@ -142,6 +142,12 @@ export type PublicInvoiceResponse = {
     name: string;
     timeZone: string | null;
     template: InvoiceTemplate;
+    paymentQrCodes?: {
+      kbz?: string | null;
+      ayaPay?: string | null;
+      uabPay?: string | null;
+      aPlus?: string | null;
+    };
   };
   invoice: {
     id: number;
@@ -180,6 +186,34 @@ export async function createPublicInvoiceLink(companyId: number, invoiceId: numb
 export async function getPublicInvoice(token: string): Promise<PublicInvoiceResponse> {
   const safe = encodeURIComponent(token);
   return fetchApi(`/public/invoices/${safe}`);
+}
+
+// Upload payment proof (public, no auth) - customer uploads after making payment
+export async function uploadPaymentProof(token: string, file: File, note?: string): Promise<{
+  success: boolean;
+  message: string;
+  proof: { url: string; submittedAt: string; note: string | null };
+}> {
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+  const safe = encodeURIComponent(token);
+  const formData = new FormData();
+  formData.append('file', file);
+  if (note) formData.append('note', note);
+
+  const res = await fetch(`${API_BASE_URL}/public/invoices/${safe}/payment-proof`, {
+    method: 'POST',
+    body: formData,
+    headers: {
+      'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    },
+  });
+
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload?.error || payload?.message || 'Failed to upload payment proof');
+  }
+
+  return res.json();
 }
 
 // Report types based on our backend response
@@ -734,5 +768,64 @@ export async function createExchangeRate(
   return fetchApi(`/companies/${companyId}/currencies/${code}/rates`, {
     method: 'POST',
     body: JSON.stringify(data),
+  });
+}
+
+// --- Payment QR Codes Management ---
+export type PaymentQrCodes = {
+  kbz?: string | null;
+  ayaPay?: string | null;
+  uabPay?: string | null;
+  aPlus?: string | null;
+};
+
+export async function getPaymentQrCodes(companyId: number): Promise<PaymentQrCodes> {
+  return fetchApi(`/companies/${companyId}/payment-qr-codes`);
+}
+
+export async function updatePaymentQrCodes(
+  companyId: number,
+  data: Partial<PaymentQrCodes>
+): Promise<PaymentQrCodes> {
+  return fetchApi(`/companies/${companyId}/payment-qr-codes`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function uploadPaymentQrCode(
+  companyId: number,
+  method: 'kbz' | 'ayaPay' | 'uabPay' | 'aPlus',
+  file: File
+): Promise<{ method: string; url: string; allQrCodes: PaymentQrCodes }> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+  const token = (await import('js-cookie')).default.get('token');
+  
+  const res = await fetch(`${API_BASE_URL}/companies/${companyId}/payment-qr-codes/${method}`, {
+    method: 'POST',
+    body: formData,
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    },
+  });
+
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload?.error || payload?.message || 'Failed to upload QR code');
+  }
+
+  return res.json();
+}
+
+export async function deletePaymentQrCode(
+  companyId: number,
+  method: 'kbz' | 'ayaPay' | 'uabPay' | 'aPlus'
+): Promise<PaymentQrCodes> {
+  return fetchApi(`/companies/${companyId}/payment-qr-codes/${method}`, {
+    method: 'DELETE',
   });
 }

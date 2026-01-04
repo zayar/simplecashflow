@@ -3,6 +3,7 @@ import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from '../books/invoiceAccounting.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
+import { ensureTaxPayableAccountIfNeeded } from '../../utils/tax.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { randomUUID } from 'node:crypto';
 async function ensureSalesIncomeAccount(tx, companyId) {
@@ -42,29 +43,6 @@ async function ensureCashAccount1000(tx, companyId) {
             type: AccountType.ASSET,
             normalBalance: 'DEBIT',
             reportGroup: 'CASH_AND_CASH_EQUIVALENTS',
-            cashflowActivity: 'OPERATING',
-        },
-        select: { id: true },
-    });
-    return created.id;
-}
-async function ensureTaxPayable2100IfNeeded(tx, companyId, taxAmount) {
-    if (!taxAmount || !taxAmount.greaterThan(0))
-        return null;
-    const existing = await tx.account.findFirst({
-        where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-        select: { id: true },
-    });
-    if (existing?.id)
-        return existing.id;
-    const created = await tx.account.create({
-        data: {
-            companyId,
-            code: '2100',
-            name: 'Tax Payable',
-            type: AccountType.LIABILITY,
-            normalBalance: 'CREDIT',
-            reportGroup: 'OTHER_CURRENT_LIABILITY',
             cashflowActivity: 'OPERATING',
         },
         select: { id: true },
@@ -291,7 +269,7 @@ export async function upsertPostedInvoiceFromPitiSale(args) {
             include: { lines: true },
         });
         // Post JE for invoice
-        const taxPayableAccountId = await ensureTaxPayable2100IfNeeded(tx, companyId, taxAmount);
+        const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
         const jeLines = buildInvoicePostingJournalLines({
             arAccountId: company.accountsReceivableAccountId,
             total,
@@ -740,7 +718,7 @@ export async function upsertPostedCreditNoteFromPitiRefund(args) {
                 lines: { create: computedLines },
             },
         });
-        const taxPayableAccountId = await ensureTaxPayable2100IfNeeded(tx, companyId, taxAmount);
+        const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
         // JE for credit note:
         // - Debit income (reverse revenue)
         // - Debit tax payable (reverse tax liability)

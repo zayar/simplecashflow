@@ -15,6 +15,23 @@ export type TaxCalculationResult = {
     total: Prisma.Decimal;
 };
 /**
+ * Pick the first unused numeric account code within [start, end].
+ * (Pure helper so we can unit-test code selection without a DB.)
+ */
+export declare function pickFirstUnusedNumericCode(usedCodes: Set<string>, start: number, end: number): string;
+/**
+ * Ensures the company has a dedicated Tax Payable account (LIABILITY) and returns its id.
+ *
+ * Important: Do NOT assume a fixed code like 2100. Some tenants may already use 2100 for
+ * other liabilities (e.g. Customer Advance), which would cause tax to post to the wrong account.
+ *
+ * Strategy:
+ * - Prefer an existing LIABILITY account named "Tax Payable"
+ * - Otherwise create one, using code 2100 if free; else pick the next free numeric code in 2101..2999
+ */
+export declare function ensureTaxPayableAccount(tx: any, companyId: number): Promise<number>;
+export declare function ensureTaxPayableAccountIfNeeded(tx: any, companyId: number, taxAmount: Prisma.Decimal | number | string | null | undefined): Promise<number | null>;
+/**
  * Calculate tax for a single line item.
  * @param subtotal - Line subtotal before tax (qty * unitPrice)
  * @param taxRate - Tax rate as decimal (e.g., 0.10 for 10%)

@@ -3,6 +3,9 @@ import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-do
 import { fetchApi } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import type { AuthResponse } from '../lib/types';
+import { Card } from '../components/ui/card';
+import { Input } from '../components/ui/input';
+import { Button } from '../components/ui/button';
 
 export default function Login() {
   const { login } = useAuth();
@@ -12,6 +15,7 @@ export default function Login() {
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -41,67 +45,83 @@ export default function Login() {
   }
 
   return (
-    <div className="min-h-dvh px-4 py-8">
+    <div className="min-h-dvh bg-background px-4 py-8">
       <div className="mx-auto w-full max-w-md">
-        <div className="mb-6">
-          <div className="text-sm text-slate-400">Cashflow</div>
-          <h1 className="text-2xl font-semibold">Sign in</h1>
-          <p className="mt-1 text-sm text-slate-400">Use your existing backend account.</p>
+        <div className="mb-6 text-center">
+          <div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-primary text-primary-foreground shadow-sm">
+            <span className="text-lg font-semibold">CF</span>
+          </div>
+          <h1 className="mt-4 text-2xl font-semibold tracking-tight text-foreground">Welcome back</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Sign in to continue</p>
         </div>
 
         {banner ? (
-          <div className="mb-4 rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-sm text-slate-200">
+          <Card className="mb-4 rounded-2xl border border-border bg-background px-4 py-3 text-sm text-foreground shadow-sm">
             {banner}
-          </div>
+          </Card>
         ) : null}
 
-        <form onSubmit={onSubmit} className="space-y-4">
-          <div>
-            <label className="mb-1 block text-sm text-slate-300">Email</label>
-            <input
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              type="email"
-              required
-              className="w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-3 text-slate-100 outline-none focus:border-sky-500"
-              placeholder="you@company.com"
-              autoComplete="email"
-            />
-          </div>
+        <Card className="rounded-2xl p-4 shadow-sm">
+          <form onSubmit={onSubmit} className="space-y-4">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-foreground">Email</label>
+              <Input
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                type="email"
+                required
+                placeholder="you@company.com"
+                autoComplete="email"
+                inputMode="email"
+              />
+            </div>
 
-          <div>
-            <label className="mb-1 block text-sm text-slate-300">Password</label>
-            <input
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              type="password"
-              required
-              className="w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-3 text-slate-100 outline-none focus:border-sky-500"
-              placeholder="••••••••"
-              autoComplete="current-password"
-            />
-            <p className="mt-2 text-xs text-slate-500">
-              Backend policy requires 8+ chars with upper/lower/number.
-            </p>
-          </div>
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <label className="block text-sm font-medium text-foreground">Password</label>
+                <button
+                  type="button"
+                  className="text-xs font-medium text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowPassword((v) => !v)}
+                >
+                  {showPassword ? 'Hide' : 'Show'}
+                </button>
+              </div>
+              <Input
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                type={showPassword ? 'text' : 'password'}
+                required
+                placeholder="••••••••"
+                autoComplete="current-password"
+              />
+              <p className="mt-2 text-xs text-muted-foreground">
+                Password must be 8+ characters with upper/lowercase and a number.
+              </p>
+            </div>
 
-          {error ? <div className="text-sm text-rose-400">{error}</div> : null}
+            {error ? (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {error}
+              </div>
+            ) : null}
 
-          <button
-            disabled={isSubmitting}
-            className="w-full rounded-xl bg-sky-500 px-4 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60"
-            type="submit"
-          >
-            {isSubmitting ? 'Signing in…' : 'Sign in'}
-          </button>
+            <Button disabled={isSubmitting} className="w-full" type="submit">
+              {isSubmitting ? 'Signing in…' : 'Sign in'}
+            </Button>
 
-          <div className="text-center text-sm text-slate-400">
-            No account?{' '}
-            <Link to="/register" className="text-slate-200 underline underline-offset-4">
-              Create one
-            </Link>
-          </div>
-        </form>
+            <div className="text-center text-sm text-muted-foreground">
+              No account?{' '}
+              <Link to="/register" className="font-medium text-foreground underline underline-offset-4">
+                Create one
+              </Link>
+            </div>
+          </form>
+        </Card>
+
+        <div className="mt-6 text-center text-xs text-muted-foreground">
+          By continuing, you agree to your company’s internal usage policy.
+        </div>
       </div>
     </div>
   );

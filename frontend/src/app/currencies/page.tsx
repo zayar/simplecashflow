@@ -56,9 +56,10 @@ export default function CurrenciesPage() {
   const [overview, setOverview] = useState<CurrenciesOverview | null>(null)
 
   const baseCurrency = useMemo(() => {
-    const cur = (companySettings?.baseCurrency ?? "").trim().toUpperCase()
+    // Prefer freshest value from overview; fall back to auth context snapshot.
+    const cur = (overview?.baseCurrency ?? companySettings?.baseCurrency ?? "").trim().toUpperCase()
     return cur || null
-  }, [companySettings?.baseCurrency])
+  }, [overview?.baseCurrency, companySettings?.baseCurrency])
 
   const [newCurrency, setNewCurrency] = useState({ code: "", name: "", symbol: "" })
 

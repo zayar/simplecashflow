@@ -3,6 +3,7 @@ import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from '../books/invoiceAccounting.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
+import { ensureTaxPayableAccountIfNeeded } from '../../utils/tax.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { randomUUID } from 'node:crypto';
 
@@ -53,27 +54,8 @@ async function ensureCashAccount1000(tx: Tx, companyId: number): Promise<number>
   return created.id;
 }
 
-async function ensureTaxPayable2100IfNeeded(tx: Tx, companyId: number, taxAmount: Prisma.Decimal): Promise<number | null> {
-  if (!taxAmount || !taxAmount.greaterThan(0)) return null;
-  const existing = await tx.account.findFirst({
-    where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-    select: { id: true },
-  });
-  if (existing?.id) return existing.id;
-  const created = await tx.account.create({
-    data: {
-      companyId,
-      code: '2100',
-      name: 'Tax Payable',
-      type: AccountType.LIABILITY,
-      normalBalance: 'CREDIT',
-      reportGroup: 'OTHER_CURRENT_LIABILITY',
-      cashflowActivity: 'OPERATING',
-    },
-    select: { id: true },
-  });
-  return created.id;
-}
+// NOTE: Tax Payable must NOT be hard-coded to code 2100.
+// Some tenants use 2100 for other liabilities (e.g. Customer Advance), which would cause tax to post incorrectly.
 
 export type PitiSaleUpsertRequest = {
   saleId: string;
@@ -392,7 +374,7 @@ export async function upsertPostedInvoiceFromPitiSale(args: {
     });
 
     // Post JE for invoice
-    const taxPayableAccountId = await ensureTaxPayable2100IfNeeded(tx, companyId, taxAmount);
+    const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
     const jeLines = buildInvoicePostingJournalLines({
       arAccountId: company.accountsReceivableAccountId,
       total,
@@ -871,7 +853,7 @@ export async function upsertPostedCreditNoteFromPitiRefund(args: {
       } as any,
     });
 
-    const taxPayableAccountId = await ensureTaxPayable2100IfNeeded(tx, companyId, taxAmount);
+    const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
 
     // JE for credit note:
     // - Debit income (reverse revenue)

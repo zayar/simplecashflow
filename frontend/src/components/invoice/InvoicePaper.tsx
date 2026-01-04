@@ -52,11 +52,19 @@ export function InvoicePaper({
   companyName,
   tz,
   template,
+  displayCurrency,
+  baseCurrency,
+  fxRateToBase,
 }: {
   invoice: InvoiceLike
   companyName: string
   tz: string
   template: InvoiceTemplate | null
+  // Optional: display invoice in a different currency (UI-only).
+  // When provided with fxRateToBase, amounts are converted from baseCurrency to displayCurrency.
+  displayCurrency?: string | null
+  baseCurrency?: string | null
+  fxRateToBase?: number | null
 }) {
   const t: InvoiceTemplate = template ?? {
     version: 1,
@@ -70,6 +78,17 @@ export function InvoicePaper({
   }
 
   const invoiceLines = (invoice.lines ?? []) as any[]
+  const baseCur = (baseCurrency ?? invoice.currency ?? "").trim() || null
+  const dispCur = (displayCurrency ?? baseCur ?? invoice.currency ?? "").trim() || null
+  const fx = typeof fxRateToBase === "number" ? fxRateToBase : Number(fxRateToBase ?? 0)
+  const showFx = !!(baseCur && dispCur && baseCur !== dispCur && Number.isFinite(fx) && fx > 0)
+
+  const toDisp = (n: any) => {
+    const num = Number(n ?? 0)
+    if (!showFx) return num
+    return num / fx
+  }
+
   const grossSubtotal = invoiceLines.reduce((sum: number, l: any) => {
     const qty = Number(l.quantity ?? 0)
     const rate = Number(l.unitPrice ?? 0)
@@ -130,8 +149,14 @@ export function InvoicePaper({
           <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
             <div className="text-xs font-medium text-muted-foreground">Balance Due</div>
             <div className="text-lg font-semibold tabular-nums">
-              {formatMoneyWithCurrency((invoice as any).remainingBalance, invoice.currency ?? undefined)}
+              {formatMoneyWithCurrency(toDisp((invoice as any).remainingBalance), dispCur ?? undefined)}
             </div>
+            {showFx ? (
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                Exchange rate: 1 {dispCur} = {baseCur}
+                {formatMoney(fx)}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -202,16 +227,16 @@ export function InvoicePaper({
                       {showDesc ? <div className="mt-1 text-xs text-muted-foreground">{desc}</div> : null}
                       {discount > 0 ? (
                         <div className="mt-1 text-xs text-muted-foreground">
-                          Discount: {formatMoneyWithCurrency(discount, invoice.currency ?? undefined)}
+                          Discount: {formatMoneyWithCurrency(toDisp(discount), dispCur ?? undefined)}
                         </div>
                       ) : null}
                     </td>
                     <td className="px-4 py-3 text-right font-medium tabular-nums">{formatMoney(qty)}</td>
                     <td className="px-4 py-3 text-right font-medium tabular-nums">
-                      {formatMoneyWithCurrency(rate, invoice.currency ?? undefined)}
+                      {formatMoneyWithCurrency(toDisp(rate), dispCur ?? undefined)}
                     </td>
                     <td className="px-4 py-3 text-right font-medium tabular-nums">
-                      {formatMoneyWithCurrency(amount, invoice.currency ?? undefined)}
+                      {formatMoneyWithCurrency(toDisp(amount), dispCur ?? undefined)}
                     </td>
                   </tr>
                 )
@@ -251,37 +276,37 @@ export function InvoicePaper({
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Sub Total</span>
               <span className="font-medium tabular-nums">
-                {formatMoneyWithCurrency(grossSubtotal, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp(grossSubtotal), dispCur ?? undefined)}
               </span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Discount</span>
               <span className="font-medium tabular-nums">
-                {formatMoneyWithCurrency(discountTotal, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp(discountTotal), dispCur ?? undefined)}
               </span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Tax</span>
               <span className="font-medium tabular-nums">
-                {formatMoneyWithCurrency(taxAmount, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp(taxAmount), dispCur ?? undefined)}
               </span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Total</span>
               <span className="font-semibold tabular-nums">
-                {formatMoneyWithCurrency((invoice as any).total, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp((invoice as any).total), dispCur ?? undefined)}
               </span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">Payment Made</span>
               <span className="font-medium tabular-nums">
-                {formatMoneyWithCurrency((invoice as any).totalPaid, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp((invoice as any).totalPaid), dispCur ?? undefined)}
               </span>
             </div>
             <div className="mt-2 flex items-center justify-between border-t pt-2">
               <span className="font-semibold">Balance Due</span>
               <span className="font-semibold tabular-nums">
-                {formatMoneyWithCurrency((invoice as any).remainingBalance, invoice.currency ?? undefined)}
+                {formatMoneyWithCurrency(toDisp((invoice as any).remainingBalance), dispCur ?? undefined)}
               </span>
             </div>
           </div>

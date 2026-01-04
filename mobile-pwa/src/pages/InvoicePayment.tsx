@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
 import { getBankingAccounts, getInvoice, recordInvoicePayment, type BankingAccountRow } from '../lib/ar';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
@@ -27,6 +27,7 @@ export default function InvoicePayment() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const params = useParams();
   const invoiceId = Number(params.id ?? 0);
 
@@ -49,6 +50,7 @@ export default function InvoicePayment() {
   const [bankAccountId, setBankAccountId] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedAttachmentUrl, setSelectedAttachmentUrl] = useState<string | null>(null);
 
   React.useEffect(() => {
     if (!inv) return;
@@ -86,12 +88,19 @@ export default function InvoicePayment() {
         paymentMode,
         paymentDate,
         amount: amt,
-        bankAccountId: Number(bankAccountId)
+        bankAccountId: Number(bankAccountId),
+        attachmentUrl: selectedAttachmentUrl || undefined,
       });
+      
+      // Invalidate queries so the invoice detail page shows updated data
+      await queryClient.invalidateQueries({ queryKey: ['invoice', companyId, invoiceId] });
+      await queryClient.invalidateQueries({ queryKey: ['invoices', companyId] });
+      
+      // Reset state and navigate back to invoice detail
+      setIsSubmitting(false);
       navigate(`/invoices/${invoiceId}`, { replace: true });
     } catch (err: any) {
       setError(err?.message ?? 'Failed to record payment');
-    } finally {
       setIsSubmitting(false);
     }
   }
@@ -138,6 +147,54 @@ export default function InvoicePayment() {
                 : 'Payments allowed only for POSTED or PARTIAL invoices.'}
             </div>
           ) : null}
+
+          {/* Customer Payment Proofs */}
+          {inv && Array.isArray((inv as any)?.pendingPaymentProofs) && (inv as any).pendingPaymentProofs.length > 0 && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3">
+              <div className="mb-2 flex items-center gap-2 text-sm font-medium text-amber-800">
+                <span>📷</span> Customer Proofs
+                <span className="rounded-full bg-amber-200 px-1.5 py-0.5 text-xs">
+                  {(inv as any).pendingPaymentProofs.length}
+                </span>
+              </div>
+              <p className="mb-2 text-xs text-amber-700">Select a proof to attach:</p>
+              <div className="grid grid-cols-4 gap-2">
+                {(inv as any).pendingPaymentProofs.map((proof: any, idx: number) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => setSelectedAttachmentUrl(
+                      selectedAttachmentUrl === proof.url ? null : proof.url
+                    )}
+                    className={`relative aspect-square overflow-hidden rounded-lg border-2 ${
+                      selectedAttachmentUrl === proof.url
+                        ? 'border-blue-500 ring-2 ring-blue-200'
+                        : 'border-gray-200'
+                    }`}
+                  >
+                    <img
+                      src={proof.url}
+                      alt={`Proof ${idx + 1}`}
+                      className="h-full w-full object-cover"
+                    />
+                    {selectedAttachmentUrl === proof.url && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-blue-500/20">
+                        <span className="rounded-full bg-blue-500 p-0.5 text-white text-xs">✓</span>
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+              {selectedAttachmentUrl && (
+                <div className="mt-2 flex items-center justify-between text-xs text-green-700">
+                  <span>✓ Proof selected</span>
+                  <button type="button" onClick={() => setSelectedAttachmentUrl(null)} className="text-gray-500">
+                    Clear
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
 
           <form onSubmit={onSubmit} className="mt-3 space-y-4">
             <div className="grid gap-2">

@@ -136,6 +136,9 @@ model Company {
   name                 String
   // Invoice print/template customization (simple JSON blob; evolve with versioning).
   invoiceTemplate      Json?
+  // Payment method QR codes for customer self-service payments.
+  // JSON: { kbz?: string, ayaPay?: string, uabPay?: string, aPlus?: string }
+  paymentQrCodes       Json?
   // --- Company profile / reporting preferences ---
   // Base currency for the tenant. Treat as immutable after transactions exist.
   baseCurrency         String? // e.g. "MMK"
@@ -644,6 +647,10 @@ model Invoice {
   // Denormalized for performance (avoid summing Payment table on every payment record).
   amountPaid         Decimal       @default(0) @db.Decimal(18, 2)
 
+  // Customer-submitted payment proofs (before payment is recorded by owner).
+  // JSON array: [{ url: string, submittedAt: string, note?: string }]
+  pendingPaymentProofs Json?
+
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
 
@@ -815,6 +822,9 @@ model Payment {
 
   bankAccountId Int
   bankAccount   Account @relation("Payment_BankAccount", fields: [bankAccountId], references: [id])
+
+  // Optional payment proof attachment (screenshot, receipt image)
+  attachmentUrl String? @db.Text
 
   journalEntryId Int?          @unique
   journalEntry   JournalEntry? @relation("Payment_JournalEntry", fields: [journalEntryId], references: [id])
@@ -1102,6 +1112,9 @@ model PurchaseBillLine {
   description String?
   quantity    Decimal @db.Decimal(18, 2)
   unitCost    Decimal @db.Decimal(18, 2)
+  // Absolute discount amount for this line (in document currency).
+  // Applied as: lineTotal = quantity * unitCost - discountAmount
+  discountAmount Decimal @default(0) @db.Decimal(18, 2)
   lineTotal   Decimal @db.Decimal(18, 2)
 
   @@index([companyId])

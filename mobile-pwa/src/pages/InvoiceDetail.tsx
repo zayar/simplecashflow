@@ -46,8 +46,15 @@ export default function InvoiceDetail() {
       setActionError(null);
     },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ['invoice', companyId, invoiceId] });
-      await invoiceQuery.refetch();
+      // Invalidate and refetch the invoice data to update the UI
+      try {
+        await queryClient.invalidateQueries({ queryKey: ['invoice', companyId, invoiceId] });
+        await queryClient.invalidateQueries({ queryKey: ['invoices', companyId] });
+        await invoiceQuery.refetch();
+      } catch (e) {
+        // If refetch fails, at least the mutation succeeded - user can refresh
+        console.warn('Refetch after post failed:', e);
+      }
     },
     onError: (err) => {
       const msg = err instanceof Error ? err.message : 'Failed to post invoice.';
@@ -191,6 +198,39 @@ export default function InvoiceDetail() {
               />
             </Card>
 
+            {/* Customer Payment Proofs */}
+            {Array.isArray((inv as any)?.pendingPaymentProofs) && (inv as any).pendingPaymentProofs.length > 0 && (
+              <Card className="rounded-2xl border-amber-200 bg-amber-50/50 p-4 shadow-sm">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="text-lg">📷</span>
+                  <span className="font-medium text-amber-800">Customer Payment Proofs</span>
+                  <span className="rounded-full bg-amber-200 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    {(inv as any).pendingPaymentProofs.length}
+                  </span>
+                </div>
+                <p className="mb-3 text-xs text-amber-700">
+                  Your customer has uploaded payment screenshots. Tap to view, then record the payment.
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  {(inv as any).pendingPaymentProofs.map((proof: any, idx: number) => (
+                    <a
+                      key={idx}
+                      href={proof.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="aspect-square overflow-hidden rounded-lg border-2 border-amber-200 bg-white"
+                    >
+                      <img
+                        src={proof.url}
+                        alt={`Proof ${idx + 1}`}
+                        className="h-full w-full object-cover"
+                      />
+                    </a>
+                  ))}
+                </div>
+              </Card>
+            )}
+
             {/* Actions */}
             <Card className="rounded-2xl p-4 shadow-sm">
               {inv.status === 'DRAFT' ? (
@@ -207,14 +247,27 @@ export default function InvoiceDetail() {
               {actionError ? <div className="mt-3 text-sm text-destructive">{actionError}</div> : null}
               {shareError ? <div className="mt-3 text-sm text-destructive">{shareError}</div> : null}
 
-              <Button
-                className={`${inv.status === 'DRAFT' ? 'mt-3' : ''} w-full`}
-                variant={inv.status === 'DRAFT' ? 'outline' : 'default'}
-                type="button"
-                onClick={() => navigate(`/invoices/${invoiceId}/payment`)}
-              >
-                Record Payment
-              </Button>
+              {/* Only show Record Payment for invoices that can still receive payments */}
+              {inv.status !== 'PAID' && inv.status !== 'VOID' ? (
+                <Button
+                  className={`${inv.status === 'DRAFT' ? 'mt-3' : ''} w-full`}
+                  variant={inv.status === 'DRAFT' ? 'outline' : 'default'}
+                  type="button"
+                  onClick={() => navigate(`/invoices/${invoiceId}/payment`)}
+                >
+                  Record Payment
+                </Button>
+              ) : null}
+
+              {/* Show paid status indicator when fully paid */}
+              {inv.status === 'PAID' ? (
+                <div className="flex items-center justify-center gap-2 rounded-xl bg-green-50 p-3 text-green-700">
+                  <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span className="font-medium">Fully Paid</span>
+                </div>
+              ) : null}
             </Card>
           </div>
         )}

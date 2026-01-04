@@ -143,7 +143,7 @@ export function HeroSection() {
             <CardContent className="relative p-0">
               <div aria-hidden className="absolute inset-0 bg-gradient-to-b from-primary/10 via-transparent to-transparent" />
               <Image
-                src="/images/dashboard-preview.png"
+                src="/images/dashboard-preview.png?v=2"
                 alt="Cashflow dashboard preview"
                 width={1600}
                 height={1000}

@@ -465,12 +465,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
     return invoices.map((inv) => ({
       id: inv.id,
       invoiceNumber: inv.invoiceNumber,
-      customerName: inv.customer.name,
+      customerName: inv.customer ? inv.customer.name : null,
       status: inv.status,
       total: inv.total,
       invoiceDate: inv.invoiceDate,
       dueDate: inv.dueDate,
       createdAt: inv.createdAt,
+      hasPendingPaymentProof: Array.isArray((inv as any).pendingPaymentProofs) && (inv as any).pendingPaymentProofs.length > 0,
+      pendingPaymentProofCount: Array.isArray((inv as any).pendingPaymentProofs) ? (inv as any).pendingPaymentProofs.length : 0,
     }));
   });
 
@@ -602,11 +604,15 @@ export async function booksRoutes(fastify: FastifyInstance) {
           code: p.bankAccount.code,
           name: p.bankAccount.name,
         },
+        attachmentUrl: (p as any).attachmentUrl ?? null,
         journalEntryId: p.journalEntry?.id ?? null,
         reversedAt: (p as any).reversedAt ?? null,
         reversalReason: (p as any).reversalReason ?? null,
         reversalJournalEntryId: (p as any).reversalJournalEntryId ?? null,
       })),
+      pendingPaymentProofs: Array.isArray((invoice as any).pendingPaymentProofs) 
+        ? (invoice as any).pendingPaymentProofs 
+        : [],
       creditsApplied: (invoice.customerAdvanceApplications ?? []).map((a: any) => ({
         id: a.id,
         appliedDate: a.appliedDate,
@@ -2303,6 +2309,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       amount?: number;
       bankAccountId?: number;
       paymentMode?: 'CASH' | 'BANK' | 'E_WALLET';
+      attachmentUrl?: string; // Payment proof image URL
     };
 
     if (!body.amount || body.amount <= 0 || !body.bankAccountId) {
@@ -2454,6 +2461,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   ],
                 });
 
+                // Validate attachment URL if provided (must be from our GCS bucket)
+                const attachmentUrl = (typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim())
+                  ? body.attachmentUrl.trim()
+                  : null;
+
                 const payment = await tx.payment.create({
                   data: {
                     companyId,
@@ -2462,8 +2474,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
                     amount,
                     bankAccountId: bankAccount.id,
                     journalEntryId: journalEntry.id,
+                    attachmentUrl,
                   },
                 });
+
+                // If attachmentUrl was from pendingPaymentProofs, remove it from the list
+                if (attachmentUrl && Array.isArray(invoice.pendingPaymentProofs)) {
+                  const remainingProofs = (invoice.pendingPaymentProofs as any[]).filter(
+                    (p: any) => p?.url !== attachmentUrl
+                  );
+                  await tx.invoice.updateMany({
+                    where: { id: invoice.id, companyId },
+                    data: { pendingPaymentProofs: remainingProofs.length > 0 ? remainingProofs : Prisma.DbNull },
+                  });
+                }
 
                 // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
                 const sumAgg = await tx.payment.aggregate({
@@ -2874,6 +2898,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       bankAccountName: (p as any).bankAccount ? `${(p as any).bankAccount.code} - ${(p as any).bankAccount.name}` : null,
       journalEntryId: p.journalEntryId ?? null,
       reversedAt: p.reversedAt ?? null,
+      attachmentUrl: (p as any).attachmentUrl ?? null,
     }));
   });
 

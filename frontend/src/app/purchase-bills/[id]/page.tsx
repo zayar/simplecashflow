@@ -243,6 +243,7 @@ export default function PurchaseBillDetailPage() {
                   <TableHead>Account</TableHead>
                   <TableHead className="w-[140px] text-right">Qty</TableHead>
                   <TableHead className="w-[180px] text-right">Unit Cost</TableHead>
+                  <TableHead className="w-[160px] text-right">Discount</TableHead>
                   <TableHead className="w-[160px] text-right">Line Total</TableHead>
                 </TableRow>
               </TableHeader>
@@ -255,12 +256,13 @@ export default function PurchaseBillDetailPage() {
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{Number(l.quantity ?? 0).toLocaleString()}</TableCell>
                     <TableCell className="text-right tabular-nums">{Number(l.unitCost ?? 0).toLocaleString()}</TableCell>
+                    <TableCell className="text-right tabular-nums">{Number(l.discountAmount ?? 0).toLocaleString()}</TableCell>
                     <TableCell className="text-right font-medium tabular-nums">{Number(l.lineTotal ?? 0).toLocaleString()}</TableCell>
                   </TableRow>
                 ))}
                 {(bill?.lines ?? []).length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={5} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
                       No lines.
                     </TableCell>
                   </TableRow>

@@ -6,7 +6,13 @@ import { useParams, useRouter } from "next/navigation"
 import { ArrowLeft, ChevronDown, Loader2, Pencil } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
-import { createPublicInvoiceLink, fetchApi, getInvoiceTemplate, type InvoiceTemplate } from "@/lib/api"
+import {
+  createPublicInvoiceLink,
+  fetchApi,
+  getExchangeRates,
+  getInvoiceTemplate,
+  type InvoiceTemplate,
+} from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -76,6 +82,7 @@ export default function InvoiceDetailPage() {
   const [invoice, setInvoice] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [template, setTemplate] = useState<InvoiceTemplate | null>(null)
+  const [fxInfo, setFxInfo] = useState<{ displayCurrency: string; rateToBase: number; asOfDate: string | null } | null>(null)
   const [posting, setPosting] = useState(false)
   const [postError, setPostError] = useState<string | null>(null)
   const [reversingPaymentId, setReversingPaymentId] = useState<number | null>(
@@ -87,6 +94,10 @@ export default function InvoiceDetailPage() {
   const [refundReason, setRefundReason] = useState("")
   const [shareError, setShareError] = useState<string | null>(null)
   const [sharing, setSharing] = useState(false)
+
+  // Payment proof viewer (thumbnail -> modal)
+  const [proofViewerOpen, setProofViewerOpen] = useState(false)
+  const [activeProof, setActiveProof] = useState<any>(null)
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -107,10 +118,63 @@ export default function InvoiceDetailPage() {
     }
   }
 
+  const baseCurrency = useMemo(() => {
+    const cur = (companySettings?.baseCurrency ?? "").trim().toUpperCase()
+    return cur || null
+  }, [companySettings?.baseCurrency])
+
+  const customerCurrency = useMemo(() => {
+    const cur = (invoice?.customer?.currency ?? "").trim().toUpperCase()
+    return cur || null
+  }, [invoice?.customer?.currency])
+
   useEffect(() => {
     loadInvoice()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId, invoiceId])
+
+  // FX (display-only): if customer currency differs from base currency, fetch the latest rate.
+  useEffect(() => {
+    if (!user?.companyId) return
+    if (!baseCurrency || !customerCurrency) {
+      setFxInfo(null)
+      return
+    }
+    if (customerCurrency === baseCurrency) {
+      setFxInfo(null)
+      return
+    }
+
+    let cancelled = false
+    getExchangeRates(user.companyId, customerCurrency)
+      .then((rows) => {
+        if (cancelled) return
+        const invoiceDateStr = String(invoice?.invoiceDate ?? "").slice(0, 10)
+        const invoiceDate = invoiceDateStr ? new Date(invoiceDateStr) : null
+        const pick =
+          (rows ?? []).find((r) => {
+            if (!invoiceDate) return true
+            const d = new Date(String((r as any).asOfDate ?? ""))
+            if (Number.isNaN(d.getTime())) return false
+            return d.getTime() <= invoiceDate.getTime()
+          }) ?? (rows ?? [])[0]
+
+        const rate = pick ? Number((pick as any).rateToBase) : 0
+        if (!pick || !Number.isFinite(rate) || rate <= 0) {
+          setFxInfo(null)
+          return
+        }
+        setFxInfo({ displayCurrency: customerCurrency, rateToBase: rate, asOfDate: (pick as any).asOfDate ?? null })
+      })
+      .catch(() => {
+        if (cancelled) return
+        setFxInfo(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [user?.companyId, baseCurrency, customerCurrency, invoice?.invoiceDate])
 
   useEffect(() => {
     if (!user?.companyId) return
@@ -430,11 +494,120 @@ export default function InvoiceDetailPage() {
         </div>
       ) : null}
 
+      {/* Pending Payment Proofs from Customer */}
+      {Array.isArray(invoice?.pendingPaymentProofs) && invoice.pendingPaymentProofs.length > 0 && (
+        <Card className="no-print border-amber-200 bg-amber-50/40">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <span className="text-lg">📷</span>
+              Customer Payment Proofs
+              <Badge variant="secondary" className="bg-amber-100 text-amber-700">
+                {invoice.pendingPaymentProofs.length} pending
+              </Badge>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground">
+              Customer uploaded proof images. Click a thumbnail to preview; then record the payment.
+            </p>
+
+            {/* Compact, non-overwhelming thumbnail strip (prevents giant tiles on wide screens) */}
+            <div className="mt-4 flex gap-3 overflow-x-auto pb-2">
+              {invoice.pendingPaymentProofs.map((proof: any, idx: number) => (
+                <button
+                  key={`${proof?.url ?? idx}`}
+                  type="button"
+                  onClick={() => {
+                    setActiveProof({ ...proof, idx })
+                    setProofViewerOpen(true)
+                  }}
+                  className="group relative h-28 w-28 shrink-0 overflow-hidden rounded-lg border bg-white shadow-sm transition hover:border-amber-300 hover:shadow-md"
+                  title="Click to preview"
+                >
+                  <img
+                    src={proof.url}
+                    alt={`Payment proof ${idx + 1}`}
+                    className="h-full w-full object-cover"
+                    loading="lazy"
+                  />
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/65 to-transparent px-2 pb-1 pt-6 text-left opacity-0 transition group-hover:opacity-100">
+                    <div className="text-[11px] font-medium text-white">
+                      Proof {idx + 1}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-2 text-xs text-muted-foreground">
+              Tip: You can attach one of these proofs when recording a payment.
+            </div>
+
+            {canReceivePayment && (
+              <div className="mt-4 pt-4 border-t border-amber-200">
+                <Link href={`/invoices/${invoice.id}/payment`}>
+                  <Button className="w-full sm:w-auto">
+                    Record Payment with Proof
+                  </Button>
+                </Link>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Proof viewer modal */}
+      <Dialog open={proofViewerOpen} onOpenChange={(o) => { setProofViewerOpen(o); if (!o) setActiveProof(null) }}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Payment proof</DialogTitle>
+            <DialogDescription>
+              {activeProof?.submittedAt ? formatDateInTimeZone(activeProof.submittedAt, tz) : "—"}
+              {activeProof?.note ? ` • ${activeProof.note}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {activeProof?.url ? (
+            <div className="overflow-hidden rounded-lg border bg-white">
+              <img
+                src={activeProof.url}
+                alt={`Payment proof ${Number(activeProof.idx ?? 0) + 1}`}
+                className="max-h-[70vh] w-full object-contain"
+              />
+            </div>
+          ) : null}
+
+          <DialogFooter className="gap-2 sm:gap-0">
+            {activeProof?.url ? (
+              <a
+                href={activeProof.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={cn(buttonVariants({ variant: "outline" }))}
+              >
+                Open original
+              </a>
+            ) : null}
+            <Button type="button" onClick={() => setProofViewerOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Invoice paper preview */}
       <div className="print-area rounded-lg border bg-muted/20 p-4 sm:p-6">
         <div className="print-paper mx-auto max-w-4xl rounded-lg border bg-white shadow-sm">
           <div className="p-0">
-            <InvoicePaper invoice={invoice} companyName={companyName} tz={tz} template={template} />
+            <InvoicePaper
+              invoice={invoice}
+              companyName={companyName}
+              tz={tz}
+              template={template}
+              displayCurrency={fxInfo?.displayCurrency ?? null}
+              baseCurrency={baseCurrency ?? invoice?.currency ?? null}
+              fxRateToBase={fxInfo?.rateToBase ?? null}
+            />
 
             {/* Payment info */}
             {(invoice.payments ?? []).length > 0 ? (
@@ -463,7 +636,20 @@ export default function InvoiceDetailPage() {
                               {formatDateInTimeZone(p.paymentDate, tz)}
                             </td>
                             <td className="px-4 py-2">
-                              <div className="font-medium">{p.bankAccount?.name ?? "—"}</div>
+                              <div className="font-medium">
+                                {p.bankAccount?.name ?? "—"}
+                                {p.attachmentUrl && (
+                                  <a
+                                    href={p.attachmentUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="ml-2 inline-flex items-center text-blue-600 hover:text-blue-800"
+                                    title="View payment proof"
+                                  >
+                                    📎
+                                  </a>
+                                )}
+                              </div>
                               <div className="mt-1">
                                 {isReversed ? (
                                   <Badge variant="destructive">Reversed</Badge>

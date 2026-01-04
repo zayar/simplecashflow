@@ -467,8 +467,15 @@ export async function applyStockMoveWac(tx, input) {
         };
     }
     // IN
-    const unitCost = d2(input.unitCostApplied);
-    const inValue = d2(qty.mul(unitCost));
+    // Default IN: qty * unitCostApplied (rounded).
+    // Optional override: allow caller to specify totalCostApplied for exact receipt flows
+    // (e.g., purchase bills with an absolute discount that must preserve the line total).
+    const overrideInValue = input.totalCostApplied !== undefined && input.totalCostApplied !== null;
+    const inValue = overrideInValue ? d2(new Prisma.Decimal(input.totalCostApplied)) : d2(qty.mul(d2(input.unitCostApplied)));
+    if (inValue.lessThan(0)) {
+        throw Object.assign(new Error('totalCostApplied cannot be negative'), { statusCode: 400 });
+    }
+    const unitCost = qty.greaterThan(0) ? d2(inValue.div(qty)) : d2(input.unitCostApplied);
     const newQ = d2(Q.add(qty));
     const newV = d2(V.add(inValue));
     const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : d2(unitCost);

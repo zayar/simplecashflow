@@ -19,6 +19,74 @@ export type TaxCalculationResult = {
 };
 
 /**
+ * Pick the first unused numeric account code within [start, end].
+ * (Pure helper so we can unit-test code selection without a DB.)
+ */
+export function pickFirstUnusedNumericCode(usedCodes: Set<string>, start: number, end: number): string {
+  for (let i = start; i <= end; i++) {
+    const code = String(i);
+    if (!usedCodes.has(code)) return code;
+  }
+  throw new Error(`no available account code in range ${start}..${end}`);
+}
+
+/**
+ * Ensures the company has a dedicated Tax Payable account (LIABILITY) and returns its id.
+ *
+ * Important: Do NOT assume a fixed code like 2100. Some tenants may already use 2100 for
+ * other liabilities (e.g. Customer Advance), which would cause tax to post to the wrong account.
+ *
+ * Strategy:
+ * - Prefer an existing LIABILITY account named "Tax Payable"
+ * - Otherwise create one, using code 2100 if free; else pick the next free numeric code in 2101..2999
+ */
+export async function ensureTaxPayableAccount(tx: any, companyId: number): Promise<number> {
+  if (!companyId || Number.isNaN(Number(companyId))) {
+    throw Object.assign(new Error('companyId is required'), { statusCode: 400 });
+  }
+
+  // Prefer existing account by name (works even if code differs per tenant).
+  const byName = await tx.account.findFirst({
+    where: { companyId, type: 'LIABILITY', name: 'Tax Payable' },
+    select: { id: true },
+  });
+  if (byName?.id) return byName.id;
+
+  // If no "Tax Payable" exists, create one with a safe (non-conflicting) code.
+  const liabilityCodes = await tx.account.findMany({
+    where: { companyId, type: 'LIABILITY' },
+    select: { code: true },
+  });
+  const used = new Set<string>(liabilityCodes.map((a: any) => String(a.code ?? '').trim()).filter(Boolean));
+
+  const desired = !used.has('2100') ? '2100' : pickFirstUnusedNumericCode(used, 2101, 2999);
+
+  const created = await tx.account.create({
+    data: {
+      companyId,
+      code: desired,
+      name: 'Tax Payable',
+      type: 'LIABILITY',
+      normalBalance: 'CREDIT',
+      reportGroup: 'OTHER_CURRENT_LIABILITY',
+      cashflowActivity: 'OPERATING',
+    },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+export async function ensureTaxPayableAccountIfNeeded(
+  tx: any,
+  companyId: number,
+  taxAmount: Prisma.Decimal | number | string | null | undefined
+): Promise<number | null> {
+  const amt = taxAmount instanceof Prisma.Decimal ? taxAmount : new Prisma.Decimal(taxAmount ?? 0);
+  if (!amt.greaterThan(0)) return null;
+  return await ensureTaxPayableAccount(tx, companyId);
+}
+
+/**
  * Calculate tax for a single line item.
  * @param subtotal - Line subtotal before tax (qty * unitPrice)
  * @param taxRate - Tax rate as decimal (e.g., 0.10 for 10%)
@@ -74,48 +142,7 @@ export async function validateTaxConfiguration(
   tx: any,
   companyId: number
 ): Promise<{ taxPayableAccountId: number }> {
-  const company = await tx.company.findUnique({
-    where: { id: companyId },
-    select: { taxPayableAccountId: true },
-  });
-
-  if (!company) {
-    throw Object.assign(new Error('company not found'), { statusCode: 404 });
-  }
-
-  // For now, we'll look for a Tax Payable account by code
-  // In a full implementation, this would be a company setting
-  let taxPayableAccountId = (company as any).taxPayableAccountId;
-
-  if (!taxPayableAccountId) {
-    // Try to find Tax Payable account by code (2100)
-    const taxAccount = await tx.account.findFirst({
-      where: { companyId, type: 'LIABILITY', code: '2100' },
-      select: { id: true },
-    });
-    taxPayableAccountId = taxAccount?.id;
-  }
-
-  if (!taxPayableAccountId) {
-    throw Object.assign(
-      new Error(
-        'company.taxPayableAccountId is not set. Please create a Tax Payable account (LIABILITY, code 2100) or set it in company settings.'
-      ),
-      { statusCode: 400 }
-    );
-  }
-
-  // Validate it's a LIABILITY account
-  const taxAccount = await tx.account.findFirst({
-    where: { id: taxPayableAccountId, companyId, type: 'LIABILITY' },
-  });
-  if (!taxAccount) {
-    throw Object.assign(
-      new Error('taxPayableAccountId must be a LIABILITY account in this company'),
-      { statusCode: 400 }
-    );
-  }
-
+  const taxPayableAccountId = await ensureTaxPayableAccount(tx, companyId);
   return { taxPayableAccountId };
 }
 

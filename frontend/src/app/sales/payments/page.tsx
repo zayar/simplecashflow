@@ -143,6 +143,9 @@ export default function SalesPaymentsListPage() {
                         <Link className="text-primary underline" href={`/sales/payments/${r.id}`}>
                           {r.id}
                         </Link>
+                        {r.attachmentUrl && (
+                          <span className="ml-1 text-blue-500" title="Has payment proof">📎</span>
+                        )}
                       </TableCell>
                       <TableCell className="text-muted-foreground">—</TableCell>
                       <TableCell className="font-medium">{r.customerName ?? "—"}</TableCell>

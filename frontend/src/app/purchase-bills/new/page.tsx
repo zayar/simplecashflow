@@ -16,7 +16,14 @@ import { todayInTimeZone } from '@/lib/utils';
 import { Textarea } from '@/components/ui/textarea';
 import { AccountPicker } from '@/components/account-picker';
 
-type Line = { itemId: string; accountId: string; quantity: string; unitCost: string; description: string };
+type Line = {
+  itemId: string;
+  accountId: string;
+  quantity: string;
+  unitCost: string;
+  discountAmount: string;
+  description: string;
+};
 
 export default function NewPurchaseBillPage() {
   const { user, companySettings } = useAuth();
@@ -37,7 +44,7 @@ export default function NewPurchaseBillPage() {
   });
 
   const [lines, setLines] = useState<Line[]>([
-    { itemId: '', accountId: '', quantity: '1', unitCost: '', description: '' },
+    { itemId: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
   ]);
 
   useEffect(() => {
@@ -66,7 +73,12 @@ export default function NewPurchaseBillPage() {
     [accounts, inventoryAccountId]
   );
   const total = useMemo(
-    () => lines.reduce((sum, l) => sum + Number(l.quantity || 0) * Number(l.unitCost || 0), 0),
+    () =>
+      lines.reduce((sum, l) => {
+        const gross = Number(l.quantity || 0) * Number(l.unitCost || 0);
+        const disc = Number(l.discountAmount || 0);
+        return sum + Math.max(0, gross - (Number.isFinite(disc) ? disc : 0));
+      }, 0),
     [lines]
   );
 
@@ -75,7 +87,10 @@ export default function NewPurchaseBillPage() {
   }
 
   function addLine() {
-    setLines((prev) => [...prev, { itemId: '', accountId: '', quantity: '1', unitCost: '', description: '' }]);
+    setLines((prev) => [
+      ...prev,
+      { itemId: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
+    ]);
   }
 
   function removeLine(idx: number) {
@@ -94,6 +109,7 @@ export default function NewPurchaseBillPage() {
         accountId: l.accountId ? Number(l.accountId) : undefined,
         quantity: Number(l.quantity),
         unitCost: Number(l.unitCost),
+        discountAmount: Number(l.discountAmount || 0),
         description: l.description || undefined,
       }))
       .filter((l) => l.itemId && l.quantity > 0 && l.unitCost > 0);
@@ -206,7 +222,9 @@ export default function NewPurchaseBillPage() {
                       {lines.map((l, idx) => {
                         const it = selectableItems.find((x) => String(x.id) === String(l.itemId));
                         const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
-                        const lineTotal = Number(l.quantity || 0) * Number(l.unitCost || 0);
+                        const gross = Number(l.quantity || 0) * Number(l.unitCost || 0);
+                        const disc = Number(l.discountAmount || 0);
+                        const lineTotal = Math.max(0, gross - (Number.isFinite(disc) ? disc : 0));
                         return (
                           <>
                           <TableRow key={`main-${idx}`} className="border-b-0">
@@ -293,7 +311,15 @@ export default function NewPurchaseBillPage() {
                               ) : null}
                             </TableCell>
                             <TableCell className="align-top">
-                              <Input disabled className="text-right" value="0.00" />
+                              <Input
+                                type="number"
+                                inputMode="numeric"
+                                step="1"
+                                min="0"
+                                className="text-right"
+                                value={l.discountAmount}
+                                onChange={(e) => updateLine(idx, { discountAmount: e.target.value })}
+                              />
                             </TableCell>
                             <TableCell className="align-top text-right font-semibold tabular-nums">
                               {lineTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}

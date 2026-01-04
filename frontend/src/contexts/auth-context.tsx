@@ -27,6 +27,7 @@ interface AuthContextType {
   token: string | null;
   companySettings: CompanySettings | null;
   isCompanySettingsLoading: boolean;
+  refreshCompanySettings: () => Promise<void>;
   login: (token: string, user: User) => void;
   logout: () => void;
   isLoading: boolean;
@@ -41,6 +42,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [companySettings, setCompanySettings] = useState<CompanySettings | null>(null);
   const [isCompanySettingsLoading, setIsCompanySettingsLoading] = useState(false);
   const router = useRouter();
+
+  const refreshCompanySettings = async () => {
+    if (!user?.companyId || !token) {
+      setCompanySettings(null);
+      setIsCompanySettingsLoading(false);
+      return;
+    }
+    setIsCompanySettingsLoading(true);
+    try {
+      const s = (await fetchApi(`/companies/${user.companyId}/settings`)) as CompanySettings;
+      setCompanySettings(s);
+    } catch (err) {
+      console.error(err);
+      setCompanySettings(null);
+    } finally {
+      setIsCompanySettingsLoading(false);
+    }
+  };
 
   useEffect(() => {
     // Restore session from cookies on load
@@ -104,7 +123,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, companySettings, isCompanySettingsLoading, login, logout, isLoading }}
+      value={{
+        user,
+        token,
+        companySettings,
+        isCompanySettingsLoading,
+        refreshCompanySettings,
+        login,
+        logout,
+        isLoading,
+      }}
     >
       {children}
     </AuthContext.Provider>

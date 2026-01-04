@@ -14,6 +14,7 @@ import { nextPurchaseBillNumber } from '../sequence/sequence.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry, computeNetByAccount, diffNets, buildAdjustmentLinesFromNets } from '../ledger/reversal.service.js';
+import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 function generatePurchaseBillNumber() {
     // legacy fallback (should not be used in new code paths)
     return `PBILL-${Date.now()}`;
@@ -86,6 +87,7 @@ export async function purchaseBillsRoutes(fastify) {
             const itemId = Number(l.itemId);
             const qty = Number(l.quantity ?? 0);
             const unitCost = Number(l.unitCost ?? 0);
+            const discountAmount = Number(l.discountAmount ?? 0);
             if (!itemId || Number.isNaN(itemId)) {
                 reply.status(400);
                 return { error: `lines[${idx}].itemId is required` };
@@ -97,6 +99,10 @@ export async function purchaseBillsRoutes(fastify) {
             if (!unitCost || unitCost <= 0) {
                 reply.status(400);
                 return { error: `lines[${idx}].unitCost must be > 0` };
+            }
+            if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount must be >= 0` };
             }
             // Item can be GOODS (tracked or not) or SERVICE.
             const item = await prisma.item.findFirst({
@@ -131,7 +137,13 @@ export async function purchaseBillsRoutes(fastify) {
             }
             const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
             const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
-            const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
+            const gross = qtyDec.mul(unitDec).toDecimalPlaces(2);
+            const disc = new Prisma.Decimal(discountAmount).toDecimalPlaces(2);
+            if (disc.greaterThan(gross)) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
+            }
+            const lineTotal = gross.sub(disc).toDecimalPlaces(2);
             total = total.add(lineTotal);
             computedLines.push({
                 companyId,
@@ -141,6 +153,7 @@ export async function purchaseBillsRoutes(fastify) {
                 description: l.description ?? null,
                 quantity: qtyDec,
                 unitCost: unitDec,
+                discountAmount: disc,
                 lineTotal,
             });
         }
@@ -239,6 +252,7 @@ export async function purchaseBillsRoutes(fastify) {
                 description: l.description ?? null,
                 quantity: l.quantity,
                 unitCost: l.unitCost,
+                discountAmount: l.discountAmount ?? new Prisma.Decimal(0),
                 lineTotal: l.lineTotal,
             })),
             payments: (bill.payments ?? []).map((p) => ({
@@ -310,6 +324,7 @@ export async function purchaseBillsRoutes(fastify) {
             const itemId = Number(l.itemId);
             const qty = Number(l.quantity ?? 0);
             const unitCost = Number(l.unitCost ?? 0);
+            const discountAmount = Number(l.discountAmount ?? 0);
             if (!itemId || Number.isNaN(itemId)) {
                 reply.status(400);
                 return { error: `lines[${idx}].itemId is required` };
@@ -321,6 +336,10 @@ export async function purchaseBillsRoutes(fastify) {
             if (!unitCost || unitCost <= 0) {
                 reply.status(400);
                 return { error: `lines[${idx}].unitCost must be > 0` };
+            }
+            if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount must be >= 0` };
             }
             const item = await prisma.item.findFirst({
                 where: { id: itemId, companyId },
@@ -348,7 +367,13 @@ export async function purchaseBillsRoutes(fastify) {
             }
             const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
             const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
-            const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
+            const gross = qtyDec.mul(unitDec).toDecimalPlaces(2);
+            const disc = new Prisma.Decimal(discountAmount).toDecimalPlaces(2);
+            if (disc.greaterThan(gross)) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
+            }
+            const lineTotal = gross.sub(disc).toDecimalPlaces(2);
             total = total.add(lineTotal);
             computedLines.push({
                 companyId,
@@ -358,6 +383,7 @@ export async function purchaseBillsRoutes(fastify) {
                 description: l.description ?? null,
                 quantity: qtyDec,
                 unitCost: unitDec,
+                discountAmount: disc,
                 lineTotal,
             });
         }
@@ -609,6 +635,8 @@ export async function purchaseBillsRoutes(fastify) {
                             direction: 'IN',
                             quantity: qty,
                             unitCostApplied: unitCost,
+                            // Preserve the exact discounted line total in inventory value / WAC.
+                            totalCostApplied: lineTotal,
                             referenceType: 'PurchaseBill',
                             referenceId: String(bill.id),
                             correlationId,
@@ -708,6 +736,10 @@ export async function purchaseBillsRoutes(fastify) {
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
         }, redis)));
+        // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+        if (!replay && result._jeEventId) {
+            publishEventsFastPath([result._jeEventId]);
+        }
         return {
             purchaseBillId: result.purchaseBillId,
             status: result.status,
@@ -789,12 +821,16 @@ export async function purchaseBillsRoutes(fastify) {
                         const itemId = Number(l.itemId);
                         const qty = Number(l.quantity ?? 0);
                         const unitCost = Number(l.unitCost ?? 0);
+                        const discountAmount = Number(l.discountAmount ?? 0);
                         if (!itemId || Number.isNaN(itemId))
                             throw Object.assign(new Error(`lines[${idx}].itemId is required`), { statusCode: 400 });
                         if (!qty || qty <= 0)
                             throw Object.assign(new Error(`lines[${idx}].quantity must be > 0`), { statusCode: 400 });
                         if (!unitCost || unitCost <= 0)
                             throw Object.assign(new Error(`lines[${idx}].unitCost must be > 0`), { statusCode: 400 });
+                        if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+                            throw Object.assign(new Error(`lines[${idx}].discountAmount must be >= 0`), { statusCode: 400 });
+                        }
                         const item = await tx.item.findFirst({
                             where: { id: itemId, companyId },
                             select: { id: true, type: true, trackInventory: true, expenseAccountId: true, name: true },
@@ -812,7 +848,12 @@ export async function purchaseBillsRoutes(fastify) {
                             throw Object.assign(new Error(`lines[${idx}].accountId must be an EXPENSE account in this company`), { statusCode: 400 });
                         const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
                         const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
-                        const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
+                        const gross = qtyDec.mul(unitDec).toDecimalPlaces(2);
+                        const disc = new Prisma.Decimal(discountAmount).toDecimalPlaces(2);
+                        if (disc.greaterThan(gross)) {
+                            throw Object.assign(new Error(`lines[${idx}].discountAmount cannot exceed line subtotal`), { statusCode: 400 });
+                        }
+                        const lineTotal = gross.sub(disc).toDecimalPlaces(2);
                         total = total.add(lineTotal);
                         computedLines.push({
                             companyId,
@@ -822,6 +863,7 @@ export async function purchaseBillsRoutes(fastify) {
                             description: l.description ?? null,
                             quantity: qtyDec,
                             unitCost: unitDec,
+                            discountAmount: disc,
                             lineTotal,
                         });
                         const prev = debitByAccount.get(accountId) ?? new Prisma.Decimal(0);
@@ -1375,6 +1417,10 @@ export async function purchaseBillsRoutes(fastify) {
                     _occurredAt: occurredAt,
                 };
             }, redis));
+            // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+            if (!replay && result._jeEventId) {
+                publishEventsFastPath([result._jeEventId]);
+            }
             return {
                 purchaseBillId,
                 purchaseBillPaymentId: result.purchaseBillPaymentId,

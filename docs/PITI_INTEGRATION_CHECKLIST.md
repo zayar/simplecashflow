@@ -1,5 +1,7 @@
 ## Piti → Cashflow Integration Checklist (hand this to Piti team)
 
+> **📦 See `docs/piti-integration/` for complete integration package with TypeScript client**
+
 ### Production base URL (current)
 
 - `https://cashflow-api-291129507535.asia-southeast1.run.app`
@@ -47,4 +49,23 @@ Cashflow stores a mapping table so duplicates never happen:
 - **Refund/return → credit note + JE**:
   - `POST /integrations/piti/companies/:companyId/refunds`
 
+---
+
+## Ready-to-Use Integration Package
+
+A complete integration package is available at `docs/piti-integration/`:
+
+| File | Description |
+|------|-------------|
+| `README.md` | Quick start guide (5 minutes) |
+| `INTEGRATION_GUIDE.md` | Step-by-step integration guide |
+| `API_REFERENCE.md` | Complete API documentation |
+| `cashflow_client.ts` | **Copy this to Pitix** |
+| `cashflow_sale_helper.ts` | Example integration code |
+
+### Quick Setup
+
+1. Copy `cashflow_client.ts` → `app/service/cashflow_client.ts`
+2. Add env vars: `CASHFLOW_INTEGRATION_KEY`, `CASHFLOW_COMPANY_ID`
+3. Call `getCashflowClient(env).importSale({...})` after sale completion
 

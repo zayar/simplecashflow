@@ -5,6 +5,7 @@ import { useAuth } from '../lib/auth';
 import { getItems, type Item } from '../lib/ar';
 import { AppBar, BackIcon, IconButton, SearchIcon } from '../components/AppBar';
 import { BottomNav } from '../components/BottomNav';
+import { Fab, PlusIcon } from '../components/Fab';
 import { formatMoneyK, toNumber } from '../lib/format';
 import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
 
@@ -89,7 +90,7 @@ export default function Items() {
               <button
                 key={item.id}
                 type="button"
-                onClick={() => (mode === 'pick' ? pickItem(item) : undefined)}
+                onClick={() => (mode === 'pick' ? pickItem(item) : navigate(`/items/${item.id}`))}
                 className="flex w-full items-center justify-between border-b border-slate-100 px-4 py-3 text-left active:bg-slate-50"
               >
                 <div className="min-w-0">
@@ -105,6 +106,7 @@ export default function Items() {
         </div>
       </div>
 
+      {mode ? null : <Fab onClick={() => navigate('/items/new')} ariaLabel="New item" icon={<PlusIcon />} />}
       {mode ? null : <BottomNav />}
     </div>
   );

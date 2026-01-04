@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getExchangeRates } from '@/lib/api';
 import { useRouter, useParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -21,10 +21,27 @@ export default function RecordPaymentPage() {
   const params = useParams();
   const invoiceId = params.id;
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const baseCurrency = useMemo(() => {
+    const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [companySettings?.baseCurrency]);
 
   const [loading, setLoading] = useState(false);
   const [invoice, setInvoice] = useState<any>(null);
   const [depositAccounts, setDepositAccounts] = useState<any[]>([]);
+
+  const customerCurrency = useMemo(() => {
+    const cur = String(invoice?.customer?.currency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [invoice?.customer?.currency]);
+
+  const isFxCustomer = useMemo(() => {
+    return !!(baseCurrency && customerCurrency && baseCurrency !== customerCurrency);
+  }, [baseCurrency, customerCurrency]);
+
+  const [fxRateToBase, setFxRateToBase] = useState<number | null>(null);
+  const [fxAsOfDate, setFxAsOfDate] = useState<string | null>(null);
+  const [enterInCustomerCurrency, setEnterInCustomerCurrency] = useState(true);
   
   const [formData, setFormData] = useState({
     paymentMode: 'CASH' as 'CASH' | 'BANK' | 'E_WALLET',
@@ -32,6 +49,9 @@ export default function RecordPaymentPage() {
     amount: '',
     bankAccountId: '',
   });
+
+  // Selected payment proof attachment
+  const [selectedAttachmentUrl, setSelectedAttachmentUrl] = useState<string | null>(null);
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -57,6 +77,46 @@ export default function RecordPaymentPage() {
     }
   }, [user?.companyId, invoiceId, router]);
 
+  // FX (display + entry helper): load latest rate for customer currency.
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!isFxCustomer || !customerCurrency) {
+      setFxRateToBase(null);
+      setFxAsOfDate(null);
+      return;
+    }
+    let cancelled = false;
+    getExchangeRates(user.companyId, customerCurrency)
+      .then((rows) => {
+        if (cancelled) return;
+        const invoiceDateStr = String(invoice?.invoiceDate ?? '').slice(0, 10);
+        const invoiceDate = invoiceDateStr ? new Date(invoiceDateStr) : null;
+        const pick =
+          (rows ?? []).find((r: any) => {
+            if (!invoiceDate) return true;
+            const d = new Date(String(r.asOfDate ?? ''));
+            if (Number.isNaN(d.getTime())) return false;
+            return d.getTime() <= invoiceDate.getTime();
+          }) ?? (rows ?? [])[0];
+        const rate = pick ? Number((pick as any).rateToBase) : 0;
+        if (!pick || !Number.isFinite(rate) || rate <= 0) {
+          setFxRateToBase(null);
+          setFxAsOfDate(null);
+          return;
+        }
+        setFxRateToBase(rate);
+        setFxAsOfDate((pick as any).asOfDate ?? null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setFxRateToBase(null);
+        setFxAsOfDate(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, isFxCustomer, customerCurrency, invoice?.invoiceDate]);
+
   useEffect(() => {
     const tz = companySettings?.timeZone ?? 'Asia/Yangon';
     if (!formData.paymentDate) {
@@ -68,19 +128,29 @@ export default function RecordPaymentPage() {
   // Auto-fill remaining balance when invoice loads
   useEffect(() => {
     if (invoice && invoice.remainingBalance > 0 && !formData.amount) {
-      setFormData(prev => ({ ...prev, amount: invoice.remainingBalance.toFixed(2) }));
+      // If user wants to enter in customer currency, prefill converted amount.
+      if (isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0) {
+        setFormData((prev) => ({ ...prev, amount: (invoice.remainingBalance / fxRateToBase).toFixed(2) }));
+      } else {
+        setFormData(prev => ({ ...prev, amount: invoice.remainingBalance.toFixed(2) }));
+      }
     }
-  }, [invoice]);
+  }, [invoice, isFxCustomer, enterInCustomerCurrency, fxRateToBase]);
 
   const handleAmountChange = (value: string) => {
     const numValue = Number(value);
     const maxAmount = invoice ? invoice.remainingBalance : Infinity;
-    
-    if (numValue > maxAmount) {
-      alert(`Payment amount cannot exceed remaining balance of ${maxAmount.toLocaleString()}`);
-      setFormData(prev => ({ ...prev, amount: maxAmount.toFixed(2) }));
+
+    // Always validate against remaining balance in BASE currency (backend posts in base).
+    const baseAmt =
+      isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0 ? numValue * fxRateToBase : numValue;
+
+    if (baseAmt > maxAmount) {
+      alert(`Payment amount cannot exceed remaining balance of ${maxAmount.toLocaleString()} ${baseCurrency ?? ''}`.trim());
+      const capped = isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0 ? maxAmount / fxRateToBase : maxAmount;
+      setFormData((prev) => ({ ...prev, amount: capped.toFixed(2) }));
     } else {
-      setFormData(prev => ({ ...prev, amount: value }));
+      setFormData((prev) => ({ ...prev, amount: value }));
     }
   };
 
@@ -93,8 +163,10 @@ export default function RecordPaymentPage() {
       alert('Payment amount must be greater than 0');
       return;
     }
-    
-    if (amount > invoice.remainingBalance) {
+
+    const baseAmount =
+      isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0 ? amount * fxRateToBase : amount;
+    if (baseAmount > invoice.remainingBalance) {
       alert(`Payment amount cannot exceed remaining balance of ${invoice.remainingBalance.toLocaleString()}`);
       return;
     }
@@ -114,8 +186,11 @@ export default function RecordPaymentPage() {
         body: JSON.stringify({
           paymentMode: formData.paymentMode,
           paymentDate: formData.paymentDate,
-          amount: amount,
+          // Always send BASE currency amount to backend (ledger-safe).
+          amount: baseAmount,
           bankAccountId: Number(formData.bankAccountId),
+          // Optional attachment URL from customer-uploaded proofs
+          attachmentUrl: selectedAttachmentUrl || undefined,
         }),
       });
       router.push('/invoices');
@@ -152,6 +227,10 @@ export default function RecordPaymentPage() {
 
   const canPay = invoice.status === 'POSTED' || invoice.status === 'PARTIAL';
   const isFullyPaid = invoice.remainingBalance <= 0;
+  const showFx = isFxCustomer && fxRateToBase && fxRateToBase > 0;
+  const enteredNum = Number(formData.amount || 0);
+  const baseEntered = showFx && enterInCustomerCurrency ? enteredNum * (fxRateToBase as number) : enteredNum;
+  const maxDisplay = showFx && enterInCustomerCurrency ? invoice.remainingBalance / (fxRateToBase as number) : invoice.remainingBalance;
 
   const filteredDepositAccounts = depositAccounts.filter((a: any) => {
     if (formData.paymentMode === 'CASH') return a.kind === 'CASH';
@@ -220,7 +299,10 @@ export default function RecordPaymentPage() {
             <div className="pt-4 border-t space-y-2">
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Invoice Total:</span>
-                <span className="font-bold text-lg">{Number(invoice.total).toLocaleString()}</span>
+                <span className="font-bold text-lg">
+                  {Number(invoice.total).toLocaleString()}
+                  {baseCurrency ? ` ${baseCurrency}` : ''}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Total Paid:</span>
@@ -230,9 +312,24 @@ export default function RecordPaymentPage() {
                 <span className="font-semibold">Remaining Balance:</span>
                 <span className={`font-bold text-lg ${invoice.remainingBalance > 0 ? 'text-orange-600' : 'text-green-600'}`}>
                   {invoice.remainingBalance.toLocaleString()}
+                  {baseCurrency ? ` ${baseCurrency}` : ''}
                 </span>
               </div>
             </div>
+
+              {showFx ? (
+                <div className="mt-2 rounded-md border bg-muted/30 p-3 text-sm">
+                  <div>
+                    <span className="text-muted-foreground">Customer currency:</span> <b>{customerCurrency}</b>
+                    &nbsp;·&nbsp;
+                    <span className="text-muted-foreground">Base currency:</span> <b>{baseCurrency}</b>
+                  </div>
+                  <div className="text-muted-foreground">
+                    Exchange rate: <b>1 {customerCurrency} = {baseCurrency}{Number(fxRateToBase).toLocaleString()}</b>
+                    {fxAsOfDate ? ` (as of ${String(fxAsOfDate).slice(0, 10)})` : ''}
+                  </div>
+                </div>
+              ) : null}
 
             <div className="pt-2">
               <Badge variant="outline">{invoice.status}</Badge>
@@ -275,11 +372,63 @@ export default function RecordPaymentPage() {
                     <div key={payment.id} className="flex justify-between text-sm">
                       <span className="text-muted-foreground">
                         {formatDateInTimeZone(payment.paymentDate, tz)} - {payment.bankAccount?.name}
+                        {payment.attachmentUrl && <span className="ml-1">📎</span>}
                       </span>
                       <span className="font-medium">{Number(payment.amount).toLocaleString()}</span>
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Customer-submitted payment proofs */}
+            {Array.isArray(invoice?.pendingPaymentProofs) && invoice.pendingPaymentProofs.length > 0 && (
+              <div className="mb-4 p-4 bg-amber-50 border border-amber-200 rounded-md">
+                <p className="text-sm font-semibold mb-2 text-amber-800">
+                  📷 Customer Payment Proofs ({invoice.pendingPaymentProofs.length})
+                </p>
+                <p className="text-xs text-amber-700 mb-3">
+                  Select a proof to attach to this payment record:
+                </p>
+                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                  {invoice.pendingPaymentProofs.map((proof: any, idx: number) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setSelectedAttachmentUrl(
+                        selectedAttachmentUrl === proof.url ? null : proof.url
+                      )}
+                      className={`relative aspect-square overflow-hidden rounded-lg border-2 transition-all ${
+                        selectedAttachmentUrl === proof.url
+                          ? 'border-blue-500 ring-2 ring-blue-200'
+                          : 'border-gray-200 hover:border-amber-300'
+                      }`}
+                    >
+                      <img
+                        src={proof.url}
+                        alt={`Proof ${idx + 1}`}
+                        className="h-full w-full object-cover"
+                      />
+                      {selectedAttachmentUrl === proof.url && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-blue-500/20">
+                          <div className="rounded-full bg-blue-500 p-1 text-white text-xs">✓</div>
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+                {selectedAttachmentUrl && (
+                  <div className="mt-2 flex items-center justify-between text-xs">
+                    <span className="text-green-700">✓ Proof selected</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedAttachmentUrl(null)}
+                      className="text-gray-500 hover:text-gray-700"
+                    >
+                      Clear selection
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -320,7 +469,8 @@ export default function RecordPaymentPage() {
                   Amount
                   {invoice.remainingBalance > 0 && (
                     <span className="text-xs text-muted-foreground ml-2">
-                      (Max: {invoice.remainingBalance.toLocaleString()})
+                      (Max: {Number(maxDisplay).toLocaleString()}
+                      {showFx && enterInCustomerCurrency ? ` ${customerCurrency}` : baseCurrency ? ` ${baseCurrency}` : ''})
                     </span>
                   )}
                 </Label>
@@ -335,6 +485,25 @@ export default function RecordPaymentPage() {
                   value={formData.amount}
                   onChange={(e) => handleAmountChange(e.target.value)}
                 />
+                {showFx ? (
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="enterInCustomerCurrency"
+                        type="checkbox"
+                        checked={enterInCustomerCurrency}
+                        onChange={() => setEnterInCustomerCurrency((p) => !p)}
+                      />
+                      <label htmlFor="enterInCustomerCurrency">
+                        Enter amount in <b>{customerCurrency}</b>
+                      </label>
+                    </div>
+                    <div>
+                      Will record: <b>{Number(baseEntered || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}</b>
+                      {baseCurrency ? ` ${baseCurrency}` : ''}
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               <div className="grid gap-2">

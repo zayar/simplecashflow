@@ -94,7 +94,10 @@ export async function companiesRoutes(fastify) {
             reply.status(404);
             return { error: 'company not found' };
         }
-        // Used for base currency immutability (fintech safety): once transactions exist, lock base currency.
+        // Used for base currency immutability (fintech safety):
+        // - If baseCurrency is already set and transactions exist, lock it.
+        // - If baseCurrency is NOT set yet, allow setting it even if transactions already exist
+        //   (so features like exchange rates can be enabled for legacy companies).
         const transactionCount = await prisma.journalEntry.count({ where: { companyId } });
         return {
             companyId: company.id,
@@ -102,7 +105,7 @@ export async function companiesRoutes(fastify) {
             baseCurrency: company.baseCurrency ?? null,
             timeZone: company.timeZone ?? null,
             fiscalYearStartMonth: company.fiscalYearStartMonth ?? 1,
-            baseCurrencyLocked: transactionCount > 0,
+            baseCurrencyLocked: transactionCount > 0 && !!(company.baseCurrency ?? null),
             accountsReceivableAccountId: company.accountsReceivableAccountId,
             accountsReceivableAccount: company.accountsReceivableAccount
                 ? {
@@ -355,7 +358,7 @@ export async function companiesRoutes(fastify) {
             baseCurrency: updated.baseCurrency ?? null,
             timeZone: updated.timeZone ?? null,
             fiscalYearStartMonth: updated.fiscalYearStartMonth ?? 1,
-            baseCurrencyLocked: transactionCount > 0,
+            baseCurrencyLocked: transactionCount > 0 && !!(updated.baseCurrency ?? null),
             accountsReceivableAccountId: updated.accountsReceivableAccountId,
             accountsReceivableAccount: updated.accountsReceivableAccount
                 ? {

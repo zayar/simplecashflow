@@ -6,7 +6,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { ChevronDown, Loader2, Search, Trash2, Plus, ArrowLeft } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getExchangeRates } from '@/lib/api';
 import { todayInTimeZone } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -33,6 +33,10 @@ export default function EditInvoicePage() {
   const params = useParams<{ id: string }>();
   const invoiceId = params?.id;
   const timeZone = companySettings?.timeZone ?? 'Asia/Yangon';
+  const baseCurrency = useMemo(() => {
+    const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [companySettings?.baseCurrency]);
 
   const [loading, setLoading] = useState(false);
   const [loadingDoc, setLoadingDoc] = useState(true);
@@ -76,6 +80,23 @@ export default function EditInvoicePage() {
       incomeAccountId: '',
     },
   ]);
+
+  const selectedCustomer = useMemo(() => {
+    return customers.find((c: any) => String(c.id) === String(formData.customerId));
+  }, [customers, formData.customerId]);
+
+  const customerCurrency = useMemo(() => {
+    const cur = String(selectedCustomer?.currency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [selectedCustomer?.currency]);
+
+  const isFxCustomer = useMemo(() => {
+    return !!(baseCurrency && customerCurrency && baseCurrency !== customerCurrency);
+  }, [baseCurrency, customerCurrency]);
+
+  const [fxRateToBase, setFxRateToBase] = useState<number | null>(null);
+  const [fxAsOfDate, setFxAsOfDate] = useState<string | null>(null);
+  const [enterInCustomerCurrency, setEnterInCustomerCurrency] = useState(true);
 
   useEffect(() => {
     if (!user?.companyId) return;
@@ -132,6 +153,45 @@ export default function EditInvoicePage() {
   }, [timeZone]);
 
   useEffect(() => {
+    if (!isFxCustomer) {
+      setFxRateToBase(null);
+      setFxAsOfDate(null);
+      return;
+    }
+    if (!user?.companyId || !customerCurrency) return;
+    let cancelled = false;
+    getExchangeRates(user.companyId, customerCurrency)
+      .then((rows) => {
+        if (cancelled) return;
+        const invoiceDateStr = String(formData.invoiceDate ?? '').slice(0, 10);
+        const invoiceDate = invoiceDateStr ? new Date(invoiceDateStr) : null;
+        const pick =
+          (rows ?? []).find((r: any) => {
+            if (!invoiceDate) return true;
+            const d = new Date(String(r.asOfDate ?? ''));
+            if (Number.isNaN(d.getTime())) return false;
+            return d.getTime() <= invoiceDate.getTime();
+          }) ?? (rows ?? [])[0];
+        const rate = pick ? Number((pick as any).rateToBase) : 0;
+        if (!pick || !Number.isFinite(rate) || rate <= 0) {
+          setFxRateToBase(null);
+          setFxAsOfDate(null);
+          return;
+        }
+        setFxRateToBase(rate);
+        setFxAsOfDate((pick as any).asOfDate ?? null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setFxRateToBase(null);
+        setFxAsOfDate(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isFxCustomer, user?.companyId, customerCurrency, formData.invoiceDate]);
+
+  useEffect(() => {
     if (!user?.companyId || !invoiceId) return;
     setLoadingDoc(true);
     setError(null);
@@ -180,7 +240,9 @@ export default function EditInvoicePage() {
     if (item) {
       (newLines[index] as any).itemText = item.name;
       (newLines[index] as any).itemId = String(item.id);
-      (newLines[index] as any).unitPrice = Number(item.sellingPrice);
+      const basePrice = Number(item.sellingPrice);
+      const showFx = !!(isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0);
+      (newLines[index] as any).unitPrice = showFx ? basePrice / fxRateToBase : basePrice;
       (newLines[index] as any).description = item.name;
     } else {
       (newLines[index] as any).itemId = '';
@@ -252,6 +314,8 @@ export default function EditInvoicePage() {
 
     setLoading(true);
     try {
+      const showFx = !!(isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0);
+      const factor = showFx ? fxRateToBase! : 1;
       await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`, {
         method: 'PUT',
         body: JSON.stringify({
@@ -267,9 +331,9 @@ export default function EditInvoicePage() {
               ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
               description: String(l.description ?? l.itemText ?? '').trim() || undefined,
             quantity: Number(l.quantity),
-            unitPrice: Number(l.unitPrice),
+            unitPrice: Number(l.unitPrice) * factor,
             taxRate: Number((l as any).taxRate || 0),
-            discountAmount: Number((l as any).discount || 0),
+            discountAmount: Number((l as any).discount || 0) * factor,
             incomeAccountId:
               Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
                 ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
@@ -401,6 +465,55 @@ export default function EditInvoicePage() {
                 </div>
               </CardContent>
             </Card>
+
+            {isFxCustomer ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Currency</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  <div>
+                    <span className="text-muted-foreground">Customer currency:</span> <b>{customerCurrency}</b> &nbsp;·&nbsp;
+                    <span className="text-muted-foreground">Base currency:</span> <b>{baseCurrency}</b>
+                  </div>
+                  {fxRateToBase ? (
+                    <div className="text-muted-foreground">
+                      Exchange rate: <b>1 {customerCurrency} = {baseCurrency}{fxRateToBase}</b>
+                      {fxAsOfDate ? ` (as of ${String(fxAsOfDate).slice(0, 10)})` : ""}
+                    </div>
+                  ) : (
+                    <div className="text-orange-600">No exchange rate found for {customerCurrency}. Add it in Currencies.</div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="enterInCustomerCurrency"
+                      type="checkbox"
+                      checked={enterInCustomerCurrency}
+                      onChange={() => {
+                        if (!isFxCustomer || !fxRateToBase || fxRateToBase <= 0) {
+                          setEnterInCustomerCurrency((p) => !p);
+                          return;
+                        }
+                        const next = !enterInCustomerCurrency;
+                        const factor2 = next ? 1 / fxRateToBase : fxRateToBase;
+                        setLines((prev) =>
+                          prev.map((l: any) => ({
+                            ...l,
+                            unitPrice: Number(l.unitPrice ?? 0) * factor2,
+                            discount: Number(l.discount ?? 0) * factor2,
+                          }))
+                        );
+                        setEnterInCustomerCurrency(next);
+                      }}
+                      disabled={!fxRateToBase}
+                    />
+                    <label htmlFor="enterInCustomerCurrency">
+                      Enter prices/discounts in <b>{customerCurrency}</b> (will be saved in {baseCurrency})
+                    </label>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
 
             <Card>
               <CardHeader className="flex flex-row items-center justify-between space-y-0">

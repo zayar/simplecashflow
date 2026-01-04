@@ -12,6 +12,8 @@ export type InvoiceListRow = {
   customerName: string | null;
   total: string | number;
   amountPaid?: string | number;
+  hasPendingPaymentProof?: boolean;
+  pendingPaymentProofCount?: number;
 };
 
 export type InvoiceDetail = InvoiceListRow & {
@@ -53,6 +55,56 @@ export type Item = {
   sellingPrice: string | number | null;
 };
 
+export async function createCustomer(
+  companyId: number,
+  payload: { name: string; email?: string | null; phone?: string | null; currency?: string | null }
+): Promise<Customer> {
+  return (await fetchApi(`/companies/${companyId}/customers`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })) as Customer;
+}
+
+export async function updateCustomer(
+  companyId: number,
+  customerId: number,
+  payload: { name: string; email?: string | null; phone?: string | null; currency?: string | null }
+): Promise<Customer> {
+  return (await fetchApi(`/companies/${companyId}/customers/${customerId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload)
+  })) as Customer;
+}
+
+export async function getCustomer(companyId: number, customerId: number): Promise<Customer> {
+  return (await fetchApi(`/companies/${companyId}/customers/${customerId}`)) as Customer;
+}
+
+export async function createItem(
+  companyId: number,
+  payload: { name: string; sellingPrice?: number; sku?: string | null; type?: 'GOODS' | 'SERVICE' }
+): Promise<Item> {
+  return (await fetchApi(`/companies/${companyId}/items`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })) as Item;
+}
+
+export async function updateItem(
+  companyId: number,
+  itemId: number,
+  payload: { name?: string; sellingPrice?: number; sku?: string | null; type?: 'GOODS' | 'SERVICE' }
+): Promise<Item> {
+  return (await fetchApi(`/companies/${companyId}/items/${itemId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload)
+  })) as Item;
+}
+
+export async function getItem(companyId: number, itemId: number): Promise<Item> {
+  return (await fetchApi(`/companies/${companyId}/items/${itemId}`)) as Item;
+}
+
 export type BankingAccountKind = 'CASH' | 'BANK' | 'E_WALLET' | 'CREDIT_CARD';
 
 export type BankingAccountRow = {
@@ -93,12 +145,20 @@ export type InvoiceTemplate = {
   tableHeaderText: string;
 };
 
+export type PaymentQrCodes = {
+  kbz?: string | null;
+  ayaPay?: string | null;
+  uabPay?: string | null;
+  aPlus?: string | null;
+};
+
 export type PublicInvoiceResponse = {
   company: {
     id: number;
     name: string;
     timeZone: string | null;
     template: InvoiceTemplate;
+    paymentQrCodes?: PaymentQrCodes | null;
   };
   invoice: {
     id: number;
@@ -116,6 +176,7 @@ export type PublicInvoiceResponse = {
     locationName: string | null;
     customerNotes: string | null;
     termsAndConditions: string | null;
+    pendingPaymentProofs?: { url: string; submittedAt: string; note?: string | null }[] | null;
     lines: {
       id: number;
       quantity: string | number;
@@ -205,6 +266,7 @@ export async function recordInvoicePayment(
     paymentDate?: string;
     amount: number;
     bankAccountId: number;
+    attachmentUrl?: string; // Payment proof image URL
   }
 ) {
   return await fetchApi(`/companies/${companyId}/invoices/${invoiceId}/payments`, {
@@ -235,6 +297,61 @@ export async function createInvoice(
     method: 'POST',
     body: JSON.stringify(payload)
   });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Payment QR Codes
+// ──────────────────────────────────────────────────────────────────────────────
+
+export async function getPaymentQrCodes(companyId: number): Promise<PaymentQrCodes> {
+  return (await fetchApi(`/companies/${companyId}/payment-qr-codes`)) as PaymentQrCodes;
+}
+
+export async function uploadPaymentQrCode(
+  companyId: number,
+  method: 'kbz' | 'ayaPay' | 'uabPay' | 'aPlus',
+  file: File
+): Promise<{ url: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  return (await fetchApi(`/companies/${companyId}/payment-qr-codes/${method}`, {
+    method: 'POST',
+    body: formData
+  })) as { url: string };
+}
+
+export async function deletePaymentQrCode(
+  companyId: number,
+  method: 'kbz' | 'ayaPay' | 'uabPay' | 'aPlus'
+): Promise<PaymentQrCodes> {
+  return (await fetchApi(`/companies/${companyId}/payment-qr-codes/${method}`, {
+    method: 'DELETE',
+  })) as PaymentQrCodes;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public Payment Proof Upload
+// ──────────────────────────────────────────────────────────────────────────────
+
+export async function uploadPublicPaymentProof(
+  token: string,
+  file: File
+): Promise<{ url: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const safeToken = encodeURIComponent(token);
+  return (await fetchApi(`/public/invoices/${safeToken}/payment-proof`, {
+    method: 'POST',
+    body: formData
+  })) as { url: string };
+}
+
+export async function deletePublicPaymentProof(token: string, url?: string): Promise<{ success: true; pendingPaymentProofs: any[] }> {
+  const safeToken = encodeURIComponent(token);
+  const qs = url ? `?url=${encodeURIComponent(url)}` : '';
+  return (await fetchApi(`/public/invoices/${safeToken}/payment-proof${qs}`, {
+    method: 'DELETE',
+  })) as { success: true; pendingPaymentProofs: any[] };
 }
 
 

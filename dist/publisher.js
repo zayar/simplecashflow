@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { prisma } from './infrastructure/db.js';
-import { publishDomainEvent } from './infrastructure/pubsub.js';
+import { publishDomainEvent, buildEventEnvelope } from './infrastructure/pubsub.js';
 const fastify = Fastify({ logger: true });
 const PUBLISH_BATCH_SIZE = Number(process.env.PUBLISH_BATCH_SIZE) || 50;
 const PUBLISH_INTERVAL_MS = Number(process.env.PUBLISH_INTERVAL_MS) || 1000;
@@ -11,6 +11,8 @@ function backoffMs(attempt) {
     const ms = 1000 * Math.pow(2, Math.max(0, attempt));
     return Math.min(ms, 60_000);
 }
+// Use shared buildEventEnvelope from pubsub.ts
+// Wrapper to add error code for dead-lettering
 function buildEnvelopeFromEventRow(e) {
     const companyId = Number(e.companyId);
     if (!Number.isInteger(companyId) || companyId <= 0) {
@@ -18,27 +20,20 @@ function buildEnvelopeFromEventRow(e) {
             code: 'OUTBOX_TENANT_MISSING',
         });
     }
-    const payload = e.payload ?? {};
-    const aggregateId = e.aggregateId ??
-        (typeof payload?.journalEntryId === 'number'
-            ? String(payload.journalEntryId)
-            : typeof payload?.journalEntryId === 'string'
-                ? payload.journalEntryId
-                : e.eventId);
-    return {
+    return buildEventEnvelope({
         eventId: e.eventId,
         eventType: e.eventType,
-        schemaVersion: (e.schemaVersion ?? 'v1'),
-        occurredAt: new Date(e.occurredAt).toISOString(),
-        companyId,
-        partitionKey: e.partitionKey ?? String(companyId),
-        correlationId: e.correlationId ?? e.eventId,
-        causationId: e.causationId ?? undefined,
-        aggregateType: e.aggregateType ?? 'Unknown',
-        aggregateId,
-        source: e.source ?? 'cashflow-api',
-        payload,
-    };
+        schemaVersion: e.schemaVersion,
+        occurredAt: new Date(e.occurredAt),
+        companyId: e.companyId,
+        partitionKey: e.partitionKey,
+        correlationId: e.correlationId,
+        causationId: e.causationId,
+        aggregateType: e.aggregateType,
+        aggregateId: e.aggregateId,
+        source: e.source,
+        payload: e.payload,
+    });
 }
 async function deadLetterAndUnlock(eventId, reason) {
     await prisma.event.update({

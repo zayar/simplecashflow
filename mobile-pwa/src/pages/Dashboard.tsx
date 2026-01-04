@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { fetchApi } from '../lib/api';
 import { useAuth } from '../lib/auth';
@@ -54,6 +55,22 @@ export default function Dashboard() {
                   : 'OK'}
             </div>
           </div>
+
+          {/* Settings Card */}
+          <Link
+            to="/settings"
+            className="block rounded-2xl border border-slate-800 bg-slate-950 p-4 transition-colors hover:border-slate-700 hover:bg-slate-900"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold">Settings</div>
+                <div className="mt-1 text-xs text-slate-400">Payment QR codes, preferences</div>
+              </div>
+              <svg className="h-5 w-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+              </svg>
+            </div>
+          </Link>
 
           <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
             <div className="text-sm font-semibold">Next: wire real screens</div>

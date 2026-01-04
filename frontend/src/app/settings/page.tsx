@@ -44,7 +44,7 @@ const MONTHS = [
 ]
 
 export default function SettingsPage() {
-  const { user } = useAuth()
+  const { user, refreshCompanySettings } = useAuth()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [settings, setSettings] = useState<CompanySettings | null>(null)
@@ -91,6 +91,8 @@ export default function SettingsPage() {
         }),
       })
       setSettings(updated)
+      // Keep auth context in sync so other pages (e.g. Currencies) immediately unlock.
+      await refreshCompanySettings()
       alert("Saved.")
     } catch (err: any) {
       console.error(err)
@@ -132,9 +134,11 @@ export default function SettingsPage() {
                     value={form.baseCurrency}
                     onChange={(e) => setForm({ ...form, baseCurrency: e.target.value })}
                     placeholder="e.g. MMK"
-                    disabled={settings.baseCurrencyLocked}
+                    // Only lock if baseCurrency is already set. If it's missing/null, allow setting it
+                    // even when transactions exist (needed to enable exchange-rate features for legacy companies).
+                    disabled={settings.baseCurrencyLocked && !!settings.baseCurrency}
                   />
-                  {settings.baseCurrencyLocked ? (
+                  {settings.baseCurrencyLocked && !!settings.baseCurrency ? (
                     <p className="text-xs text-muted-foreground">
                       You can’t change base currency after transactions exist.
                     </p>
@@ -204,6 +208,20 @@ export default function SettingsPage() {
           </div>
           <Link href="/settings/invoice-template">
             <Button variant="outline">Invoice Template</Button>
+          </Link>
+        </CardContent>
+      </Card>
+
+      <Card className="shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg">Payment Methods</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-sm text-muted-foreground">
+            Upload QR codes for KBZ Pay, AYA Pay, UAB Pay, A+ Wallet. Customers can scan these on shared invoices.
+          </div>
+          <Link href="/settings/payment-qr">
+            <Button variant="outline">Payment QR Codes</Button>
           </Link>
         </CardContent>
       </Card>

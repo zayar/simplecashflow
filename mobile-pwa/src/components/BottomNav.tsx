@@ -1,5 +1,5 @@
 import React from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 
 function Tab({
   to,
@@ -46,15 +46,6 @@ function DocIcon() {
   );
 }
 
-function ListIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2">
-      <path strokeLinecap="round" strokeLinejoin="round" d="M8 6h13M8 12h13M8 18h13" />
-      <path strokeLinecap="round" strokeLinejoin="round" d="M3 6h.01M3 12h.01M3 18h.01" />
-    </svg>
-  );
-}
-
 function ReceiptIcon() {
   return (
     <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2">
@@ -84,17 +75,92 @@ function MoreIcon() {
   );
 }
 
-export function BottomNav() {
+function SheetRow({
+  label,
+  onClick
+}: {
+  label: string;
+  onClick: () => void;
+}) {
   return (
-    <div className="fixed bottom-0 left-0 right-0 z-10 border-t border-border bg-background/95 backdrop-blur">
-      <div className="mx-auto grid max-w-xl grid-cols-5 safe-bottom">
-        <Tab to="/invoices" label="Invoices" icon={<DocIcon />} />
-        <Tab to="/estimates" label="Estimates" icon={<ListIcon />} disabled />
-        <Tab to="/expenses" label="Expenses" icon={<ReceiptIcon />} disabled />
-        <Tab to="/reports" label="Reports" icon={<ChartIcon />} disabled />
-        <Tab to="/more" label="More" icon={<MoreIcon />} />
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full items-center gap-3 px-5 py-4 text-left active:bg-muted/50"
+    >
+      <div className="text-base text-foreground">{label}</div>
+      <div className="ml-auto text-muted-foreground">›</div>
+    </button>
+  );
+}
+
+export function BottomNav() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [open, setOpen] = React.useState(false);
+  const isMoreActive =
+    open ||
+    location.pathname.startsWith('/customers') ||
+    location.pathname.startsWith('/items') ||
+    location.pathname.startsWith('/warehouses') ||
+    location.pathname.startsWith('/more');
+
+  return (
+    <>
+      <div className="fixed bottom-0 left-0 right-0 z-10 border-t border-border bg-background/95 backdrop-blur">
+        <div className="mx-auto grid max-w-xl grid-cols-4 safe-bottom">
+          <Tab to="/invoices" label="Invoices" icon={<DocIcon />} />
+          <Tab to="/expenses" label="Expenses" icon={<ReceiptIcon />} />
+          <Tab to="/reports" label="Reports" icon={<ChartIcon />} />
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            className={`flex w-full flex-col items-center justify-center gap-1 py-2 text-xs ${
+              isMoreActive ? 'text-primary' : 'text-muted-foreground'
+            }`}
+          >
+            <div className="h-6 w-6">
+              <MoreIcon />
+            </div>
+            <div>More</div>
+          </button>
+        </div>
       </div>
-    </div>
+
+      {open ? (
+        <div className="fixed inset-0 z-50">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/40"
+            onClick={() => setOpen(false)}
+            aria-label="Close"
+          />
+          <div className="absolute bottom-0 left-0 right-0 mx-auto max-w-xl rounded-t-3xl bg-background shadow-xl">
+            <div className="px-5 pb-2 pt-3">
+              <div className="mx-auto h-1.5 w-12 rounded-full bg-muted" />
+            </div>
+
+            <SheetRow
+              label="Clients"
+              onClick={() => {
+                setOpen(false);
+                navigate('/customers');
+              }}
+            />
+            <div className="h-px bg-border" />
+            <SheetRow
+              label="Items"
+              onClick={() => {
+                setOpen(false);
+                navigate('/items');
+              }}
+            />
+
+            <div className="safe-bottom" />
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 

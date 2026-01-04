@@ -2,6 +2,14 @@
 
 This document is written for the **Piti development team**.
 
+> **📦 Complete Integration Package Available**
+>
+> See the `docs/piti-integration/` folder for:
+> - `README.md` - Quick start guide
+> - `INTEGRATION_GUIDE.md` - Step-by-step setup
+> - `API_REFERENCE.md` - Complete API documentation
+> - `cashflow_client.ts` - Ready-to-use TypeScript client
+
 ### Production environment (current)
 
 - **API Base URL (PROD)**: `https://cashflow-api-291129507535.asia-southeast1.run.app`
@@ -251,4 +259,26 @@ curl -sS -X POST "$CASHFLOW_URL/integrations/piti/companies/$COMPANY_ID/sales" \
 - Refund flow is supported via `POST /integrations/piti/companies/:companyId/refunds` (creates a POSTED credit note).
 - Multi-currency is not supported if company `baseCurrency` is set (Cashflow is single-currency per company).
 
+---
+
+## For Pitix Team: Integration Package
+
+A complete integration package is available at `docs/piti-integration/`:
+
+```
+docs/piti-integration/
+├── README.md                 # Quick start (5 minutes)
+├── INTEGRATION_GUIDE.md      # Step-by-step setup guide
+├── API_REFERENCE.md          # Complete API documentation
+├── cashflow_client.ts        # TypeScript client for Pitix
+└── cashflow_sale_helper.ts   # Integration helper examples
+```
+
+The `cashflow_client.ts` file:
+- Matches Pitix coding patterns (extends their HttpClient approach)
+- Includes built-in retry with exponential backoff
+- Handles idempotency keys automatically
+- Provides TypeScript types for all requests/responses
+
+Simply copy `cashflow_client.ts` to `app/service/cashflow_client.ts` in Pitix and follow the integration guide.
 

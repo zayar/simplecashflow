@@ -131,7 +131,17 @@ export default function Invoices() {
                         >
                           <div className="min-w-0">
                             <div className="truncate text-base text-foreground">{customer}</div>
-                            <div className="text-sm text-muted-foreground">{inv.invoiceNumber}</div>
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                              <span className="truncate">{inv.invoiceNumber}</span>
+                              {inv.hasPendingPaymentProof ? (
+                                <span
+                                  className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700"
+                                  title="Customer uploaded payment proof"
+                                >
+                                  📎 {typeof inv.pendingPaymentProofCount === 'number' && inv.pendingPaymentProofCount > 0 ? inv.pendingPaymentProofCount : ''}
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
                           <div className="shrink-0 text-right">
                             <div className="text-base font-medium text-foreground">{formatMoneyK(inv.total)}</div>

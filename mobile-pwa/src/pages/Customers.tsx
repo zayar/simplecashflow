@@ -5,6 +5,7 @@ import { useAuth } from '../lib/auth';
 import { getCustomers, getInvoices, type Customer, type InvoiceListRow } from '../lib/ar';
 import { AppBar, BackIcon, IconButton, SearchIcon } from '../components/AppBar';
 import { BottomNav } from '../components/BottomNav';
+import { Fab, PlusIcon } from '../components/Fab';
 import { formatMoneyK, toNumber } from '../lib/format';
 import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
 
@@ -114,7 +115,10 @@ export default function Customers() {
               const actionProps =
                 mode === 'pick'
                   ? { onClick: () => pickCustomer(r.customer), role: 'button' as const }
-                  : { onClick: () => {}, role: 'button' as const };
+                  : {
+                      onClick: () => navigate(`/customers/${r.customer.id}`),
+                      role: 'button' as const
+                    };
 
               return (
                 <button
@@ -139,6 +143,7 @@ export default function Customers() {
         </div>
       </div>
 
+      {mode ? null : <Fab onClick={() => navigate('/customers/new')} ariaLabel="New client" icon={<PlusIcon />} />}
       {mode ? null : <BottomNav />}
     </div>
   );
