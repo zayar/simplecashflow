@@ -4,6 +4,7 @@ import { toMoneyDecimal } from '../../utils/money.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
 import { isFutureBusinessDate } from '../../utils/docDatePolicy.js';
 import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from './invoiceAccounting.js';
+import { ensureTaxPayableAccountIfNeeded } from '../../utils/tax.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
 import { postJournalEntry } from '../ledger/posting.service.js';
@@ -24,6 +25,7 @@ import {
   createReversalJournalEntry,
   diffNets,
 } from '../ledger/reversal.service.js';
+import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -337,14 +339,24 @@ export async function booksRoutes(fastify: FastifyInstance) {
       defaultWarehouseId?: number | null; // backward-compatible alias
     };
 
-    if (!body.name || !body.type || body.sellingPrice === undefined || !body.incomeAccountId) {
+    if (!body.name) {
       reply.status(400);
-      return { error: 'name, type, sellingPrice, incomeAccountId are required' };
+      return { error: 'name is required' };
     }
+
+    // Mobile-friendly defaults:
+    // - If type omitted, default to SERVICE (most common for small businesses)
+    // - If sellingPrice omitted, default to 0 (free item)
+    // - If incomeAccountId omitted, default to the Sales income account
+    const desiredType = body.type ?? ItemType.SERVICE;
+    const desiredSellingPrice = body.sellingPrice === undefined ? 0 : body.sellingPrice;
+    const desiredIncomeAccountId =
+      body.incomeAccountId ??
+      (await prisma.$transaction(async (tx) => await ensureSalesIncomeAccount(tx, companyId)));
 
     // Tenant-safe validation: incomeAccount must belong to same company and be INCOME.
     const incomeAccount = await prisma.account.findFirst({
-      where: { id: body.incomeAccountId, companyId, type: AccountType.INCOME },
+      where: { id: desiredIncomeAccountId, companyId, type: AccountType.INCOME },
     });
     if (!incomeAccount) {
       reply.status(400);
@@ -361,7 +373,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
     }
 
-    if (body.trackInventory && body.type !== ItemType.GOODS) {
+    if (body.trackInventory && desiredType !== ItemType.GOODS) {
       reply.status(400);
       return { error: 'trackInventory can only be enabled for GOODS' };
     }
@@ -384,10 +396,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
         companyId,
         name: body.name,
         sku: body.sku ?? null,
-        type: body.type,
-        sellingPrice: toMoneyDecimal(body.sellingPrice),
+        type: desiredType,
+        sellingPrice: toMoneyDecimal(desiredSellingPrice),
         costPrice: body.costPrice === undefined ? null : toMoneyDecimal(body.costPrice),
-        incomeAccountId: body.incomeAccountId,
+        incomeAccountId: desiredIncomeAccountId,
         expenseAccountId: body.expenseAccountId ?? null,
         trackInventory: body.trackInventory ?? false,
         defaultLocationId: desiredDefaultLocationId ?? null,
@@ -399,6 +411,44 @@ export async function booksRoutes(fastify: FastifyInstance) {
     });
 
     return item;
+  });
+
+  fastify.put('/companies/:companyId/items/:itemId', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const itemId = Number((request.params as any)?.itemId);
+    if (Number.isNaN(itemId)) {
+      reply.status(400);
+      return { error: 'invalid itemId' };
+    }
+
+    const body = request.body as {
+      name?: string;
+      sku?: string | null;
+      sellingPrice?: number;
+      costPrice?: number | null;
+    };
+
+    const existing = await prisma.item.findFirst({ where: { id: itemId, companyId } });
+    if (!existing) {
+      reply.status(404);
+      return { error: 'item not found' };
+    }
+
+    // Keep update minimal for mobile UX (name/sku/price). More advanced fields can be added later.
+    const data: any = {};
+    if (body.name !== undefined) data.name = body.name;
+    if (body.sku !== undefined) data.sku = body.sku;
+    if (body.sellingPrice !== undefined) data.sellingPrice = toMoneyDecimal(body.sellingPrice);
+    if (body.costPrice !== undefined)
+      data.costPrice = body.costPrice === null ? null : toMoneyDecimal(body.costPrice);
+
+    const updated = await prisma.item.update({
+      where: { id: itemId },
+      data,
+      include: { incomeAccount: true, expenseAccount: true },
+    });
+
+    return updated;
   });
 
   // --- Books: Invoices (DRAFT) ---
@@ -1341,30 +1391,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
               incomeBuckets.set(l.incomeAccountId, prev.add(new Prisma.Decimal(l.lineTotal)).toDecimalPlaces(2));
             }
 
-            // Ensure Tax Payable exists when needed
-            let taxPayableAccountId: number | null = null;
-            if (taxAmount.greaterThan(0)) {
-              const existing = await tx.account.findFirst({
-                where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-                select: { id: true },
-              });
-              taxPayableAccountId = existing?.id ?? null;
-              if (!taxPayableAccountId) {
-                const created = await tx.account.create({
-                  data: {
-                    companyId,
-                    code: '2100',
-                    name: 'Tax Payable',
-                    type: AccountType.LIABILITY,
-                    normalBalance: 'CREDIT',
-                    reportGroup: 'OTHER_CURRENT_LIABILITY',
-                    cashflowActivity: 'OPERATING',
-                  },
-                  select: { id: true },
-                });
-                taxPayableAccountId = created.id;
-              }
-            }
+            // Ensure Tax Payable exists when needed (do NOT assume code 2100; some tenants use it for Customer Advance).
+            const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
 
             const desiredPostingLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
               { accountId: arAccount.id, debit: total, credit: new Prisma.Decimal(0) },
@@ -2024,31 +2052,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
             });
           }
 
-          // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
-          let taxPayableAccountId: number | null = null;
-          if (taxAmount.greaterThan(0)) {
-            const existing = await tx.account.findFirst({
-              where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-              select: { id: true },
-            });
-            if (existing?.id) {
-              taxPayableAccountId = existing.id;
-            } else {
-              const created = await tx.account.create({
-                data: {
-                  companyId,
-                  code: '2100',
-                  name: 'Tax Payable',
-                  type: AccountType.LIABILITY,
-                  normalBalance: 'CREDIT',
-                  reportGroup: 'OTHER_CURRENT_LIABILITY',
-                  cashflowActivity: 'OPERATING',
-                },
-                select: { id: true },
-              });
-              taxPayableAccountId = created.id;
-            }
-          }
+          // Ensure Tax Payable exists when needed (do NOT assume code 2100; some tenants use it for Customer Advance).
+          const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
 
           // Inventory V1: deduct stock + compute COGS (WAC) at invoice post time
           const isTrackedInvoiceLine = (
@@ -2259,6 +2264,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
         )
       )
     );
+
+    // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+    // If this fails, the outbox publisher will pick up the events
+    if (!replay && result._jeEventId) {
+      const eventIds = [result._jeEventId];
+      if (result._invoiceEventId) eventIds.push(result._invoiceEventId);
+      publishEventsFastPath(eventIds);
+    }
 
     // Always return stable business response
     return {
@@ -2556,6 +2569,13 @@ export async function booksRoutes(fastify: FastifyInstance) {
           redis
         )
       );
+
+      // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+      if (!replay && result._jeEventId) {
+        const eventIds = [result._jeEventId];
+        if (result._paymentEventId) eventIds.push(result._paymentEventId);
+        publishEventsFastPath(eventIds);
+      }
 
       return {
         invoiceId: result.invoiceId,
@@ -3659,29 +3679,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
             const arAccount = await tx.account.findFirst({ where: { id: arId, companyId, type: AccountType.ASSET } });
             if (!arAccount) throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), { statusCode: 400 });
 
-            let taxPayableAccountId: number | null = null;
-            if (taxAmount.greaterThan(0)) {
-              const existing = await tx.account.findFirst({
-                where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-                select: { id: true },
-              });
-              taxPayableAccountId = existing?.id ?? null;
-              if (!taxPayableAccountId) {
-                const created = await tx.account.create({
-                  data: {
-                    companyId,
-                    code: '2100',
-                    name: 'Tax Payable',
-                    type: AccountType.LIABILITY,
-                    normalBalance: 'CREDIT',
-                    reportGroup: 'OTHER_CURRENT_LIABILITY',
-                    cashflowActivity: 'OPERATING',
-                  },
-                  select: { id: true },
-                });
-                taxPayableAccountId = created.id;
-              }
-            }
+            const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
 
             // Desired posting JE for credit note: Dr Income(subtotal), Dr Tax Payable(tax), Cr AR(total)
             const desiredPostingLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
@@ -4179,9 +4177,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
       ])
     );
 
-    // Build computed lines using invoice unit price (cleanest) and enforce qty <= remaining
-    // Note: invoice-based credit notes (this endpoint) currently default tax to 0 because invoices v1 do not store tax.
-    // If you want tax-aware returns, use the generic /companies/:companyId/credit-notes endpoint (UI-driven) which accepts taxRate.
+    // Build computed lines using invoice unit price (cleanest) and enforce qty <= remaining.
+    // IMPORTANT: Invoices DO store discount + tax per line, so returns must reverse both discount and tax
+    // to keep AR and customer balance summary correct (especially for full returns).
     let subtotal = new Prisma.Decimal(0);
     let taxAmount = new Prisma.Decimal(0);
     let total = new Prisma.Decimal(0);
@@ -4198,12 +4196,29 @@ export async function booksRoutes(fastify: FastifyInstance) {
       }
       const unit = new Prisma.Decimal(r.invoiceLine.unitPrice).toDecimalPlaces(2);
       const lineSubtotal = r.qty.mul(unit).toDecimalPlaces(2);
-      const rate = new Prisma.Decimal(0).toDecimalPlaces(4);
-      const lineTax = new Prisma.Decimal(0).toDecimalPlaces(2);
-      const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-      subtotal = subtotal.add(lineSubtotal);
+
+      // Pro-rate discount by quantity (line-level absolute discount).
+      const invDiscount = new Prisma.Decimal((r.invoiceLine as any).discountAmount ?? 0).toDecimalPlaces(2);
+      const ratio = soldQty.greaterThan(0) ? r.qty.div(soldQty) : new Prisma.Decimal(0);
+      const discount = invDiscount.mul(ratio).toDecimalPlaces(2);
+      if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+        throw Object.assign(new Error(`computed discountAmount is invalid for invoiceLineId ${r.invoiceLineId}`), {
+          statusCode: 400,
+        });
+      }
+      const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
+
+      const rate = new Prisma.Decimal((r.invoiceLine as any).taxRate ?? 0).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        throw Object.assign(new Error(`invalid taxRate on invoiceLineId ${r.invoiceLineId}`), { statusCode: 400 });
+      }
+      // Recompute tax from net subtotal to keep consistent with stored taxRate.
+      const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+      const docLineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+
+      subtotal = subtotal.add(netSubtotal);
       taxAmount = taxAmount.add(lineTax);
-      total = total.add(lineTotal);
+      total = total.add(docLineTotal);
       computedLines.push({
         companyId,
         invoiceLineId: r.invoiceLineId,
@@ -4211,7 +4226,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
         description: r.invoiceLine.description ?? r.invoiceLine.item?.name ?? null,
         quantity: r.qty,
         unitPrice: unit,
-        lineTotal,
+        discountAmount: discount,
+        lineTotal: netSubtotal, // store tax-exclusive net subtotal; tax stored separately
         taxRate: rate,
         taxAmount: lineTax,
         incomeAccountId: Number((r.invoiceLine as any).incomeAccountId ?? 0) || null,
@@ -4552,31 +4568,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
               taxAmount = taxAmount.toDecimalPlaces(2);
               total = total.toDecimalPlaces(2);
 
-              // Ensure Tax Payable account exists when needed (code 2100, LIABILITY).
-              let taxPayableAccountId: number | null = null;
-              if (taxAmount.greaterThan(0)) {
-                const existing = await tx.account.findFirst({
-                  where: { companyId, type: AccountType.LIABILITY, code: '2100' },
-                  select: { id: true },
-                });
-                if (existing?.id) {
-                  taxPayableAccountId = existing.id;
-                } else {
-                  const created = await tx.account.create({
-                    data: {
-                      companyId,
-                      code: '2100',
-                      name: 'Tax Payable',
-                      type: AccountType.LIABILITY,
-                      normalBalance: 'CREDIT',
-                      reportGroup: 'OTHER_CURRENT_LIABILITY',
-                      cashflowActivity: 'OPERATING',
-                    },
-                    select: { id: true },
-                  });
-                  taxPayableAccountId = created.id;
-                }
-              }
+              // Ensure Tax Payable exists when needed (do NOT assume code 2100; some tenants use it for Customer Advance).
+              const taxPayableAccountId = await ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount);
 
               const jeLines: any[] = [
                 // Dr Income (reduce revenue)

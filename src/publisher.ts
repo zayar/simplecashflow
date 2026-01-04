@@ -1,8 +1,7 @@
 import Fastify from 'fastify';
 import { randomUUID } from 'node:crypto';
-import type { DomainEventEnvelopeV1 } from './events/domainEvent.js';
 import { prisma } from './infrastructure/db.js';
-import { publishDomainEvent } from './infrastructure/pubsub.js';
+import { publishDomainEvent, buildEventEnvelope } from './infrastructure/pubsub.js';
 
 const fastify = Fastify({ logger: true });
 
@@ -16,37 +15,29 @@ function backoffMs(attempt: number): number {
   return Math.min(ms, 60_000);
 }
 
-function buildEnvelopeFromEventRow(e: any): DomainEventEnvelopeV1 {
+// Use shared buildEventEnvelope from pubsub.ts
+// Wrapper to add error code for dead-lettering
+function buildEnvelopeFromEventRow(e: any) {
   const companyId = Number(e.companyId);
   if (!Number.isInteger(companyId) || companyId <= 0) {
     throw Object.assign(new Error('outbox event is missing a valid companyId (tenant)'), {
       code: 'OUTBOX_TENANT_MISSING',
     });
   }
-  const payload = e.payload ?? {};
-
-  const aggregateId =
-    e.aggregateId ??
-    (typeof payload?.journalEntryId === 'number'
-      ? String(payload.journalEntryId)
-      : typeof payload?.journalEntryId === 'string'
-        ? payload.journalEntryId
-        : e.eventId);
-
-  return {
+  return buildEventEnvelope({
     eventId: e.eventId,
     eventType: e.eventType,
-    schemaVersion: (e.schemaVersion ?? 'v1') as any,
-    occurredAt: new Date(e.occurredAt).toISOString(),
-    companyId,
-    partitionKey: e.partitionKey ?? String(companyId),
-    correlationId: e.correlationId ?? e.eventId,
-    causationId: e.causationId ?? undefined,
-    aggregateType: e.aggregateType ?? 'Unknown',
-    aggregateId,
-    source: e.source ?? 'cashflow-api',
-    payload,
-  };
+    schemaVersion: e.schemaVersion,
+    occurredAt: new Date(e.occurredAt),
+    companyId: e.companyId,
+    partitionKey: e.partitionKey,
+    correlationId: e.correlationId,
+    causationId: e.causationId,
+    aggregateType: e.aggregateType,
+    aggregateId: e.aggregateId,
+    source: e.source,
+    payload: e.payload,
+  });
 }
 
 async function deadLetterAndUnlock(eventId: string, reason: string) {
