@@ -1433,6 +1433,149 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     };
   });
 
+  // --- Account Transactions (drill-down from reports) ---
+  // GET /companies/:companyId/reports/account-transactions?accountId=123&from=YYYY-MM-DD&to=YYYY-MM-DD&take=200
+  fastify.get('/companies/:companyId/reports/account-transactions', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    const query = request.query as { accountId?: string; from?: string; to?: string; take?: string };
+
+    const accountId = Number(query.accountId ?? 0);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      reply.status(400);
+      return { error: 'accountId is required' };
+    }
+    if (!query.from || !query.to) {
+      reply.status(400);
+      return { error: 'from and to are required (YYYY-MM-DD)' };
+    }
+
+    const fromDate = normalizeToDay(new Date(query.from));
+    const toDate = normalizeToDay(new Date(query.to));
+    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid from/to dates' };
+    }
+    if (fromDate.getTime() > toDate.getTime()) {
+      reply.status(400);
+      return { error: 'from must be <= to' };
+    }
+
+    const take = Math.min(Math.max(Number(query.take ?? 200) || 200, 1), 1000);
+
+    const account = await prisma.account.findFirst({
+      where: { companyId, id: accountId },
+      select: { id: true, code: true, name: true, type: true, normalBalance: true },
+    });
+    if (!account) {
+      reply.status(404);
+      return { error: 'account not found' };
+    }
+
+    // Opening balance (source-of-truth from journal lines, independent of worker projections)
+    const openingAgg = await prisma.journalLine.aggregate({
+      where: {
+        companyId,
+        accountId,
+        journalEntry: { date: { lt: fromDate } },
+      } as any,
+      _sum: { debit: true, credit: true },
+    });
+    const openingDebit = new Prisma.Decimal(openingAgg._sum.debit ?? 0).toDecimalPlaces(2);
+    const openingCredit = new Prisma.Decimal(openingAgg._sum.credit ?? 0).toDecimalPlaces(2);
+    const openingNet = account.normalBalance === 'DEBIT' ? openingDebit.sub(openingCredit) : openingCredit.sub(openingDebit);
+    const openingAbs = openingNet.abs().toDecimalPlaces(2);
+    const openingSide = openingNet.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr');
+
+    // Pull journal lines for the period, include the parent journal entry
+    const lines = await prisma.journalLine.findMany({
+      where: {
+        companyId,
+        accountId,
+        journalEntry: { date: { gte: fromDate, lte: toDate } },
+      } as any,
+      include: {
+        journalEntry: { select: { id: true, entryNumber: true, date: true, description: true } },
+      },
+      orderBy: [{ journalEntry: { date: 'asc' } }, { journalEntryId: 'asc' }, { id: 'asc' }] as any,
+      take,
+    });
+
+    // Group by journal entry (one row per JE for this account)
+    const byEntry = new Map<number, { entry: any; debit: Prisma.Decimal; credit: Prisma.Decimal }>();
+    for (const l of lines as any[]) {
+      const jeId = Number(l.journalEntryId);
+      const prev = byEntry.get(jeId);
+      const debit = new Prisma.Decimal(l.debit ?? 0).toDecimalPlaces(2);
+      const credit = new Prisma.Decimal(l.credit ?? 0).toDecimalPlaces(2);
+      if (!prev) {
+        byEntry.set(jeId, { entry: l.journalEntry, debit, credit });
+      } else {
+        prev.debit = prev.debit.add(debit).toDecimalPlaces(2);
+        prev.credit = prev.credit.add(credit).toDecimalPlaces(2);
+      }
+    }
+
+    const entryIds = Array.from(byEntry.keys());
+
+    // Best-effort source document inference (fast lookups by journalEntryId)
+    const [invoices, creditNotes, payments, expenses, purchaseBills, vendorCredits, pbPayments, expPayments] = await Promise.all([
+      prisma.invoice.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, invoiceNumber: true } }),
+      prisma.creditNote.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, creditNoteNumber: true } } as any),
+      prisma.payment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, invoiceId: true } }),
+      prisma.expense.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, expenseNumber: true } } as any),
+      prisma.purchaseBill.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, billNumber: true } } as any),
+      prisma.vendorCredit.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, creditNumber: true } } as any),
+      prisma.purchaseBillPayment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, purchaseBillId: true } } as any),
+      prisma.expensePayment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, expenseId: true } } as any),
+    ]);
+
+    const sourceByJeId = new Map<number, { transactionType: string; transactionNo: string; referenceNo: string | null }>();
+    for (const i of invoices as any[]) sourceByJeId.set(Number(i.journalEntryId), { transactionType: 'Invoice', transactionNo: i.invoiceNumber, referenceNo: null });
+    for (const c of creditNotes as any[]) sourceByJeId.set(Number(c.journalEntryId), { transactionType: 'Credit Note', transactionNo: (c as any).creditNoteNumber ?? String((c as any).id), referenceNo: null });
+    for (const p of payments as any[]) sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Payment', transactionNo: `PAY-${p.id}`, referenceNo: p.invoiceId ? `Invoice#${p.invoiceId}` : null });
+    for (const e of expenses as any[]) sourceByJeId.set(Number(e.journalEntryId), { transactionType: 'Expense', transactionNo: (e as any).expenseNumber ?? String((e as any).id), referenceNo: null });
+    for (const b of purchaseBills as any[]) sourceByJeId.set(Number(b.journalEntryId), { transactionType: 'Purchase Bill', transactionNo: (b as any).billNumber ?? String((b as any).id), referenceNo: null });
+    for (const v of vendorCredits as any[]) sourceByJeId.set(Number(v.journalEntryId), { transactionType: 'Vendor Credit', transactionNo: (v as any).creditNumber ?? String((v as any).id), referenceNo: null });
+    for (const p of pbPayments as any[]) sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Bill Payment', transactionNo: `PB-PAY-${p.id}`, referenceNo: p.purchaseBillId ? `Bill#${p.purchaseBillId}` : null });
+    for (const p of expPayments as any[]) sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Expense Payment', transactionNo: `EXP-PAY-${p.id}`, referenceNo: p.expenseId ? `Expense#${p.expenseId}` : null });
+
+    // Build rows + running balance
+    let running = openingNet.toDecimalPlaces(2);
+    const rows = Array.from(byEntry.values())
+      .sort((a, b) => new Date(a.entry.date).getTime() - new Date(b.entry.date).getTime() || Number(a.entry.id) - Number(b.entry.id))
+      .map((g) => {
+        const net = account.normalBalance === 'DEBIT' ? g.debit.sub(g.credit) : g.credit.sub(g.debit);
+        running = running.add(net).toDecimalPlaces(2);
+        const abs = net.abs().toDecimalPlaces(2);
+        const side = net.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr');
+        const src = sourceByJeId.get(Number(g.entry.id)) ?? null;
+        return {
+          date: new Date(g.entry.date).toISOString().slice(0, 10),
+          journalEntryId: g.entry.id,
+          entryNumber: g.entry.entryNumber,
+          description: g.entry.description,
+          debit: g.debit.toString(),
+          credit: g.credit.toString(),
+          amount: abs.toString(),
+          side,
+          runningBalance: running.abs().toString(),
+          runningSide: running.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr'),
+          transactionType: src?.transactionType ?? 'Journal Entry',
+          transactionNo: src?.transactionNo ?? g.entry.entryNumber,
+          referenceNo: src?.referenceNo ?? null,
+        };
+      });
+
+    return {
+      companyId,
+      from: query.from,
+      to: query.to,
+      account: { id: account.id, code: account.code, name: account.name, type: account.type },
+      openingBalance: { amount: openingAbs.toString(), side: openingSide },
+      rows,
+    };
+  });
+
   // --- Cashflow Statement (Indirect Method) ---
   // GET /companies/:companyId/reports/cashflow?from=YYYY-MM-DD&to=YYYY-MM-DD
   fastify.get('/companies/:companyId/reports/cashflow', async (request, reply) => {

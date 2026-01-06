@@ -140,7 +140,7 @@ export default function VendorBalanceSummaryReportPage() {
             </Table>
           </div>
           <div className="mt-2 text-xs text-muted-foreground">
-            Notes: “Amount Paid” includes payments and applied vendor credits that reduce payables.
+            Notes: “Amount Paid” includes payments and POSTED vendor credits that reduce payables.
           </div>
         </CardContent>
       </Card>

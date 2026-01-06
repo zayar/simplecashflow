@@ -1,5 +1,5 @@
 import { prisma } from '../../infrastructure/db.js';
-import { AccountReportGroup, AccountType, BankingAccountKind, CashflowActivity, NormalBalance, } from '@prisma/client';
+import { AccountReportGroup, AccountType, BankingAccountKind, CashflowActivity, NormalBalance, Prisma, } from '@prisma/client';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
@@ -510,6 +510,128 @@ export async function companiesRoutes(fastify) {
             logoUrl: publicUrl,
             template: sanitizeInvoiceTemplate(updated.invoiceTemplate),
         };
+    });
+    const VALID_QR_METHODS = ['kbz', 'ayaPay', 'uabPay', 'aPlus'];
+    function sanitizePaymentQrCodes(input) {
+        if (!input || typeof input !== 'object')
+            return {};
+        const result = {};
+        for (const key of VALID_QR_METHODS) {
+            const val = input[key];
+            if (typeof val === 'string' && val.trim()) {
+                result[key] = val.trim();
+            }
+        }
+        return result;
+    }
+    // Get current payment QR codes
+    fastify.get('/companies/:companyId/payment-qr-codes', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+        const companyId = requireCompanyIdParam(request, reply);
+        const company = await prisma.company.findUnique({
+            where: { id: companyId },
+            select: { paymentQrCodes: true },
+        });
+        return sanitizePaymentQrCodes(company?.paymentQrCodes ?? null);
+    });
+    // Update payment QR codes (JSON update, not file upload)
+    fastify.put('/companies/:companyId/payment-qr-codes', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+        const companyId = requireCompanyIdParam(request, reply);
+        const body = request.body;
+        const company = await prisma.company.findUnique({
+            where: { id: companyId },
+            select: { paymentQrCodes: true },
+        });
+        const current = sanitizePaymentQrCodes(company?.paymentQrCodes ?? null);
+        const merged = { ...current };
+        // Merge updates (allow null to clear a method)
+        for (const key of VALID_QR_METHODS) {
+            if (key in body) {
+                const val = body[key];
+                if (val === null || val === '') {
+                    delete merged[key];
+                }
+                else if (typeof val === 'string' && val.trim()) {
+                    merged[key] = val.trim();
+                }
+            }
+        }
+        const updated = await prisma.company.update({
+            where: { id: companyId },
+            data: { paymentQrCodes: merged },
+            select: { paymentQrCodes: true },
+        });
+        return sanitizePaymentQrCodes(updated.paymentQrCodes ?? null);
+    });
+    // Upload QR code image for a specific payment method
+    fastify.post('/companies/:companyId/payment-qr-codes/:method', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+        const companyId = requireCompanyIdParam(request, reply);
+        const method = String(request.params?.method ?? '').trim();
+        if (!VALID_QR_METHODS.includes(method)) {
+            reply.status(400);
+            return { error: `Invalid method. Valid: ${VALID_QR_METHODS.join(', ')}` };
+        }
+        const file = await request.file();
+        if (!file) {
+            reply.status(400);
+            return { error: 'file is required' };
+        }
+        const mimetype = String(file.mimetype ?? '');
+        if (!mimetype.startsWith('image/')) {
+            reply.status(400);
+            return { error: 'only image uploads are allowed' };
+        }
+        const bucketName = requireEnv('INVOICE_TEMPLATE_ASSETS_BUCKET');
+        const storage = new Storage();
+        const ext = mimetype === 'image/png' ? '.png' : mimetype === 'image/jpeg' ? '.jpg' : '';
+        const objectName = `companies/${companyId}/payment-qr/${method}/${uuidv4()}${ext}`;
+        const buf = await file.toBuffer();
+        await storage.bucket(bucketName).file(objectName).save(buf, {
+            contentType: mimetype,
+            metadata: { cacheControl: 'public, max-age=31536000' },
+        });
+        const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectName}`;
+        // Update the specific method's QR code URL
+        const company = await prisma.company.findUnique({
+            where: { id: companyId },
+            select: { paymentQrCodes: true },
+        });
+        const current = sanitizePaymentQrCodes(company?.paymentQrCodes ?? null);
+        current[method] = publicUrl;
+        const updated = await prisma.company.update({
+            where: { id: companyId },
+            data: { paymentQrCodes: current },
+            select: { paymentQrCodes: true },
+        });
+        return {
+            method,
+            url: publicUrl,
+            allQrCodes: sanitizePaymentQrCodes(updated.paymentQrCodes ?? null),
+        };
+    });
+    // Delete a specific payment QR code
+    fastify.delete('/companies/:companyId/payment-qr-codes/:method', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER/ACCOUNTANT');
+        const companyId = requireCompanyIdParam(request, reply);
+        const method = String(request.params?.method ?? '').trim();
+        if (!VALID_QR_METHODS.includes(method)) {
+            reply.status(400);
+            return { error: `Invalid method. Valid: ${VALID_QR_METHODS.join(', ')}` };
+        }
+        const company = await prisma.company.findUnique({
+            where: { id: companyId },
+            select: { paymentQrCodes: true },
+        });
+        const current = sanitizePaymentQrCodes(company?.paymentQrCodes ?? null);
+        delete current[method];
+        const updated = await prisma.company.update({
+            where: { id: companyId },
+            data: { paymentQrCodes: Object.keys(current).length > 0 ? current : Prisma.DbNull },
+            select: { paymentQrCodes: true },
+        });
+        return sanitizePaymentQrCodes(updated.paymentQrCodes ?? null);
     });
     // --- Account APIs ---
     // List accounts for a company

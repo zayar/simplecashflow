@@ -7,6 +7,7 @@ import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoic
 import { ensureTaxPayableAccountIfNeeded } from '../../utils/tax.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
+import { Storage } from '@google-cloud/storage';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
@@ -43,6 +44,56 @@ export async function booksRoutes(fastify: FastifyInstance) {
   // All Books endpoints are tenant-scoped and must be authenticated.
   fastify.addHook('preHandler', fastify.authenticate);
   const redis = getRedis();
+
+  function parseGcsUri(input: string): { bucket: string; objectName: string } | null {
+    const s = String(input ?? '').trim();
+    if (!s.startsWith('gs://')) return null;
+    const rest = s.slice('gs://'.length);
+    const idx = rest.indexOf('/');
+    if (idx <= 0) return null;
+    const bucket = rest.slice(0, idx);
+    const objectName = rest.slice(idx + 1);
+    if (!bucket || !objectName) return null;
+    return { bucket, objectName };
+  }
+
+  async function signedUrlIfGcsUri(storage: Storage, input: string | null | undefined, ttlMs: number = 15 * 60 * 1000) {
+    if (!input) return null;
+    const parsed = parseGcsUri(input);
+    if (!parsed) return input;
+    try {
+      const [url] = await storage.bucket(parsed.bucket).file(parsed.objectName).getSignedUrl({
+        version: 'v4',
+        action: 'read',
+        expires: Date.now() + ttlMs,
+      });
+      return url;
+    } catch {
+      return null;
+    }
+  }
+
+  async function presentPendingPaymentProofs(storage: Storage, proofs: any): Promise<any[]> {
+    if (!Array.isArray(proofs)) return [];
+    const out: any[] = [];
+    for (const p of proofs as any[]) {
+      const submittedAt = typeof p?.submittedAt === 'string' ? p.submittedAt : null;
+      const note = typeof p?.note === 'string' ? p.note : p?.note === null ? null : null;
+
+      // New format: { id, gcsUri, ... } => signed URL
+      if (typeof p?.id === 'string' && typeof p?.gcsUri === 'string') {
+        const url = await signedUrlIfGcsUri(storage, String(p.gcsUri));
+        if (url) out.push({ id: p.id, url, submittedAt, note });
+        continue;
+      }
+
+      // Legacy format: { url, ... } already public
+      if (typeof p?.url === 'string' && String(p.url).trim()) {
+        out.push({ url: String(p.url).trim(), submittedAt, note });
+      }
+    }
+    return out;
+  }
 
   function normalizeCurrencyOrNull(input: unknown): string | null {
     if (input === undefined || input === null) return null;
@@ -535,7 +586,15 @@ export async function booksRoutes(fastify: FastifyInstance) {
       .filter((p: any) => !p.reversedAt)
       .reduce((sum, p) => sum + Number(p.amount), 0);
     const totalCredits = (invoice.customerAdvanceApplications ?? []).reduce((sum: number, a: any) => sum + Number(a.amount), 0);
-    const totalPaid = totalPayments + totalCredits;
+    // Credit notes linked to this invoice reduce AR and should reduce the invoice balance due.
+    const creditNotes = await prisma.creditNote.findMany({
+      where: { companyId, invoiceId: invoice.id, status: 'POSTED' as any },
+      select: { id: true, creditNoteNumber: true, creditNoteDate: true, total: true },
+      orderBy: [{ creditNoteDate: 'desc' }, { id: 'desc' }],
+    });
+    const totalCreditNotes = (creditNotes ?? []).reduce((sum, cn: any) => sum + Number(cn.total ?? 0), 0);
+
+    const totalPaid = totalPayments + totalCredits + totalCreditNotes;
 
     const creditsAgg = await prisma.customerAdvance.aggregate({
       where: { companyId, customerId: invoice.customerId },
@@ -578,6 +637,25 @@ export async function booksRoutes(fastify: FastifyInstance) {
     // Note: customer advance applications have their own journal entries, but we don't
     // include them in `journalEntries` UI yet (to keep the invoice JE list focused).
 
+    const storage = new Storage();
+    const payments = await Promise.all(
+      invoice.payments.map(async (p) => ({
+        id: p.id,
+        paymentDate: p.paymentDate,
+        amount: p.amount,
+        bankAccount: {
+          id: p.bankAccount.id,
+          code: p.bankAccount.code,
+          name: p.bankAccount.name,
+        },
+        attachmentUrl: await signedUrlIfGcsUri(storage, (p as any).attachmentUrl ?? null),
+        journalEntryId: p.journalEntry?.id ?? null,
+        reversedAt: (p as any).reversedAt ?? null,
+        reversalReason: (p as any).reversalReason ?? null,
+        reversalJournalEntryId: (p as any).reversalJournalEntryId ?? null,
+      }))
+    );
+
     return {
       id: invoice.id,
       invoiceNumber: invoice.invoiceNumber,
@@ -595,30 +673,26 @@ export async function booksRoutes(fastify: FastifyInstance) {
       customerNotes: (invoice as any).customerNotes ?? null,
       termsAndConditions: (invoice as any).termsAndConditions ?? null,
       lines: invoice.lines,
-      payments: invoice.payments.map((p) => ({
-        id: p.id,
-        paymentDate: p.paymentDate,
-        amount: p.amount,
-        bankAccount: {
-          id: p.bankAccount.id,
-          code: p.bankAccount.code,
-          name: p.bankAccount.name,
-        },
-        attachmentUrl: (p as any).attachmentUrl ?? null,
-        journalEntryId: p.journalEntry?.id ?? null,
-        reversedAt: (p as any).reversedAt ?? null,
-        reversalReason: (p as any).reversalReason ?? null,
-        reversalJournalEntryId: (p as any).reversalJournalEntryId ?? null,
-      })),
-      pendingPaymentProofs: Array.isArray((invoice as any).pendingPaymentProofs) 
-        ? (invoice as any).pendingPaymentProofs 
-        : [],
-      creditsApplied: (invoice.customerAdvanceApplications ?? []).map((a: any) => ({
-        id: a.id,
-        appliedDate: a.appliedDate,
-        amount: a.amount,
-        customerAdvanceId: a.customerAdvanceId,
-      })),
+      payments,
+      pendingPaymentProofs: await presentPendingPaymentProofs(storage, (invoice as any).pendingPaymentProofs),
+      creditsApplied: [
+        ...(invoice.customerAdvanceApplications ?? []).map((a: any) => ({
+          id: a.id,
+          appliedDate: a.appliedDate,
+          amount: a.amount,
+          customerAdvanceId: a.customerAdvanceId,
+          creditNoteId: null,
+          creditNoteNumber: null,
+        })),
+        ...(creditNotes ?? []).map((cn: any) => ({
+          id: cn.id,
+          appliedDate: cn.creditNoteDate,
+          amount: cn.total,
+          customerAdvanceId: null,
+          creditNoteId: cn.id,
+          creditNoteNumber: cn.creditNoteNumber,
+        })),
+      ],
       creditsAvailable: creditsAvailable.toString(),
       totalPaid: totalPaid,
       remainingBalance: Number(invoice.total) - totalPaid,
@@ -2310,6 +2384,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
       bankAccountId?: number;
       paymentMode?: 'CASH' | 'BANK' | 'E_WALLET';
       attachmentUrl?: string; // Payment proof image URL
+      pendingProofId?: string; // Preferred: stable id from invoice.pendingPaymentProofs (customer upload)
     };
 
     if (!body.amount || body.amount <= 0 || !body.bankAccountId) {
@@ -2461,10 +2536,29 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   ],
                 });
 
-                // Validate attachment URL if provided (must be from our GCS bucket)
-                const attachmentUrl = (typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim())
-                  ? body.attachmentUrl.trim()
-                  : null;
+                // Payment attachment (optional). Prefer selecting from pending proofs by id.
+                const pendingProofId =
+                  typeof (body as any).pendingProofId === 'string' && String((body as any).pendingProofId).trim()
+                    ? String((body as any).pendingProofId).trim()
+                    : null;
+
+                let attachmentUrl =
+                  typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim()
+                    ? body.attachmentUrl.trim()
+                    : null;
+
+                if (pendingProofId && Array.isArray((invoice as any).pendingPaymentProofs)) {
+                  const hit = ((invoice as any).pendingPaymentProofs as any[]).find(
+                    (p: any) => String(p?.id ?? '') === pendingProofId
+                  );
+                  if (hit && typeof hit?.gcsUri === 'string' && String(hit.gcsUri).startsWith('gs://')) {
+                    // Store stable reference; presentation layer returns signed URL.
+                    attachmentUrl = String(hit.gcsUri);
+                  } else if (hit && typeof hit?.url === 'string') {
+                    // Legacy fallback
+                    attachmentUrl = String(hit.url);
+                  }
+                }
 
                 const payment = await tx.payment.create({
                   data: {
@@ -2480,9 +2574,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
                 // If attachmentUrl was from pendingPaymentProofs, remove it from the list
                 if (attachmentUrl && Array.isArray(invoice.pendingPaymentProofs)) {
-                  const remainingProofs = (invoice.pendingPaymentProofs as any[]).filter(
-                    (p: any) => p?.url !== attachmentUrl
-                  );
+                  const remainingProofs = pendingProofId
+                    ? (invoice.pendingPaymentProofs as any[]).filter((p: any) => String(p?.id ?? '') !== pendingProofId)
+                    : (invoice.pendingPaymentProofs as any[]).filter((p: any) => p?.url !== attachmentUrl);
                   await tx.invoice.updateMany({
                     where: { id: invoice.id, companyId },
                     data: { pendingPaymentProofs: remainingProofs.length > 0 ? remainingProofs : Prisma.DbNull },

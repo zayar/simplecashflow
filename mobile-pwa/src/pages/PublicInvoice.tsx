@@ -130,11 +130,13 @@ export default function PublicInvoice() {
     }
   };
 
-  const handleRemoveProof = async (url: string) => {
+  const handleRemoveProof = async (proof: any) => {
     if (!token) return;
     if (!confirm('Remove this payment proof?')) return;
     try {
-      await deletePublicPaymentProof(token, url);
+      const id = typeof proof?.id === 'string' ? proof.id : null;
+      const url = typeof proof?.url === 'string' ? proof.url : null;
+      await deletePublicPaymentProof(token, id ? { id } : url ? { url } : undefined);
       queryClient.invalidateQueries({ queryKey: ['public-invoice', token] });
     } catch (err) {
       console.error('Failed to remove proof:', err);
@@ -252,7 +254,7 @@ export default function PublicInvoice() {
                       {!isPaid ? (
                         <button
                           type="button"
-                          onClick={() => handleRemoveProof(p.url)}
+                          onClick={() => handleRemoveProof(p)}
                           className="w-full border-t border-border px-3 py-2 text-sm text-rose-600"
                         >
                           Remove

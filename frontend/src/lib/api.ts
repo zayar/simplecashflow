@@ -291,6 +291,46 @@ export async function getProfitLoss(companyId: number, from: string, to: string)
   return fetchApi(`/companies/${companyId}/reports/profit-and-loss?from=${from}&to=${to}`);
 }
 
+// --- Account Transactions (drill-down) ---
+export type AccountTransactionsReport = {
+  companyId: number;
+  from: string;
+  to: string;
+  account: { id: number; code: string; name: string; type: string };
+  openingBalance: { amount: string; side: 'Dr' | 'Cr' };
+  rows: Array<{
+    date: string; // YYYY-MM-DD
+    journalEntryId: number;
+    entryNumber: string;
+    description: string;
+    transactionType: string;
+    transactionNo: string;
+    referenceNo: string | null;
+    debit: string;
+    credit: string;
+    amount: string;
+    side: 'Dr' | 'Cr';
+    runningBalance: string;
+    runningSide: 'Dr' | 'Cr';
+  }>;
+};
+
+export async function getAccountTransactions(
+  companyId: number,
+  accountId: number,
+  from: string,
+  to: string,
+  take: number = 200
+): Promise<AccountTransactionsReport> {
+  const qs = new URLSearchParams({
+    accountId: String(accountId),
+    from,
+    to,
+    take: String(take),
+  }).toString();
+  return fetchApi(`/companies/${companyId}/reports/account-transactions?${qs}`);
+}
+
 export interface Account {
   id: number;
   code: string;
@@ -352,6 +392,32 @@ export async function updateVendor(
       email: data.email ?? null,
       phone: data.phone ?? null,
     }),
+  });
+}
+
+// --- Credit Notes (AR Credits) ---
+export type CreditNoteListRow = {
+  id: number;
+  creditNoteNumber: string;
+  creditNoteDate: string;
+  total: string;
+  invoiceId: number | null;
+};
+
+export async function getCustomerCreditNotes(companyId: number, customerId: number, onlyOpen: boolean = true): Promise<CreditNoteListRow[]> {
+  const qs = new URLSearchParams({ onlyOpen: onlyOpen ? '1' : '0' }).toString();
+  return fetchApi(`/companies/${companyId}/customers/${customerId}/credit-notes?${qs}`);
+}
+
+export async function applyCreditNoteToInvoice(
+  companyId: number,
+  invoiceId: number,
+  creditNoteId: number
+): Promise<{ invoiceId: number; creditNoteId: number; status: string }> {
+  return fetchApi(`/companies/${companyId}/invoices/${invoiceId}/apply-credit-note`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}` },
+    body: JSON.stringify({ creditNoteId }),
   });
 }
 

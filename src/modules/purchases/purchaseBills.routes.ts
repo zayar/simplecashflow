@@ -730,6 +730,9 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                   correlationId,
                   createdByUserId: (request as any).user?.userId ?? null,
                   journalEntryId: null,
+                  // Allow backdating: WAC is recalculated by replaying the full move timeline.
+                  // This enables posting bills with past dates (common for late-arriving invoices).
+                  allowBackdated: true,
                 });
               } else {
                 if (!debitAccountId) {
@@ -1281,6 +1284,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                   correlationId,
                   createdByUserId: (request as any).user?.userId ?? null,
                   journalEntryId: null,
+                  allowBackdated: true,
                 });
               }
               await tx.stockMove.updateMany({

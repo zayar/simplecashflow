@@ -76,6 +76,10 @@ async function buildApp() {
   const authMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10);
   const globalWindowMs = Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS ?? 60_000);
   const globalMax = Number(process.env.GLOBAL_RATE_LIMIT_MAX ?? 300);
+  const publicWindowMs = Number(process.env.PUBLIC_RATE_LIMIT_WINDOW_MS ?? 60_000);
+  const publicMax = Number(process.env.PUBLIC_RATE_LIMIT_MAX ?? 120);
+  const publicUploadWindowMs = Number(process.env.PUBLIC_UPLOAD_RATE_LIMIT_WINDOW_MS ?? 60_000);
+  const publicUploadMax = Number(process.env.PUBLIC_UPLOAD_RATE_LIMIT_MAX ?? 10);
 
   type Bucket = { windowStartMs: number; count: number };
   const buckets = new Map<string, Bucket>();
@@ -103,10 +107,19 @@ async function buildApp() {
     const isAuthEndpoint =
       request.method === 'POST' && (path === '/login' || path === '/register');
 
-    const key = `${isAuthEndpoint ? 'auth' : 'global'}:${ip}`;
+    // Public invoice links are anonymous by design; add a stricter bucket to reduce abuse.
+    const isPublicInvoice = typeof path === 'string' && path.startsWith('/public/invoices/');
+    const isPublicUpload =
+      isPublicInvoice && (request.method === 'POST' || request.method === 'DELETE') && path.includes('/payment-proof');
+
+    const key = `${isAuthEndpoint ? 'auth' : isPublicUpload ? 'publicUpload' : isPublicInvoice ? 'public' : 'global'}:${ip}`;
     const ok = isAuthEndpoint
       ? hit(key, authMax, authWindowMs, nowMs)
-      : hit(key, globalMax, globalWindowMs, nowMs);
+      : isPublicUpload
+        ? hit(key, publicUploadMax, publicUploadWindowMs, nowMs)
+        : isPublicInvoice
+          ? hit(key, publicMax, publicWindowMs, nowMs)
+          : hit(key, globalMax, globalWindowMs, nowMs);
 
     if (!ok) {
       reply.status(429).send({ error: 'Too Many Requests' });

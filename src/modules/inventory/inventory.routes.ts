@@ -608,8 +608,11 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
     const rows = Array.from(state.entries())
       .map(([key, st]) => {
         const m = meta.get(key)!;
-        const qtyOnHand = st.qty.toDecimalPlaces(2);
-        const inventoryValue = st.value.toDecimalPlaces(2);
+        // Avoid displaying "-0.00" (can happen due to decimal rounding after IN/OUT).
+        const qtyOnHandRaw = st.qty.toDecimalPlaces(2);
+        const inventoryValueRaw = st.value.toDecimalPlaces(2);
+        const qtyOnHand = qtyOnHandRaw.equals(0) ? new Prisma.Decimal(0) : qtyOnHandRaw;
+        const inventoryValue = inventoryValueRaw.equals(0) ? new Prisma.Decimal(0) : inventoryValueRaw;
         const avgUnitCost = qtyOnHand.equals(0) ? new Prisma.Decimal(0) : inventoryValue.div(qtyOnHand).toDecimalPlaces(2);
         return {
           locationId: m.locationId,
@@ -622,7 +625,8 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
           inventoryValue: inventoryValue.toString(),
         };
       })
-      .filter((r) => Number(r.qtyOnHand) !== 0 || Number(r.inventoryValue) !== 0)
+      // Do NOT filter out rows when qty/value becomes 0; users want to keep the item visible for audit trail.
+      // Note: rows are already limited to items/locations that had at least one StockMove up to asOf.
       .sort((a, b) => (a.itemName || '').localeCompare(b.itemName || '') || (a.locationName || '').localeCompare(b.locationName || ''));
 
     const totals = rows.reduce(

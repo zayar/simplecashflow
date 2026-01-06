@@ -10,14 +10,27 @@ import { Label } from '@/components/ui/label';
 import { Loader2 } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatDateInputInTimeZone, todayInTimeZone } from '@/lib/utils';
+import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 
 export default function ProfitLossPage() {
   const { user, companySettings } = useAuth();
+  const router = useRouter();
+  const sp = useSearchParams();
   const [report, setReport] = useState<ProfitLossReport | null>(null);
   const [loading, setLoading] = useState(false);
   
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
+
+  // Restore from/to from URL query params (so Back from drill-down preserves filters).
+  useEffect(() => {
+    const qFrom = sp.get('from');
+    const qTo = sp.get('to');
+    if (qFrom && !from) setFrom(String(qFrom));
+    if (qTo && !to) setTo(String(qTo));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sp]);
 
   useEffect(() => {
     const tz = companySettings?.timeZone ?? 'Asia/Yangon';
@@ -36,10 +49,13 @@ export default function ProfitLossPage() {
 
   async function fetchReport() {
     if (!user?.companyId) return;
+    if (!from || !to) return;
     setLoading(true);
     try {
       const data = await getProfitLoss(user.companyId, from, to);
       setReport(data);
+      // Persist filters in URL for shareability and back navigation.
+      router.replace(`/reports/profit-loss?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
     } catch (error) {
       console.error(error);
     } finally {
@@ -48,10 +64,11 @@ export default function ProfitLossPage() {
   }
 
   useEffect(() => {
-    if (user?.companyId) {
-      fetchReport();
-    }
-  }, [user?.companyId]);
+    if (!user?.companyId) return;
+    if (!from || !to) return;
+    fetchReport();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, from, to]);
 
   return (
     <div className="space-y-6">
@@ -152,7 +169,14 @@ export default function ProfitLossPage() {
                       report.incomeAccounts.map((row) => (
                         <TableRow key={row.accountId}>
                           <TableCell className="font-medium">{row.code}</TableCell>
-                          <TableCell>{row.name}</TableCell>
+                          <TableCell>
+                            <Link
+                              className="text-primary hover:underline"
+                              href={`/reports/account-transactions?accountId=${row.accountId}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`}
+                            >
+                              {row.name}
+                            </Link>
+                          </TableCell>
                           <TableCell className="text-right font-medium tabular-nums">
                             {Number(row.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </TableCell>
@@ -198,7 +222,14 @@ export default function ProfitLossPage() {
                       report.expenseAccounts.map((row) => (
                         <TableRow key={row.accountId}>
                           <TableCell className="font-medium">{row.code}</TableCell>
-                          <TableCell>{row.name}</TableCell>
+                          <TableCell>
+                            <Link
+                              className="text-primary hover:underline"
+                              href={`/reports/account-transactions?accountId=${row.accountId}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`}
+                            >
+                              {row.name}
+                            </Link>
+                          </TableCell>
                           <TableCell className="text-right font-medium tabular-nums">
                             {Number(row.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                           </TableCell>

@@ -3,10 +3,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Loader2, Plus, Trash2 } from 'lucide-react';
+import { ArrowLeft, Loader2, Plus, Trash2, Pencil } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi, getAccounts, getVendors, Account, Vendor } from '@/lib/api';
+import { fetchApi, getAccounts, getVendors, getCurrenciesOverview, getExchangeRates, Account, Vendor } from '@/lib/api';
 import { todayInTimeZone } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -16,6 +16,7 @@ import { SelectNative } from '@/components/ui/select-native';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
 import { AccountPicker } from '@/components/account-picker';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
 type Line = {
   itemId: string;
@@ -32,6 +33,11 @@ export default function EditPurchaseBillPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
 
+  const baseCurrency = useMemo(() => {
+    const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [companySettings?.baseCurrency]);
+
   const [loadingDoc, setLoadingDoc] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,6 +47,17 @@ export default function EditPurchaseBillPage() {
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [inventoryAccountId, setInventoryAccountId] = useState<number | null>(null);
+
+  const [currencyOptions, setCurrencyOptions] = useState<string[]>([]);
+  const [entryCurrency, setEntryCurrency] = useState<string>('');
+  const [enterInEntryCurrency, setEnterInEntryCurrency] = useState(true);
+  const isFx = useMemo(() => !!(baseCurrency && entryCurrency && entryCurrency !== baseCurrency), [baseCurrency, entryCurrency]);
+  const [fxRateToBase, setFxRateToBase] = useState<number | null>(null);
+  const [fxAsOfDate, setFxAsOfDate] = useState<string | null>(null);
+  const [fxRateManual, setFxRateManual] = useState(false);
+  const [fxEditOpen, setFxEditOpen] = useState(false);
+  const [fxEditRate, setFxEditRate] = useState('');
+  const [fxEditRecalc, setFxEditRecalc] = useState(false);
 
   const [bill, setBill] = useState<any>(null);
   const [form, setForm] = useState({
@@ -62,6 +79,22 @@ export default function EditPurchaseBillPage() {
     fetchApi(`/companies/${user.companyId}/settings`)
       .then((s) => setInventoryAccountId(Number(s.inventoryAssetAccountId ?? 0) || null))
       .catch(() => setInventoryAccountId(null));
+
+    getCurrenciesOverview(user.companyId)
+      .then((ov) => {
+        const base = String((ov as any)?.baseCurrency ?? baseCurrency ?? '').trim().toUpperCase();
+        const codes = Array.from(
+          new Set<string>([
+            ...(base ? [base] : []),
+            ...(((ov as any)?.currencies ?? []) as any[]).map((c: any) => String(c.code ?? '').trim().toUpperCase()).filter(Boolean),
+          ])
+        );
+        setCurrencyOptions(codes);
+        if (!entryCurrency && base) setEntryCurrency(base);
+      })
+      .catch(() => {
+        if (!entryCurrency && baseCurrency) setEntryCurrency(baseCurrency);
+      });
   }, [user?.companyId]);
 
   useEffect(() => {
@@ -110,6 +143,82 @@ export default function EditPurchaseBillPage() {
       .catch((e) => setError(e?.message ?? String(e)))
       .finally(() => setLoadingDoc(false));
   }, [user?.companyId, id]);
+
+  useEffect(() => {
+    setFxRateManual(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entryCurrency]);
+
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!isFx) {
+      setFxRateToBase(null);
+      setFxAsOfDate(null);
+      setFxRateManual(false);
+      return;
+    }
+    if (fxRateManual) return;
+    let cancelled = false;
+    getExchangeRates(user.companyId, entryCurrency)
+      .then((rows) => {
+        if (cancelled) return;
+        const billDateStr = String(form.billDate ?? '').slice(0, 10);
+        const billDate = billDateStr ? new Date(billDateStr) : null;
+        const pick =
+          (rows ?? []).find((r: any) => {
+            if (!billDate) return true;
+            const d = new Date(String(r.asOfDate ?? ''));
+            if (Number.isNaN(d.getTime())) return false;
+            return d.getTime() <= billDate.getTime();
+          }) ?? (rows ?? [])[0];
+        const rate = pick ? Number((pick as any).rateToBase) : 0;
+        if (!pick || !Number.isFinite(rate) || rate <= 0) {
+          setFxRateToBase(null);
+          setFxAsOfDate(null);
+          return;
+        }
+        setFxRateToBase(rate);
+        setFxAsOfDate((pick as any).asOfDate ?? null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setFxRateToBase(null);
+        setFxAsOfDate(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, isFx, entryCurrency, form.billDate, fxRateManual]);
+
+  function openFxEditor() {
+    setFxEditRate(fxRateToBase && fxRateToBase > 0 ? String(fxRateToBase) : '');
+    setFxEditRecalc(false);
+    setFxEditOpen(true);
+  }
+
+  function applyFxRateOverride() {
+    const next = Number(fxEditRate);
+    if (!Number.isFinite(next) || next <= 0) {
+      alert('Exchange rate must be a positive number.');
+      return;
+    }
+    const prev = fxRateToBase && fxRateToBase > 0 ? fxRateToBase : null;
+    setFxRateToBase(next);
+    setFxAsOfDate(form.billDate || null);
+    setFxRateManual(true);
+
+    if (fxEditRecalc && enterInEntryCurrency && prev && prev > 0) {
+      const factor = prev / next;
+      setLines((old) =>
+        old.map((l) => ({
+          ...l,
+          unitCost: String(Number(l.unitCost || 0) * factor),
+          discountAmount: String(Number(l.discountAmount || 0) * factor),
+        }))
+      );
+    }
+    setFxEditOpen(false);
+  }
 
   const selectableItems = useMemo(() => items.filter((i) => i.isActive !== false), [items]);
   const expenseAccounts = useMemo(() => accounts.filter((a) => a.type === 'EXPENSE'), [accounts]);
@@ -168,6 +277,8 @@ export default function EditPurchaseBillPage() {
     setSaving(true);
     setError(null);
     try {
+      const showFx = !!(isFx && enterInEntryCurrency && fxRateToBase && fxRateToBase > 0);
+      const factor = showFx ? fxRateToBase! : 1;
       await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}`, {
         method: 'PUT',
         body: JSON.stringify({
@@ -175,7 +286,12 @@ export default function EditPurchaseBillPage() {
           billDate: form.billDate,
           dueDate: form.dueDate || null,
           locationId: form.locationId ? Number(form.locationId) : undefined,
-          lines: payloadLines,
+          // Save in base currency; FX is only an entry helper.
+          lines: payloadLines.map((l) => ({
+            ...l,
+            unitCost: Number(l.unitCost) * factor,
+            discountAmount: Number(l.discountAmount ?? 0) * factor,
+          })),
         }),
       });
       router.push(`/purchase-bills/${id}`);
@@ -250,6 +366,60 @@ export default function EditPurchaseBillPage() {
                   ))}
                 </SelectNative>
               </div>
+
+              {baseCurrency ? (
+                <Card className="shadow-sm">
+                  <CardHeader>
+                    <CardTitle className="text-base">Exchange Rate (optional)</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2 text-sm">
+                    <div className="grid gap-2 md:max-w-sm">
+                      <Label>Entry Currency</Label>
+                      <SelectNative value={entryCurrency} onChange={(e) => setEntryCurrency(String(e.target.value).trim().toUpperCase())}>
+                        {(currencyOptions.length ? currencyOptions : [baseCurrency]).map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </SelectNative>
+                      <div className="text-xs text-muted-foreground">
+                        Base currency is <b>{baseCurrency}</b>. If you select a different currency, costs/discounts will be converted to base when saved.
+                      </div>
+                    </div>
+
+                    {isFx ? (
+                      <>
+                        {fxRateToBase ? (
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
+                            <div>
+                              Exchange rate: <b>1 {entryCurrency} = {baseCurrency}{fxRateToBase}</b>
+                              {fxAsOfDate ? ` (as of ${String(fxAsOfDate).slice(0, 10)})` : ''}
+                              {fxRateManual ? <span className="ml-2 text-xs text-orange-600">(custom)</span> : null}
+                            </div>
+                            <Button type="button" variant="outline" size="sm" onClick={openFxEditor}>
+                              <Pencil className="mr-2 h-4 w-4" />
+                              Edit rate
+                            </Button>
+                          </div>
+                        ) : (
+                          <div className="text-orange-600">
+                            No exchange rate found for {entryCurrency}. Add it in Currencies, or enter a custom rate here.
+                          </div>
+                        )}
+
+                        <label className="flex items-center gap-2">
+                          <input type="checkbox" checked={enterInEntryCurrency} onChange={(e) => setEnterInEntryCurrency(e.target.checked)} />
+                          <span>
+                            Enter costs/discounts in <b>{entryCurrency}</b> (will be saved in {baseCurrency})
+                          </span>
+                        </label>
+                      </>
+                    ) : (
+                      <div className="text-muted-foreground">Entry currency is the same as base. No conversion will be applied.</div>
+                    )}
+                  </CardContent>
+                </Card>
+              ) : null}
 
               <Card className="shadow-sm">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0">
@@ -411,6 +581,46 @@ export default function EditPurchaseBillPage() {
           </CardContent>
         </Card>
       )}
+
+      {/* Exchange rate editor (per-bill override; does not change company settings) */}
+      <Dialog open={fxEditOpen} onOpenChange={setFxEditOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit Exchange Rate</DialogTitle>
+            <DialogDescription>
+              Set a custom exchange rate for this purchase bill only. This will not change company exchange rates.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 text-sm">
+            <div className="grid gap-2">
+              <Label htmlFor="fxRateInput">Exchange Rate (in {baseCurrency ?? 'base currency'})</Label>
+              <Input
+                id="fxRateInput"
+                type="number"
+                inputMode="decimal"
+                step="0.000001"
+                value={fxEditRate}
+                onChange={(e) => setFxEditRate(e.target.value)}
+                placeholder={fxRateToBase ? String(fxRateToBase) : '0'}
+              />
+            </div>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={fxEditRecalc}
+                onChange={(e) => setFxEditRecalc(e.target.checked)}
+                disabled={!enterInEntryCurrency || !fxRateToBase}
+              />
+              <span>Re-calculate item prices based on this rate</span>
+            </label>
+          </div>
+          <DialogFooter>
+            <Button type="button" onClick={applyFxRateOverride}>
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -129,9 +129,18 @@ export function _test_replayStockMovesWithBackdatedInsert(args: {
 
   const computeInsertCost = (): { unitCostApplied: Prisma.Decimal; totalCostApplied: Prisma.Decimal } => {
     if (insert.direction === 'IN') {
-      const unit = d2(new Prisma.Decimal(insert.unitCostApplied));
-      const inValue = d2(insertQty.mul(unit));
-      return { unitCostApplied: unit, totalCostApplied: inValue };
+      // Default IN: qty * unitCostApplied.
+      // Optional override: allow caller to specify totalCostApplied for exact receipt flows
+      // (e.g., purchase bills with an absolute discount that must preserve the discounted line total).
+      const overrideInValue = insert.totalCostApplied !== undefined && insert.totalCostApplied !== null;
+      const inValue = overrideInValue
+        ? d2(new Prisma.Decimal(insert.totalCostApplied!))
+        : d2(insertQty.mul(d2(new Prisma.Decimal(insert.unitCostApplied))));
+      if (inValue.lessThan(0)) {
+        throw Object.assign(new Error('totalCostApplied cannot be negative'), { statusCode: 400 });
+      }
+      const unitCost = insertQty.greaterThan(0) ? d2(inValue.div(insertQty)) : d2(new Prisma.Decimal(insert.unitCostApplied));
+      return { unitCostApplied: unitCost, totalCostApplied: inValue };
     }
 
     // OUT: compute using current average cost unless caller overrides totalCostApplied.

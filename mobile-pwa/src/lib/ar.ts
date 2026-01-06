@@ -336,19 +336,23 @@ export async function deletePaymentQrCode(
 export async function uploadPublicPaymentProof(
   token: string,
   file: File
-): Promise<{ url: string }> {
+): Promise<any> {
   const formData = new FormData();
   formData.append('file', file);
   const safeToken = encodeURIComponent(token);
   return (await fetchApi(`/public/invoices/${safeToken}/payment-proof`, {
     method: 'POST',
     body: formData
-  })) as { url: string };
+  })) as any;
 }
 
-export async function deletePublicPaymentProof(token: string, url?: string): Promise<{ success: true; pendingPaymentProofs: any[] }> {
+export async function deletePublicPaymentProof(
+  token: string,
+  opts?: { id?: string; url?: string }
+): Promise<{ success: true; pendingPaymentProofs: any[] }> {
   const safeToken = encodeURIComponent(token);
-  const qs = url ? `?url=${encodeURIComponent(url)}` : '';
+  const qs =
+    opts?.id ? `?id=${encodeURIComponent(opts.id)}` : opts?.url ? `?url=${encodeURIComponent(opts.url)}` : '';
   return (await fetchApi(`/public/invoices/${safeToken}/payment-proof${qs}`, {
     method: 'DELETE',
   })) as { success: true; pendingPaymentProofs: any[] };

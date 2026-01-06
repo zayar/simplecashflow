@@ -515,7 +515,7 @@ export default function InvoiceDetailPage() {
             <div className="mt-4 flex gap-3 overflow-x-auto pb-2">
               {invoice.pendingPaymentProofs.map((proof: any, idx: number) => (
                 <button
-                  key={`${proof?.url ?? idx}`}
+                  key={`${proof?.id ?? proof?.url ?? idx}`}
                   type="button"
                   onClick={() => {
                     setActiveProof({ ...proof, idx })

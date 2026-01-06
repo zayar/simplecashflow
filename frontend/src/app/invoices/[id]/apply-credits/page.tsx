@@ -6,7 +6,7 @@ import { useParams } from 'next/navigation';
 import { ArrowLeft } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
-import { applyCustomerAdvanceToInvoice, fetchApi, getCustomerAdvances, CustomerAdvanceListRow } from '@/lib/api';
+import { applyCreditNoteToInvoice, applyCustomerAdvanceToInvoice, fetchApi, getCustomerAdvances, getCustomerCreditNotes, CreditNoteListRow, CustomerAdvanceListRow } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -22,10 +22,12 @@ export default function ApplyCreditsToInvoicePage() {
 
   const [invoice, setInvoice] = useState<any | null>(null);
   const [credits, setCredits] = useState<CustomerAdvanceListRow[]>([]);
+  const [creditNotes, setCreditNotes] = useState<CreditNoteListRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   const [form, setForm] = useState({ customerAdvanceId: '', amount: '', appliedDate: '' });
+  const [cnId, setCnId] = useState('');
 
   useEffect(() => {
     if (!user?.companyId || !invoiceId || Number.isNaN(invoiceId)) return;
@@ -35,9 +37,13 @@ export default function ApplyCreditsToInvoicePage() {
         setInvoice(inv);
         const customerId = Number(inv?.customer?.id ?? 0);
         if (customerId) {
-          return getCustomerAdvances(user.companyId, customerId, true).then(setCredits);
+          return Promise.all([
+            getCustomerAdvances(user.companyId, customerId, true).then(setCredits),
+            getCustomerCreditNotes(user.companyId, customerId, true).then(setCreditNotes),
+          ]).then(() => {});
         }
         setCredits([]);
+        setCreditNotes([]);
       })
       .finally(() => setLoading(false));
   }, [user?.companyId, invoiceId]);
@@ -81,6 +87,21 @@ export default function ApplyCreditsToInvoicePage() {
     }
   }
 
+  async function applyCreditNote(e: React.FormEvent) {
+    e.preventDefault();
+    if (!user?.companyId) return;
+    if (!cnId) return alert('Select a credit note');
+    setSubmitting(true);
+    try {
+      await applyCreditNoteToInvoice(user.companyId, invoiceId, Number(cnId));
+      if (typeof window !== 'undefined') window.location.assign(`/invoices/${invoiceId}`);
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to apply credit note');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-4">
@@ -116,6 +137,32 @@ export default function ApplyCreditsToInvoicePage() {
           <CardTitle className="text-lg">Apply</CardTitle>
         </CardHeader>
         <CardContent>
+          {creditNotes.length > 0 ? (
+            <div className="mb-6 rounded-lg border bg-muted/10 p-4">
+              <div className="mb-2 text-sm font-medium">Apply Credit Note (Return)</div>
+              <form onSubmit={applyCreditNote} className="flex flex-col gap-3 md:flex-row md:items-end">
+                <div className="grid gap-2 md:flex-1">
+                  <Label>Credit Note</Label>
+                  <SelectNative value={cnId} onChange={(e) => setCnId(e.target.value)}>
+                    <option value="">Select a credit note…</option>
+                    {creditNotes.map((cn) => (
+                      <option key={cn.id} value={String(cn.id)}>
+                        {cn.creditNoteNumber} — {Number(cn.total).toLocaleString()}
+                      </option>
+                    ))}
+                  </SelectNative>
+                  <div className="text-xs text-muted-foreground">
+                    Only POSTED credit notes that are not yet applied to any invoice are shown.
+                    Credit notes created from this invoice will be applied automatically.
+                  </div>
+                </div>
+                <Button type="submit" loading={submitting} loadingText="Applying..." disabled={remainingInvoice <= 0 || !cnId}>
+                  Apply Credit Note
+                </Button>
+              </form>
+            </div>
+          ) : null}
+
           <form onSubmit={submit} className="space-y-4">
             <div className="grid gap-4 md:grid-cols-3">
               <div className="grid gap-2 md:col-span-2">

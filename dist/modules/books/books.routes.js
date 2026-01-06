@@ -373,12 +373,14 @@ export async function booksRoutes(fastify) {
         return invoices.map((inv) => ({
             id: inv.id,
             invoiceNumber: inv.invoiceNumber,
-            customerName: inv.customer.name,
+            customerName: inv.customer ? inv.customer.name : null,
             status: inv.status,
             total: inv.total,
             invoiceDate: inv.invoiceDate,
             dueDate: inv.dueDate,
             createdAt: inv.createdAt,
+            hasPendingPaymentProof: Array.isArray(inv.pendingPaymentProofs) && inv.pendingPaymentProofs.length > 0,
+            pendingPaymentProofCount: Array.isArray(inv.pendingPaymentProofs) ? inv.pendingPaymentProofs.length : 0,
         }));
     });
     // Get single invoice with payments
@@ -503,11 +505,15 @@ export async function booksRoutes(fastify) {
                     code: p.bankAccount.code,
                     name: p.bankAccount.name,
                 },
+                attachmentUrl: p.attachmentUrl ?? null,
                 journalEntryId: p.journalEntry?.id ?? null,
                 reversedAt: p.reversedAt ?? null,
                 reversalReason: p.reversalReason ?? null,
                 reversalJournalEntryId: p.reversalJournalEntryId ?? null,
             })),
+            pendingPaymentProofs: Array.isArray(invoice.pendingPaymentProofs)
+                ? invoice.pendingPaymentProofs
+                : [],
             creditsApplied: (invoice.customerAdvanceApplications ?? []).map((a) => ({
                 id: a.id,
                 appliedDate: a.appliedDate,
@@ -2065,6 +2071,10 @@ export async function booksRoutes(fastify) {
                             { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
                         ],
                     });
+                    // Validate attachment URL if provided (must be from our GCS bucket)
+                    const attachmentUrl = (typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim())
+                        ? body.attachmentUrl.trim()
+                        : null;
                     const payment = await tx.payment.create({
                         data: {
                             companyId,
@@ -2073,8 +2083,17 @@ export async function booksRoutes(fastify) {
                             amount,
                             bankAccountId: bankAccount.id,
                             journalEntryId: journalEntry.id,
+                            attachmentUrl,
                         },
                     });
+                    // If attachmentUrl was from pendingPaymentProofs, remove it from the list
+                    if (attachmentUrl && Array.isArray(invoice.pendingPaymentProofs)) {
+                        const remainingProofs = invoice.pendingPaymentProofs.filter((p) => p?.url !== attachmentUrl);
+                        await tx.invoice.updateMany({
+                            where: { id: invoice.id, companyId },
+                            data: { pendingPaymentProofs: remainingProofs.length > 0 ? remainingProofs : Prisma.DbNull },
+                        });
+                    }
                     // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
                     const sumAgg = await tx.payment.aggregate({
                         where: { invoiceId: invoice.id, companyId, reversedAt: null },
@@ -2441,6 +2460,7 @@ export async function booksRoutes(fastify) {
             bankAccountName: p.bankAccount ? `${p.bankAccount.code} - ${p.bankAccount.name}` : null,
             journalEntryId: p.journalEntryId ?? null,
             reversedAt: p.reversedAt ?? null,
+            attachmentUrl: p.attachmentUrl ?? null,
         }));
     });
     fastify.get('/companies/:companyId/sales/payments/:paymentId', async (request, reply) => {

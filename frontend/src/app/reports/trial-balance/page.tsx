@@ -11,6 +11,7 @@ import { Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatDateInputInTimeZone, todayInTimeZone } from '@/lib/utils';
+import Link from 'next/link';
 
 export default function TrialBalancePage() {
   const { user, companySettings } = useAuth();
@@ -121,7 +122,14 @@ export default function TrialBalancePage() {
                   {report.accounts.map((row) => (
                     <TableRow key={row.accountId}>
                       <TableCell className="font-medium">{row.code}</TableCell>
-                      <TableCell>{row.name}</TableCell>
+                      <TableCell>
+                        <Link
+                          className="text-primary hover:underline"
+                          href={`/reports/account-transactions?accountId=${row.accountId}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`}
+                        >
+                          {row.name}
+                        </Link>
+                      </TableCell>
                       <TableCell className="text-muted-foreground">{row.type}</TableCell>
                       <TableCell className="text-right font-medium tabular-nums">
                         {Number(row.debit) !== 0

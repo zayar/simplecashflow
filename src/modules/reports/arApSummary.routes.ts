@@ -133,31 +133,19 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       GROUP BY e.vendorId
     `) as Array<{ vendorId: number | null; amount: any }>;
 
-    // Vendor credits applied reduce payables (treat like paid)
-    const vcAppliedInRange = (await prisma.$queryRaw<
-      Array<{ vendorId: number | null; amount: any }>
-    >`
-      SELECT vc.vendorId as vendorId, SUM(vca.amount) as amount
-      FROM VendorCreditApplication vca
-      JOIN VendorCredit vc ON vc.id = vca.vendorCreditId
-      WHERE vca.companyId = ${companyId}
-        AND vc.companyId = ${companyId}
-        AND vca.appliedDate >= ${fromDate}
-        AND vca.appliedDate <= ${toDate}
-      GROUP BY vc.vendorId
-    `) as Array<{ vendorId: number | null; amount: any }>;
+    // Vendor credits reduce payables when they are POSTED (GL impact). Application is a sub-ledger link and
+    // should not be double-counted here. We treat POSTED vendor credits like a payment/settlement.
+    const vcPostedInRange = (await prisma.vendorCredit.groupBy({
+      by: ['vendorId'],
+      where: { companyId, status: 'POSTED' as any, creditDate: { gte: fromDate, lte: toDate } },
+      _sum: { total: true },
+    })) as any[];
 
-    const vcAppliedToDate = (await prisma.$queryRaw<
-      Array<{ vendorId: number | null; amount: any }>
-    >`
-      SELECT vc.vendorId as vendorId, SUM(vca.amount) as amount
-      FROM VendorCreditApplication vca
-      JOIN VendorCredit vc ON vc.id = vca.vendorCreditId
-      WHERE vca.companyId = ${companyId}
-        AND vc.companyId = ${companyId}
-        AND vca.appliedDate <= ${toDate}
-      GROUP BY vc.vendorId
-    `) as Array<{ vendorId: number | null; amount: any }>;
+    const vcPostedToDate = (await prisma.vendorCredit.groupBy({
+      by: ['vendorId'],
+      where: { companyId, status: 'POSTED' as any, creditDate: { lte: toDate } },
+      _sum: { total: true },
+    })) as any[];
 
     const mapSum = <T extends { [k: string]: any }>(rows: T[], key: keyof T, val: keyof T) => {
       const m = new Map<string, Prisma.Decimal>();
@@ -190,19 +178,28 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
     }
 
     const paidInRangeMap = new Map<string, Prisma.Decimal>();
-    for (const m of [pbPaidInRange, expPaidInRange, vcAppliedInRange]) {
+    for (const m of [pbPaidInRange, expPaidInRange]) {
       for (const r of m) {
         const k = String((r as any).vendorId ?? 'null');
         paidInRangeMap.set(k, d2((paidInRangeMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
       }
     }
+    // Add POSTED vendor credits as settlement (reduce payable)
+    for (const r of vcPostedInRange as any[]) {
+      const k = String((r as any).vendorId ?? 'null');
+      paidInRangeMap.set(k, d2((paidInRangeMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
+    }
 
     const paidToDateMap = new Map<string, Prisma.Decimal>();
-    for (const m of [pbPaidToDate, expPaidToDate, vcAppliedToDate]) {
+    for (const m of [pbPaidToDate, expPaidToDate]) {
       for (const r of m) {
         const k = String((r as any).vendorId ?? 'null');
         paidToDateMap.set(k, d2((paidToDateMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
       }
+    }
+    for (const r of vcPostedToDate as any[]) {
+      const k = String((r as any).vendorId ?? 'null');
+      paidToDateMap.set(k, d2((paidToDateMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
     }
 
     // Detect "No Vendor" rows if any doc exists with vendorId null

@@ -51,7 +51,8 @@ export default function RecordPaymentPage() {
   });
 
   // Selected payment proof attachment
-  const [selectedAttachmentUrl, setSelectedAttachmentUrl] = useState<string | null>(null);
+  const [selectedPendingProofId, setSelectedPendingProofId] = useState<string | null>(null);
+  const [selectedAttachmentUrl, setSelectedAttachmentUrl] = useState<string | null>(null); // legacy fallback
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -189,8 +190,10 @@ export default function RecordPaymentPage() {
           // Always send BASE currency amount to backend (ledger-safe).
           amount: baseAmount,
           bankAccountId: Number(formData.bankAccountId),
-          // Optional attachment URL from customer-uploaded proofs
-          attachmentUrl: selectedAttachmentUrl || undefined,
+          // Optional attachment from customer-uploaded proofs:
+          // Prefer stable proof id (server stores gs:// reference); fallback to legacy URL.
+          pendingProofId: selectedPendingProofId || undefined,
+          attachmentUrl: !selectedPendingProofId ? (selectedAttachmentUrl || undefined) : undefined,
         }),
       });
       router.push('/invoices');
@@ -395,11 +398,20 @@ export default function RecordPaymentPage() {
                     <button
                       key={idx}
                       type="button"
-                      onClick={() => setSelectedAttachmentUrl(
-                        selectedAttachmentUrl === proof.url ? null : proof.url
-                      )}
+                      onClick={() => {
+                        const pid = typeof proof?.id === 'string' ? proof.id : null;
+                        if (pid) {
+                          setSelectedPendingProofId((prev) => (prev === pid ? null : pid));
+                          setSelectedAttachmentUrl(null);
+                        } else {
+                          const url = typeof proof?.url === 'string' ? proof.url : null;
+                          setSelectedAttachmentUrl((prev) => (prev === url ? null : url));
+                          setSelectedPendingProofId(null);
+                        }
+                      }}
                       className={`relative aspect-square overflow-hidden rounded-lg border-2 transition-all ${
-                        selectedAttachmentUrl === proof.url
+                        (selectedPendingProofId && proof?.id === selectedPendingProofId) ||
+                        (!selectedPendingProofId && selectedAttachmentUrl === proof.url)
                           ? 'border-blue-500 ring-2 ring-blue-200'
                           : 'border-gray-200 hover:border-amber-300'
                       }`}
@@ -409,7 +421,8 @@ export default function RecordPaymentPage() {
                         alt={`Proof ${idx + 1}`}
                         className="h-full w-full object-cover"
                       />
-                      {selectedAttachmentUrl === proof.url && (
+                      {((selectedPendingProofId && proof?.id === selectedPendingProofId) ||
+                        (!selectedPendingProofId && selectedAttachmentUrl === proof.url)) && (
                         <div className="absolute inset-0 flex items-center justify-center bg-blue-500/20">
                           <div className="rounded-full bg-blue-500 p-1 text-white text-xs">✓</div>
                         </div>
@@ -417,12 +430,12 @@ export default function RecordPaymentPage() {
                     </button>
                   ))}
                 </div>
-                {selectedAttachmentUrl && (
+                {(selectedPendingProofId || selectedAttachmentUrl) && (
                   <div className="mt-2 flex items-center justify-between text-xs">
                     <span className="text-green-700">✓ Proof selected</span>
                     <button
                       type="button"
-                      onClick={() => setSelectedAttachmentUrl(null)}
+                      onClick={() => { setSelectedAttachmentUrl(null); setSelectedPendingProofId(null); }}
                       className="text-gray-500 hover:text-gray-700"
                     >
                       Clear selection

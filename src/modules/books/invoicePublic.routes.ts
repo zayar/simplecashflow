@@ -3,6 +3,10 @@ import { prisma } from '../../infrastructure/db.js';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 
+type StoredPaymentProofV1 =
+  | { url: string; submittedAt?: string; note?: string | null } // legacy (public URL)
+  | { id: string; gcsUri: string; submittedAt?: string; note?: string | null }; // v1 private storage reference
+
 type InvoiceTemplateV1 = {
   version: 1;
   logoUrl: string | null;
@@ -75,6 +79,61 @@ function sanitizeInvoiceTemplate(input: any): InvoiceTemplateV1 {
     tableHeaderBg,
     tableHeaderText,
   };
+}
+
+function parseGcsUri(input: string): { bucket: string; objectName: string } | null {
+  const s = String(input ?? '').trim();
+  if (!s.startsWith('gs://')) return null;
+  const rest = s.slice('gs://'.length);
+  const idx = rest.indexOf('/');
+  if (idx <= 0) return null;
+  const bucket = rest.slice(0, idx);
+  const objectName = rest.slice(idx + 1);
+  if (!bucket || !objectName) return null;
+  return { bucket, objectName };
+}
+
+async function signedUrlForGcsUri(storage: Storage, gcsUri: string, ttlMs: number): Promise<string | null> {
+  const parsed = parseGcsUri(gcsUri);
+  if (!parsed) return null;
+  try {
+    const [url] = await storage.bucket(parsed.bucket).file(parsed.objectName).getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + ttlMs,
+    });
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+async function presentPaymentProofs(
+  storage: Storage,
+  proofs: any,
+  opts?: { signedUrlTtlMs?: number }
+): Promise<Array<{ id?: string; url: string; submittedAt: string | null; note: string | null }>> {
+  const ttlMs = Number(opts?.signedUrlTtlMs ?? 15 * 60 * 1000); // 15 minutes
+  if (!Array.isArray(proofs)) return [];
+
+  const out: Array<{ id?: string; url: string; submittedAt: string | null; note: string | null }> = [];
+  for (const p of proofs as StoredPaymentProofV1[]) {
+    const submittedAt = typeof (p as any)?.submittedAt === 'string' ? (p as any).submittedAt : null;
+    const note = typeof (p as any)?.note === 'string' ? (p as any).note : (p as any)?.note === null ? null : null;
+
+    // New format: private object reference (signed URL on demand)
+    if (typeof (p as any)?.gcsUri === 'string' && typeof (p as any)?.id === 'string') {
+      const url = await signedUrlForGcsUri(storage, String((p as any).gcsUri), ttlMs);
+      if (url) out.push({ id: String((p as any).id), url, submittedAt, note });
+      continue;
+    }
+
+    // Legacy format: public URL stored directly
+    if (typeof (p as any)?.url === 'string' && String((p as any).url).trim()) {
+      out.push({ url: String((p as any).url).trim(), submittedAt, note });
+    }
+  }
+  return out;
 }
 
 export async function invoicePublicRoutes(fastify: FastifyInstance) {
@@ -154,16 +213,9 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
       qrCodes[key] = typeof val === 'string' && val.trim() ? val.trim() : null;
     }
 
-    // Sanitize pending payment proofs (customer-uploaded screenshots)
-    const pendingPaymentProofs = Array.isArray((invoice as any).pendingPaymentProofs)
-      ? (invoice as any).pendingPaymentProofs
-          .map((p: any) => ({
-            url: typeof p?.url === 'string' ? p.url : null,
-            submittedAt: typeof p?.submittedAt === 'string' ? p.submittedAt : null,
-            note: typeof p?.note === 'string' ? p.note : p?.note === null ? null : null,
-          }))
-          .filter((p: any) => typeof p.url === 'string' && p.url)
-      : [];
+    // Payment proofs: support both legacy public URLs and new private proofs via signed URLs.
+    const storage = new Storage();
+    const pendingPaymentProofs = await presentPaymentProofs(storage, (invoice as any).pendingPaymentProofs);
 
     return {
       company: {
@@ -263,8 +315,8 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
       return { error: 'only image uploads are allowed' };
     }
 
-    // Upload to GCS
-    const bucketName = process.env.INVOICE_TEMPLATE_ASSETS_BUCKET;
+    // Upload to GCS (PRIVATE bucket preferred for payment proofs)
+    const bucketName = process.env.PAYMENT_PROOF_BUCKET || process.env.INVOICE_TEMPLATE_ASSETS_BUCKET;
     if (!bucketName) {
       reply.status(500);
       return { error: 'storage not configured' };
@@ -277,17 +329,20 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
     const buf: Buffer = await file.toBuffer();
     await storage.bucket(bucketName).file(objectName).save(buf, {
       contentType: mimetype,
-      metadata: { cacheControl: 'public, max-age=31536000' },
+      resumable: false,
+      metadata: { cacheControl: 'private, max-age=3600' },
     });
-
-    const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectName}`;
 
     // Get body for optional note
     const body = (request.body ?? {}) as { note?: string };
     const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : null;
 
+    const proofId = uuidv4();
+    const gcsUri = `gs://${bucketName}/${objectName}`;
+
     const newProof = {
-      url: publicUrl,
+      id: proofId,
+      gcsUri,
       submittedAt: new Date().toISOString(),
       note: note || null,
     };
@@ -309,11 +364,14 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
       },
     });
 
+    const presented = await presentPaymentProofs(storage, [...existingProofs, newProof]);
+    const presentedOne = presented.find((p) => p.id === proofId) ?? null;
+
     return {
       success: true,
       message: 'Payment proof uploaded. The business will review and confirm your payment.',
-      proof: newProof,
-      pendingPaymentProofs: [...existingProofs, newProof],
+      proof: presentedOne ?? { id: proofId, url: '', submittedAt: newProof.submittedAt, note: newProof.note },
+      pendingPaymentProofs: presented,
     };
   });
 
@@ -346,6 +404,7 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
     }
 
     const url = typeof (request.query as any)?.url === 'string' ? String((request.query as any).url) : null;
+    const id = typeof (request.query as any)?.id === 'string' ? String((request.query as any).id) : null;
 
     const invoice = await prisma.invoice.findFirst({
       where: { id: invoiceId, companyId },
@@ -361,14 +420,46 @@ export async function invoicePublicRoutes(fastify: FastifyInstance) {
     }
 
     const existing = Array.isArray(invoice.pendingPaymentProofs) ? (invoice.pendingPaymentProofs as any[]) : [];
-    const next = url ? existing.filter((p: any) => p?.url !== url) : [];
+
+    // Determine which proofs to remove (by id preferred; legacy by url)
+    const removeAll = !id && !url;
+    const toRemove = removeAll
+      ? existing
+      : id
+        ? existing.filter((p: any) => String(p?.id ?? '') === id)
+        : url
+          ? existing.filter((p: any) => String(p?.url ?? '') === url)
+          : [];
+
+    const next = removeAll
+      ? []
+      : id
+        ? existing.filter((p: any) => String(p?.id ?? '') !== id)
+        : url
+          ? existing.filter((p: any) => String(p?.url ?? '') !== url)
+          : existing;
+
+    // Best-effort delete objects for new-format proofs (gs://...)
+    const storage = new Storage();
+    for (const p of toRemove as StoredPaymentProofV1[]) {
+      const gcsUri = typeof (p as any)?.gcsUri === 'string' ? String((p as any).gcsUri) : null;
+      const parsed = gcsUri ? parseGcsUri(gcsUri) : null;
+      if (parsed) {
+        try {
+          await storage.bucket(parsed.bucket).file(parsed.objectName).delete({ ignoreNotFound: true });
+        } catch {
+          // best-effort
+        }
+      }
+    }
 
     await prisma.invoice.updateMany({
       where: { id: invoiceId, companyId },
       data: { pendingPaymentProofs: next as any },
     });
 
-    return { success: true, pendingPaymentProofs: next };
+    const presented = await presentPaymentProofs(storage, next);
+    return { success: true, pendingPaymentProofs: presented };
   });
 }
 

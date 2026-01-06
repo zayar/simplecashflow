@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ChevronDown, Loader2, Search, Trash2, Plus, ArrowLeft } from 'lucide-react';
+import { ChevronDown, Loader2, Search, Trash2, Plus, ArrowLeft, Pencil } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getExchangeRates } from '@/lib/api';
@@ -17,6 +17,7 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -97,6 +98,15 @@ export default function EditInvoicePage() {
   const [fxRateToBase, setFxRateToBase] = useState<number | null>(null);
   const [fxAsOfDate, setFxAsOfDate] = useState<string | null>(null);
   const [enterInCustomerCurrency, setEnterInCustomerCurrency] = useState(true);
+  const [fxRateManual, setFxRateManual] = useState(false);
+  const [fxEditOpen, setFxEditOpen] = useState(false);
+  const [fxEditRate, setFxEditRate] = useState('');
+  const [fxEditRecalc, setFxEditRecalc] = useState(false);
+
+  useEffect(() => {
+    setFxRateManual(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customerCurrency]);
 
   useEffect(() => {
     if (!user?.companyId) return;
@@ -156,9 +166,11 @@ export default function EditInvoicePage() {
     if (!isFxCustomer) {
       setFxRateToBase(null);
       setFxAsOfDate(null);
+      setFxRateManual(false);
       return;
     }
     if (!user?.companyId || !customerCurrency) return;
+    if (fxRateManual) return;
     let cancelled = false;
     getExchangeRates(user.companyId, customerCurrency)
       .then((rows) => {
@@ -189,7 +201,38 @@ export default function EditInvoicePage() {
     return () => {
       cancelled = true;
     };
-  }, [isFxCustomer, user?.companyId, customerCurrency, formData.invoiceDate]);
+  }, [isFxCustomer, user?.companyId, customerCurrency, formData.invoiceDate, fxRateManual]);
+
+  function openFxEditor() {
+    setFxEditRate(fxRateToBase && fxRateToBase > 0 ? String(fxRateToBase) : '');
+    setFxEditRecalc(false);
+    setFxEditOpen(true);
+  }
+
+  function applyFxRateOverride() {
+    const next = Number(fxEditRate);
+    if (!Number.isFinite(next) || next <= 0) {
+      alert('Exchange rate must be a positive number.');
+      return;
+    }
+    const prev = fxRateToBase && fxRateToBase > 0 ? fxRateToBase : null;
+    setFxRateToBase(next);
+    setFxAsOfDate(formData.invoiceDate || null);
+    setFxRateManual(true);
+
+    if (fxEditRecalc && enterInCustomerCurrency && prev && prev > 0) {
+      const factor = prev / next;
+      setLines((old) =>
+        old.map((l: any) => ({
+          ...l,
+          unitPrice: Number(l.unitPrice ?? 0) * factor,
+          discount: Number(l.discount ?? 0) * factor,
+        }))
+      );
+    }
+
+    setFxEditOpen(false);
+  }
 
   useEffect(() => {
     if (!user?.companyId || !invoiceId) return;
@@ -477,9 +520,16 @@ export default function EditInvoicePage() {
                     <span className="text-muted-foreground">Base currency:</span> <b>{baseCurrency}</b>
                   </div>
                   {fxRateToBase ? (
-                    <div className="text-muted-foreground">
-                      Exchange rate: <b>1 {customerCurrency} = {baseCurrency}{fxRateToBase}</b>
-                      {fxAsOfDate ? ` (as of ${String(fxAsOfDate).slice(0, 10)})` : ""}
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
+                      <div>
+                        Exchange rate: <b>1 {customerCurrency} = {baseCurrency}{fxRateToBase}</b>
+                        {fxAsOfDate ? ` (as of ${String(fxAsOfDate).slice(0, 10)})` : ""}
+                        {fxRateManual ? <span className="ml-2 text-xs text-orange-600">(custom)</span> : null}
+                      </div>
+                      <Button type="button" variant="outline" size="sm" onClick={openFxEditor}>
+                        <Pencil className="mr-2 h-4 w-4" />
+                        Edit rate
+                      </Button>
                     </div>
                   ) : (
                     <div className="text-orange-600">No exchange rate found for {customerCurrency}. Add it in Currencies.</div>
@@ -514,6 +564,48 @@ export default function EditInvoicePage() {
                 </CardContent>
               </Card>
             ) : null}
+
+          {/* Exchange rate editor (per-invoice override; does not change company settings) */}
+          <Dialog open={fxEditOpen} onOpenChange={setFxEditOpen}>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Edit Exchange Rate</DialogTitle>
+                <DialogDescription>
+                  Set a custom exchange rate for this invoice only. This will not change company exchange rates.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-3 text-sm">
+                <div className="grid gap-2">
+                  <Label htmlFor="fxRateInput">
+                    Exchange Rate (in {baseCurrency ?? 'base currency'})
+                  </Label>
+                  <Input
+                    id="fxRateInput"
+                    type="number"
+                    inputMode="decimal"
+                    step="0.000001"
+                    value={fxEditRate}
+                    onChange={(e) => setFxEditRate(e.target.value)}
+                    placeholder={fxRateToBase ? String(fxRateToBase) : '0'}
+                  />
+                </div>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={fxEditRecalc}
+                    onChange={(e) => setFxEditRecalc(e.target.checked)}
+                    disabled={!enterInCustomerCurrency || !fxRateToBase}
+                  />
+                  <span>Re-calculate item prices based on this rate</span>
+                </label>
+              </div>
+              <DialogFooter>
+                <Button type="button" onClick={applyFxRateOverride}>
+                  Save
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
 
             <Card>
               <CardHeader className="flex flex-row items-center justify-between space-y-0">

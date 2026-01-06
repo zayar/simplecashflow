@@ -11,6 +11,7 @@ import { Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { todayInTimeZone } from '@/lib/utils';
+import Link from 'next/link';
 
 export default function BalanceSheetPage() {
   const { user, companySettings } = useAuth();
@@ -45,6 +46,16 @@ export default function BalanceSheetPage() {
   }, [user?.companyId]);
 
   function SectionTable({ title, rows, total }: { title: string, rows: any[], total: string }) {
+    // For an as-of balance sheet, drill-down uses a sensible default range:
+    // fiscal-year-to-date if known, otherwise calendar-year-to-date.
+    const fyStartMonth = Number(companySettings?.fiscalYearStartMonth ?? 1); // 1-12
+    const safeMonth = Number.isFinite(fyStartMonth) && fyStartMonth >= 1 && fyStartMonth <= 12 ? fyStartMonth : 1;
+    const asOfYear = Number(String(asOf ?? '').slice(0, 4)) || new Date().getUTCFullYear();
+    const asOfMonth = Number(String(asOf ?? '').slice(5, 7)) || 1;
+    const fyStartYear = asOfMonth >= safeMonth ? asOfYear : asOfYear - 1;
+    const fromForDrill = `${fyStartYear}-${String(safeMonth).padStart(2, '0')}-01`;
+    const toForDrill = asOf || todayInTimeZone(companySettings?.timeZone ?? 'Asia/Yangon');
+
     return (
       <Card className="shadow-sm">
         <CardHeader>
@@ -71,7 +82,14 @@ export default function BalanceSheetPage() {
                   rows.map((row) => (
                     <TableRow key={row.accountId}>
                       <TableCell className="font-medium">{row.code}</TableCell>
-                      <TableCell>{row.name}</TableCell>
+                      <TableCell>
+                        <Link
+                          className="text-primary hover:underline"
+                          href={`/reports/account-transactions?accountId=${row.accountId}&from=${encodeURIComponent(fromForDrill)}&to=${encodeURIComponent(toForDrill)}`}
+                        >
+                          {row.name}
+                        </Link>
+                      </TableCell>
                       <TableCell className="text-right font-medium tabular-nums">
                         {Number(row.balance).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </TableCell>

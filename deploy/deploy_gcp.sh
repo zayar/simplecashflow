@@ -20,6 +20,10 @@ JWT_SECRET_NAME="cashflow-jwt-secret"
 # You can override by exporting INVOICE_TEMPLATE_ASSETS_BUCKET before running this script.
 INVOICE_TEMPLATE_ASSETS_BUCKET="${INVOICE_TEMPLATE_ASSETS_BUCKET:-cashflow-invoice-assets-${PROJECT_ID}}"
 
+# Private bucket for customer payment proof uploads (should NOT be publicly readable).
+# You can override by exporting PAYMENT_PROOF_BUCKET before running this script.
+PAYMENT_PROOF_BUCKET="${PAYMENT_PROOF_BUCKET:-cashflow-payment-proofs-${PROJECT_ID}}"
+
 # ---- Require password without echoing ----
 SKIP_MIGRATIONS="${SKIP_MIGRATIONS:-false}"
 UPDATE_DB_SECRET="${UPDATE_DB_SECRET:-true}"
@@ -202,6 +206,19 @@ gcloud storage buckets add-iam-policy-binding "gs://${INVOICE_TEMPLATE_ASSETS_BU
   --member="allUsers" \
   --role="roles/storage.objectViewer" >/dev/null
 
+# ---- GCS bucket for payment proofs (private) ----
+echo "Ensuring GCS bucket for payment proofs (private): gs://${PAYMENT_PROOF_BUCKET} ..."
+if ! gcloud storage buckets describe "gs://${PAYMENT_PROOF_BUCKET}" >/dev/null 2>&1; then
+  gcloud storage buckets create "gs://${PAYMENT_PROOF_BUCKET}" \
+    --location="${REGION}" \
+    --uniform-bucket-level-access
+fi
+
+# Runtime SA can write/read objects. Bucket remains private (no allUsers binding).
+gcloud storage buckets add-iam-policy-binding "gs://${PAYMENT_PROOF_BUCKET}" \
+  --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+  --role="roles/storage.objectAdmin" >/dev/null
+
 # ---- Secret Manager: store Cloud Run DATABASE_URL using unix socket (optional) ----
 if [[ "$UPDATE_DB_SECRET" == "true" ]]; then
   SOCKET_DB_URL="mysql://${DB_USER}:${DB_PASS_ENC}@localhost:3306/${DB_NAME}?socket=/cloudsql/${INSTANCE_CONN}"
@@ -249,7 +266,7 @@ gcloud run deploy cashflow-api \
   --image "gcr.io/${PROJECT_ID}/cashflow-api" \
   --region "$REGION" \
   --add-cloudsql-instances "$INSTANCE_CONN" \
-  --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC},INVOICE_TEMPLATE_ASSETS_BUCKET=${INVOICE_TEMPLATE_ASSETS_BUCKET}" \
+  --set-env-vars "PUBSUB_TOPIC=${PUBSUB_TOPIC},INVOICE_TEMPLATE_ASSETS_BUCKET=${INVOICE_TEMPLATE_ASSETS_BUCKET},PAYMENT_PROOF_BUCKET=${PAYMENT_PROOF_BUCKET}" \
   --set-secrets "DATABASE_URL=${DB_URL_SECRET}:latest,JWT_SECRET=${JWT_SECRET_NAME}:latest" \
   --service-account "$RUNTIME_SA_EMAIL"
 

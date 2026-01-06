@@ -163,6 +163,10 @@ export default function InventoryValuationDetailPage() {
           <CardTitle className="text-lg">Inventory valuation</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
+          <div className="mb-3 text-xs text-muted-foreground">
+            Cost method: <b>Moving Average (WAC)</b>. “Unit cost” on Sale (Issue) rows is the cost used for that transaction.
+            “Avg cost after” is calculated as <b>Inventory asset value ÷ Stock on hand</b> after each row.
+          </div>
           <div className="rounded-lg border">
             <Table>
               <TableHeader>
@@ -174,12 +178,16 @@ export default function InventoryValuationDetailPage() {
                   <TableHead className="text-right w-[160px]">Total cost</TableHead>
                   <TableHead className="text-right w-[150px]">Stock on hand</TableHead>
                   <TableHead className="text-right w-[190px]">Inventory asset value</TableHead>
+                  <TableHead className="text-right w-[160px]">Avg cost after</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {rows.map((r, idx) => {
                   const date = r?.date ? String(r.date).slice(0, 10) : '';
                   const isMarker = r.kind === 'OPENING' || r.kind === 'CLOSING';
+                  const soh = Number(r.stockOnHand ?? 0);
+                  const invVal = Number(r.inventoryAssetValue ?? 0);
+                  const avgAfter = soh && Number.isFinite(soh) && Number.isFinite(invVal) ? invVal / soh : 0;
                   return (
                     <TableRow key={`${r.kind}-${r.stockMoveId ?? idx}`} className={isMarker ? 'bg-muted/30' : ''}>
                       <TableCell className="text-muted-foreground">{date}</TableCell>
@@ -203,12 +211,13 @@ export default function InventoryValuationDetailPage() {
                       <TableCell className="text-right tabular-nums">{r.totalCost != null ? d2(r.totalCost) : ''}</TableCell>
                       <TableCell className="text-right tabular-nums">{d2(r.stockOnHand ?? 0).replace('.00', '')}</TableCell>
                       <TableCell className="text-right tabular-nums">{d2(r.inventoryAssetValue ?? 0)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{d2(avgAfter)}</TableCell>
                     </TableRow>
                   );
                 })}
                 {rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={8} className="py-10 text-center text-muted-foreground">
                       No rows for this range.
                     </TableCell>
                   </TableRow>

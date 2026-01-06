@@ -7,7 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "worker": "tsx watch src/worker.ts",
     "publisher": "tsx watch src/publisher.ts",
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "start:publisher": "node dist/publisher.js",
