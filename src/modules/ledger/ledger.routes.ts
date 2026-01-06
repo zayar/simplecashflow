@@ -1370,10 +1370,13 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     function buildSection(type: 'ASSET' | 'LIABILITY' | 'EQUITY') {
       // Union rows for this type from current snapshot to keep stable ordering,
       // then add any missing accounts from older snapshots.
-      const baseRows = snapshots[0].rowsByType[type.toLowerCase() as 'assets' | 'liabilities' | 'equity'] as any[];
-      const ids = new Set<number>(baseRows.map((r: any) => Number(r.accountId)));
+      const sectionKey = (type === 'ASSET' ? 'assets' : type === 'LIABILITY' ? 'liabilities' : 'equity') as 'assets' | 'liabilities' | 'equity';
+      const firstSnapshot = snapshots[0];
+      if (!firstSnapshot) return [];
+      const baseRows = [...firstSnapshot.rowsByType[sectionKey]];
+      const ids = new Set<number>(baseRows.map((r) => Number(r.accountId)));
       for (const s of snapshots) {
-        for (const r of (s.rowsByType[type.toLowerCase() as any] ?? []) as any[]) {
+        for (const r of s.rowsByType[sectionKey] ?? []) {
           if (!ids.has(Number(r.accountId))) {
             baseRows.push(r);
             ids.add(Number(r.accountId));
@@ -1407,11 +1410,14 @@ export async function ledgerRoutes(fastify: FastifyInstance) {
     const liabilities = buildSection('LIABILITY');
     const equity = buildSection('EQUITY');
 
+    const firstSnapshot = snapshots[0];
+    const defaultTotals = { assets: '0.00', liabilities: '0.00', equity: '0.00', balanced: true };
+
     return {
       companyId,
       asOf: asOfDate.toISOString().slice(0, 10),
       columns,
-      totals: snapshots[0].totals,
+      totals: firstSnapshot?.totals ?? defaultTotals,
       totalsByColumn: snapshots.map((s) => s.totals),
       assets,
       liabilities,
