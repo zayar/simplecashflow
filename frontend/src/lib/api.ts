@@ -262,6 +262,13 @@ export interface ProfitLossReport {
 export interface BalanceSheetReport {
   companyId: number;
   asOf: string;
+  columns?: Array<{ asOf: string; label: string }>;
+  totalsByColumn?: Array<{
+    assets: string;
+    liabilities: string;
+    equity: string;
+    balanced: boolean;
+  }>;
   totals: {
     assets: string;
     liabilities: string;
@@ -281,6 +288,7 @@ interface BalanceSheetRow {
   debit: string;
   credit: string;
   balance: string;
+  balances?: string[];
 }
 
 export async function getTrialBalance(companyId: number, from: string, to: string): Promise<TrialBalanceReport> {
@@ -361,6 +369,11 @@ export async function createAccount(companyId: number, data: {
 
 export async function getBalanceSheet(companyId: number, asOf: string): Promise<BalanceSheetReport> {
   return fetchApi(`/companies/${companyId}/reports/balance-sheet?asOf=${asOf}`);
+}
+
+export async function getBalanceSheetWithCompare(companyId: number, asOf: string, compareYears: number = 0): Promise<BalanceSheetReport> {
+  const cy = Math.min(Math.max(Number(compareYears || 0), 0), 2);
+  return fetchApi(`/companies/${companyId}/reports/balance-sheet?asOf=${encodeURIComponent(asOf)}&compareYears=${cy}`);
 }
 
 // --- Accounts Payable (AP) / Bills ---
