@@ -77,6 +77,7 @@ export default function BankingPage() {
                   <TableHead>Name</TableHead>
                   <TableHead className="w-[140px]">Kind</TableHead>
                   <TableHead className="w-[200px]">Bank</TableHead>
+                <TableHead className="w-[110px]">Currency</TableHead>
                   <TableHead className="w-[120px]">Primary</TableHead>
                 </TableRow>
               </TableHeader>
@@ -98,6 +99,7 @@ export default function BankingPage() {
                       <Badge variant="outline">{a.kind}</Badge>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{a.bankName ?? "—"}</TableCell>
+                    <TableCell className="text-muted-foreground">{a.currency ?? "—"}</TableCell>
                     <TableCell className="text-muted-foreground">
                       {a.isPrimary ? "Primary" : "—"}
                     </TableCell>

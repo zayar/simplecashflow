@@ -5,6 +5,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { DEFAULT_ACCOUNTS } from './company.constants.js';
 import { enforceCompanyScope, forbidClientProvidedCompanyId, getAuthCompanyId, requireCompanyIdParam, } from '../../utils/tenant.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
+import { normalizeToDay } from '../../utils/date.js';
+import { toMoneyDecimal } from '../../utils/money.js';
+import { postJournalEntry } from '../ledger/posting.service.js';
 const DEFAULT_INVOICE_TEMPLATE = {
     version: 1,
     logoUrl: null,
@@ -511,6 +514,41 @@ export async function companiesRoutes(fastify) {
             template: sanitizeInvoiceTemplate(updated.invoiceTemplate),
         };
     });
+    // ============================================================================
+    // Expense Attachment Upload
+    // ============================================================================
+    // Upload a receipt photo / expense invoice image and get back a public URL.
+    // The client then stores this URL on the Expense as attachmentUrl.
+    // ============================================================================
+    fastify.post('/companies/:companyId/uploads/expense-attachment', async (request, reply) => {
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT, Roles.CLERK], 'OWNER/ACCOUNTANT/CLERK');
+        const companyId = requireCompanyIdParam(request, reply);
+        // @fastify/multipart
+        const file = await request.file?.();
+        if (!file) {
+            reply.status(400);
+            return { error: 'file is required (multipart/form-data field: file)' };
+        }
+        const mimetype = String(file.mimetype ?? '');
+        if (!mimetype.startsWith('image/')) {
+            reply.status(400);
+            return { error: 'only image uploads are allowed' };
+        }
+        const bucketName = requireEnv('INVOICE_TEMPLATE_ASSETS_BUCKET');
+        const storage = new Storage();
+        const ext = mimetype === 'image/png' ? '.png' : mimetype === 'image/jpeg' ? '.jpg' : '';
+        const objectName = `companies/${companyId}/expense-attachments/${uuidv4()}${ext}`;
+        const buf = await file.toBuffer();
+        await storage.bucket(bucketName).file(objectName).save(buf, {
+            contentType: mimetype,
+            resumable: false,
+            metadata: {
+                cacheControl: 'private, max-age=3600',
+            },
+        });
+        const url = `https://storage.googleapis.com/${bucketName}/${objectName}`;
+        return { url };
+    });
     const VALID_QR_METHODS = ['kbz', 'ayaPay', 'uabPay', 'aPlus'];
     function sanitizePaymentQrCodes(input) {
         if (!input || typeof input !== 'object')
@@ -778,6 +816,8 @@ export async function companiesRoutes(fastify) {
     // They map 1:1 to a Chart of Accounts Account (ASSET).
     fastify.get('/companies/:companyId/banking-accounts', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        const company = await prisma.company.findUnique({ where: { id: companyId }, select: { baseCurrency: true } });
+        const baseCurrency = (company?.baseCurrency ?? '').trim().toUpperCase() || null;
         const rows = await prisma.bankingAccount.findMany({
             where: { companyId },
             include: {
@@ -799,6 +839,7 @@ export async function companiesRoutes(fastify) {
                             companyId,
                             accountId: cash.id,
                             kind: BankingAccountKind.CASH,
+                            currency: baseCurrency,
                             description: 'Default cash account',
                             isPrimary: rows.length === 0, // only primary if no other banking accounts exist
                         },
@@ -822,6 +863,7 @@ export async function companiesRoutes(fastify) {
             identifierCode: r.identifierCode,
             branch: r.branch,
             description: r.description,
+            currency: r.currency ?? null,
             account: r.account,
         }));
     });
@@ -895,6 +937,7 @@ export async function companiesRoutes(fastify) {
             identifierCode: banking.identifierCode,
             branch: banking.branch,
             description: banking.description,
+            currency: banking.currency ?? null,
             account: banking.account,
             balance,
             transactions,
@@ -912,8 +955,37 @@ export async function companiesRoutes(fastify) {
             reply.status(400);
             return { error: 'invalid kind' };
         }
+        const currency = body.currency ? String(body.currency).trim().toUpperCase() : null;
+        if (currency && !/^[A-Z]{3}$/.test(currency)) {
+            reply.status(400);
+            return { error: 'currency must be a 3-letter code (e.g. MMK, USD)' };
+        }
+        const openingBalanceInput = body.openingBalance;
+        const openingBalance = openingBalanceInput === undefined ? null : toMoneyDecimal(openingBalanceInput);
+        if (openingBalanceInput !== undefined) {
+            const n = Number(openingBalanceInput);
+            if (!Number.isFinite(n)) {
+                reply.status(400);
+                return { error: 'openingBalance must be a valid number' };
+            }
+        }
         // Bank/Cash/E-wallet should be ASSET accounts.
         const created = await prisma.$transaction(async (tx) => {
+            const userId = request.user?.userId ?? null;
+            const company = await tx.company.findUnique({
+                where: { id: companyId },
+                select: { openingBalanceEquityAccountId: true },
+            });
+            const eqId = Number(company?.openingBalanceEquityAccountId ?? 0) || null;
+            if (!eqId) {
+                throw Object.assign(new Error('company.openingBalanceEquityAccountId is not set'), { statusCode: 400 });
+            }
+            const eqAcc = await tx.account.findFirst({ where: { id: eqId, companyId }, select: { id: true, type: true } });
+            if (!eqAcc || eqAcc.type !== AccountType.EQUITY) {
+                throw Object.assign(new Error('openingBalanceEquityAccountId must be an EQUITY account in this company'), {
+                    statusCode: 400,
+                });
+            }
             const account = await tx.account.create({
                 data: {
                     companyId,
@@ -937,6 +1009,7 @@ export async function companiesRoutes(fastify) {
                     companyId,
                     accountId: account.id,
                     kind,
+                    currency,
                     bankName: body.bankName ?? null,
                     accountNumber: body.accountNumber ?? null,
                     identifierCode: body.identifierCode ?? null,
@@ -948,6 +1021,29 @@ export async function companiesRoutes(fastify) {
                     account: true,
                 },
             });
+            // Opening balance posting (optional): Bank/Cash/E-wallet (asset) ↔ Opening Balance Equity.
+            // Positive amount => bank asset Dr / equity Cr
+            // Negative amount => equity Dr / bank asset Cr (supports overdraft as negative asset)
+            if (openingBalance && !openingBalance.equals(0)) {
+                const amt = new Prisma.Decimal(openingBalance).toDecimalPlaces(2);
+                const abs = amt.abs().toDecimalPlaces(2);
+                const lines = amt.greaterThan(0)
+                    ? [
+                        { accountId: account.id, debit: abs, credit: new Prisma.Decimal(0) },
+                        { accountId: eqId, debit: new Prisma.Decimal(0), credit: abs },
+                    ]
+                    : [
+                        { accountId: eqId, debit: abs, credit: new Prisma.Decimal(0) },
+                        { accountId: account.id, debit: new Prisma.Decimal(0), credit: abs },
+                    ];
+                await postJournalEntry(tx, {
+                    companyId,
+                    date: normalizeToDay(new Date()),
+                    description: `Opening balance • Banking: ${String(body.accountName ?? '').trim() || '—'}`,
+                    createdByUserId: userId,
+                    lines,
+                });
+            }
             return banking;
         });
         return {
@@ -959,11 +1055,158 @@ export async function companiesRoutes(fastify) {
             identifierCode: created.identifierCode,
             branch: created.branch,
             description: created.description,
+            currency: created.currency ?? null,
             account: {
                 id: created.account.id,
                 code: created.account.code,
                 name: created.account.name,
                 type: created.account.type,
+            },
+        };
+    });
+    // Update banking account details + optional opening balance adjustment (posts to GL).
+    fastify.put('/companies/:companyId/banking-accounts/:bankingAccountId', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const bankingAccountId = Number(request.params?.bankingAccountId);
+        if (Number.isNaN(bankingAccountId)) {
+            reply.status(400);
+            return { error: 'invalid bankingAccountId' };
+        }
+        const body = request.body;
+        if (!body.accountCode || !body.accountName) {
+            reply.status(400);
+            return { error: 'accountCode and accountName are required' };
+        }
+        const currency = body.currency ? String(body.currency).trim().toUpperCase() : null;
+        if (currency && !/^[A-Z]{3}$/.test(currency)) {
+            reply.status(400);
+            return { error: 'currency must be a 3-letter code (e.g. MMK, USD)' };
+        }
+        const deltaInput = body.openingBalanceDelta;
+        const delta = deltaInput === undefined ? null : toMoneyDecimal(deltaInput);
+        if (deltaInput !== undefined) {
+            const n = Number(deltaInput);
+            if (!Number.isFinite(n)) {
+                reply.status(400);
+                return { error: 'openingBalanceDelta must be a valid number' };
+            }
+        }
+        const userId = request.user?.userId ?? null;
+        const updated = await prisma.$transaction(async (tx) => {
+            const banking = await tx.bankingAccount.findFirst({
+                where: { id: bankingAccountId, companyId },
+                include: { account: { select: { id: true, code: true, name: true, type: true } } },
+            });
+            if (!banking) {
+                reply.status(404);
+                return { error: 'banking account not found' };
+            }
+            // Enforce COA account constraints
+            if (banking.account.type !== AccountType.ASSET) {
+                throw Object.assign(new Error('banking account must map to an ASSET account'), { statusCode: 400 });
+            }
+            // Account code uniqueness (companyId, code)
+            const code = String(body.accountCode).trim();
+            if (!code)
+                throw Object.assign(new Error('accountCode is required'), { statusCode: 400 });
+            const existingCode = await tx.account.findFirst({
+                where: { companyId, code, id: { not: banking.account.id } },
+                select: { id: true },
+            });
+            if (existingCode) {
+                throw Object.assign(new Error('accountCode must be unique inside your company'), { statusCode: 400 });
+            }
+            // If primary, unset other primaries
+            if (body.isPrimary) {
+                await tx.bankingAccount.updateMany({
+                    where: { companyId, isPrimary: true, id: { not: bankingAccountId } },
+                    data: { isPrimary: false },
+                });
+            }
+            const accRes = await tx.account.updateMany({
+                where: { id: banking.account.id, companyId },
+                data: { code, name: String(body.accountName).trim() },
+            });
+            if (accRes?.count !== 1) {
+                throw Object.assign(new Error('account not found in this company'), { statusCode: 404 });
+            }
+            const bankRes = await tx.bankingAccount.updateMany({
+                where: { id: banking.id, companyId },
+                data: {
+                    currency,
+                    bankName: body.bankName ?? null,
+                    accountNumber: body.accountNumber ?? null,
+                    identifierCode: body.identifierCode ?? null,
+                    branch: body.branch ?? null,
+                    description: body.description ?? null,
+                    isPrimary: body.isPrimary ?? false,
+                },
+            });
+            if (bankRes?.count !== 1) {
+                throw Object.assign(new Error('banking account not found'), { statusCode: 404 });
+            }
+            const b2 = await tx.bankingAccount.findFirst({
+                where: { id: banking.id, companyId },
+                include: { account: { select: { id: true, code: true, name: true, type: true } } },
+            });
+            if (!b2) {
+                throw Object.assign(new Error('banking account not found'), { statusCode: 404 });
+            }
+            // Optional opening balance adjustment posting
+            if (delta && !delta.equals(0)) {
+                const company = await tx.company.findUnique({
+                    where: { id: companyId },
+                    select: { openingBalanceEquityAccountId: true },
+                });
+                const eqId = Number(company?.openingBalanceEquityAccountId ?? 0) || null;
+                if (!eqId) {
+                    throw Object.assign(new Error('company.openingBalanceEquityAccountId is not set'), { statusCode: 400 });
+                }
+                const eqAcc = await tx.account.findFirst({ where: { id: eqId, companyId }, select: { id: true, type: true } });
+                if (!eqAcc || eqAcc.type !== AccountType.EQUITY) {
+                    throw Object.assign(new Error('openingBalanceEquityAccountId must be an EQUITY account in this company'), {
+                        statusCode: 400,
+                    });
+                }
+                const amt = new Prisma.Decimal(delta).toDecimalPlaces(2);
+                const abs = amt.abs().toDecimalPlaces(2);
+                const lines = amt.greaterThan(0)
+                    ? [
+                        { accountId: b2.account.id, debit: abs, credit: new Prisma.Decimal(0) },
+                        { accountId: eqId, debit: new Prisma.Decimal(0), credit: abs },
+                    ]
+                    : [
+                        { accountId: eqId, debit: abs, credit: new Prisma.Decimal(0) },
+                        { accountId: b2.account.id, debit: new Prisma.Decimal(0), credit: abs },
+                    ];
+                await postJournalEntry(tx, {
+                    companyId,
+                    date: normalizeToDay(new Date()),
+                    description: `Opening balance adjustment • Banking: ${String(b2.account?.name ?? '').trim() || '—'}`,
+                    createdByUserId: userId,
+                    lines,
+                });
+            }
+            return b2;
+        });
+        // If reply already sent due to not found inside tx, just return.
+        if (updated?.error)
+            return updated;
+        return {
+            id: updated.id,
+            kind: updated.kind,
+            isPrimary: updated.isPrimary,
+            bankName: updated.bankName,
+            accountNumber: updated.accountNumber,
+            identifierCode: updated.identifierCode,
+            branch: updated.branch,
+            description: updated.description,
+            currency: updated.currency ?? null,
+            account: {
+                id: updated.account.id,
+                code: updated.account.code,
+                name: updated.account.name,
+                type: updated.account.type,
             },
         };
     });

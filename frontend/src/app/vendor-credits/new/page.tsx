@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import { ArrowLeft, Plus, Trash2 } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
@@ -21,6 +22,7 @@ type Line = { itemId: string; accountId: string; quantity: string; unitCost: str
 export default function NewVendorCreditPage() {
   const { user, companySettings } = useAuth();
   const router = useRouter();
+  const search = useSearchParams();
   const [loading, setLoading] = useState(false);
 
   const [vendors, setVendors] = useState<Vendor[]>([]);
@@ -39,6 +41,10 @@ export default function NewVendorCreditPage() {
     { itemId: '', accountId: '', quantity: '1', unitCost: '', description: '' },
   ]);
 
+  const [sourceBill, setSourceBill] = useState<any>(null);
+  const fromPurchaseBillId = Number(search?.get('purchaseBillId') ?? 0);
+  const isFromPurchaseBill = Number.isFinite(fromPurchaseBillId) && fromPurchaseBillId > 0;
+
   useEffect(() => {
     if (!user?.companyId) return;
     getVendors(user.companyId).then(setVendors).catch(console.error);
@@ -49,6 +55,38 @@ export default function NewVendorCreditPage() {
       .then((s) => setInventoryAccountId(Number(s.inventoryAssetAccountId ?? 0) || null))
       .catch(() => setInventoryAccountId(null));
   }, [user?.companyId]);
+
+  // If opened from a purchase bill, prefill vendor/location/lines.
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!isFromPurchaseBill) return;
+    fetchApi(`/companies/${user.companyId}/purchase-bills/${fromPurchaseBillId}`)
+      .then((b: any) => {
+        setSourceBill(b);
+        const vendorId = b?.vendor?.id ? String(b.vendor.id) : '';
+        const locationId = b?.warehouse?.id ? String(b.warehouse.id) : b?.location?.id ? String(b.location.id) : '';
+        setForm((prev) => ({ ...prev, vendorId: vendorId || prev.vendorId, locationId: locationId || prev.locationId }));
+
+        const billLines = (b?.lines ?? []) as any[];
+        if (billLines.length > 0) {
+          setLines(
+            billLines.map((l: any) => ({
+              itemId: String(l.itemId ?? ''),
+              accountId: l.accountId ? String(l.accountId) : '',
+              // Default to the same qty + unit cost as the bill line (user can adjust).
+              quantity: String(Number(l.quantity ?? 0) || 0),
+              unitCost: String(Number(l.unitCost ?? 0) || 0),
+              description: String(l.description ?? l.item?.name ?? ''),
+            }))
+          );
+        }
+      })
+      .catch((e: any) => {
+        console.error(e);
+        alert(e?.message ?? 'Failed to load purchase bill');
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, isFromPurchaseBill, fromPurchaseBillId]);
 
   useEffect(() => {
     const tz = companySettings?.timeZone ?? 'Asia/Yangon';
@@ -70,9 +108,11 @@ export default function NewVendorCreditPage() {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
   function addLine() {
+    if (isFromPurchaseBill) return;
     setLines((prev) => [...prev, { itemId: '', accountId: '', quantity: '1', unitCost: '', description: '' }]);
   }
   function removeLine(idx: number) {
+    if (isFromPurchaseBill) return;
     setLines((prev) => prev.filter((_, i) => i !== idx));
   }
 
@@ -114,14 +154,16 @@ export default function NewVendorCreditPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-4">
-        <Link href="/vendor-credits">
+        <Link href={isFromPurchaseBill ? `/purchase-bills/${fromPurchaseBillId}` : '/vendor-credits'}>
           <Button variant="ghost" size="icon">
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">New Vendor Credit</h1>
-          <p className="text-sm text-muted-foreground">Create a credit from a supplier and apply it to purchase bills.</p>
+          <p className="text-sm text-muted-foreground">
+            {sourceBill ? `Vendor credit for Purchase Bill #${sourceBill.billNumber}` : 'Create a credit from a supplier and apply it to purchase bills.'}
+          </p>
         </div>
       </div>
 
@@ -134,7 +176,11 @@ export default function NewVendorCreditPage() {
             <div className="grid gap-4 md:grid-cols-3">
               <div className="grid gap-2">
                 <Label>Vendor</Label>
-                <SelectNative value={form.vendorId} onChange={(e) => setForm({ ...form, vendorId: e.target.value })}>
+                <SelectNative
+                  value={form.vendorId}
+                  onChange={(e) => setForm({ ...form, vendorId: e.target.value })}
+                  disabled={!!sourceBill}
+                >
                   <option value="">—</option>
                   {vendors.map((v) => (
                     <option key={v.id} value={String(v.id)}>
@@ -149,7 +195,11 @@ export default function NewVendorCreditPage() {
               </div>
               <div className="grid gap-2">
                 <Label>Branch / Location</Label>
-                <SelectNative value={form.locationId} onChange={(e) => setForm({ ...form, locationId: e.target.value })}>
+                <SelectNative
+                  value={form.locationId}
+                  onChange={(e) => setForm({ ...form, locationId: e.target.value })}
+                  disabled={!!sourceBill}
+                >
                   <option value="">Company default</option>
                   {locations.map((l) => (
                     <option key={l.id} value={String(l.id)}>
@@ -164,7 +214,7 @@ export default function NewVendorCreditPage() {
             <Card className="shadow-sm">
               <CardHeader className="flex flex-row items-center justify-between space-y-0">
                 <CardTitle className="text-base">Item Table</CardTitle>
-                <Button type="button" variant="outline" onClick={addLine} className="gap-2">
+                <Button type="button" variant="outline" onClick={addLine} className="gap-2" disabled={!!sourceBill}>
                   <Plus className="h-4 w-4" /> Add New Row
                 </Button>
               </CardHeader>
@@ -192,6 +242,7 @@ export default function NewVendorCreditPage() {
                               <SelectNative
                                 value={l.itemId}
                                 onChange={(e) => {
+                                  if (sourceBill) return;
                                   const itemId = e.target.value;
                                   const picked = selectableItems.find((x) => String(x.id) === String(itemId));
                                   const pickedTracked = picked?.type === 'GOODS' && !!picked?.trackInventory;
@@ -204,6 +255,7 @@ export default function NewVendorCreditPage() {
                                       : '';
                                   updateLine(idx, { itemId, accountId: nextAccountId });
                                 }}
+                                disabled={!!sourceBill}
                               >
                                 <option value="">Select item…</option>
                                 {selectableItems.map((it2) => (
@@ -217,6 +269,7 @@ export default function NewVendorCreditPage() {
                                   placeholder="Description (optional)"
                                   value={l.description}
                                   onChange={(e) => updateLine(idx, { description: e.target.value })}
+                                  disabled={!!sourceBill}
                                 />
                               </div>
                             </TableCell>
@@ -227,7 +280,7 @@ export default function NewVendorCreditPage() {
                                 <AccountPicker
                                   accounts={expenseAccounts}
                                   value={l.accountId}
-                                  onChange={(v) => updateLine(idx, { accountId: v })}
+                                  onChange={(v) => updateLine(idx, { accountId: v ? String(v) : '' })}
                                   placeholder="Select account…"
                                 />
                               )}
@@ -252,13 +305,21 @@ export default function NewVendorCreditPage() {
                                 className="text-right"
                                 value={l.unitCost}
                                 onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
+                                // Allow editing rate even when created from a bill (user requested).
+                                disabled={false}
                               />
                             </TableCell>
                             <TableCell className="align-top text-right font-medium tabular-nums">
                               {Number.isFinite(lineTotal) ? lineTotal.toLocaleString() : '0'}
                             </TableCell>
                             <TableCell className="align-top">
-                              <Button type="button" variant="ghost" size="icon" onClick={() => removeLine(idx)} disabled={lines.length <= 1}>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                onClick={() => removeLine(idx)}
+                                disabled={lines.length <= 1 || !!sourceBill}
+                              >
                                 <Trash2 className="h-4 w-4" />
                               </Button>
                             </TableCell>

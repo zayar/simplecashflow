@@ -1,5 +1,5 @@
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 import { createItem } from '../lib/ar';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
@@ -7,11 +7,15 @@ import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Button } from '../components/ui/button';
 import { toNumber } from '../lib/format';
+import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
 
 export default function ItemNew() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const mode = params.get('mode'); // 'pick' or null
+  const returnTo = params.get('returnTo') ?? '/invoices/new';
 
   const [name, setName] = React.useState('');
   const [price, setPrice] = React.useState('');
@@ -28,12 +32,30 @@ export default function ItemNew() {
     if (!Number.isFinite(sellingPrice) || sellingPrice < 0) return setError('Price must be 0 or more');
     setSaving(true);
     try {
-      await createItem(companyId, {
+      const created = await createItem(companyId, {
         name: name.trim(),
         sellingPrice,
         sku: sku.trim() ? sku.trim() : null,
       });
-      navigate('/items', { replace: true });
+      if (mode === 'pick') {
+        const draft = getInvoiceDraft();
+        const idx = Number(draft.activeLineIndex ?? 0);
+        const safeIdx = Number.isFinite(idx) && idx >= 0 ? idx : 0;
+        const nextLines = (draft.lines ?? []).map((l, i) => {
+          if (i !== safeIdx) return l;
+          return {
+            ...l,
+            itemId: created.id,
+            itemName: created.name,
+            unitPrice: Math.max(0, toNumber((created as any).sellingPrice)),
+          };
+        });
+        setInvoiceDraft({ ...draft, lines: nextLines, activeLineIndex: null, returnTo: null });
+        const sep = returnTo.includes('?') ? '&' : '?';
+        navigate(`${returnTo}${sep}picked=1`, { replace: true });
+      } else {
+        navigate('/items', { replace: true });
+      }
     } catch (err: any) {
       setError(err?.message ?? 'Failed to create item');
     } finally {

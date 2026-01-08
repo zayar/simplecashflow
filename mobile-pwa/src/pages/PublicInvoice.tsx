@@ -97,7 +97,10 @@ export default function PublicInvoice() {
 
   const qrCodes: PaymentQrCodes = q.data?.company?.paymentQrCodes ?? {};
   const invoice = q.data?.invoice;
+  const totalPaid = Number((invoice as any)?.totalPaid ?? 0);
   const isPaid = invoice?.status === 'PAID';
+  const isLocked = totalPaid > 0 || invoice?.status === 'PARTIAL' || invoice?.status === 'PAID' || invoice?.status === 'VOID';
+  const canManageProofs = !isLocked;
   const proofs = Array.isArray(invoice?.pendingPaymentProofs) ? invoice?.pendingPaymentProofs : [];
 
   const handleWalletClick = (method: WalletMethod) => {
@@ -236,13 +239,13 @@ export default function PublicInvoice() {
               />
             </Card>
 
-            {/* Payment Proofs (customer can view; can manage only if not fully paid) */}
+            {/* Payment Proofs (customer can view; can manage only before the business records payment) */}
             {proofs.length > 0 ? (
               <Card className="no-print overflow-hidden rounded-2xl shadow-sm">
                 <div className="px-4 py-3">
                   <div className="text-base font-semibold text-foreground">Payment proofs</div>
                   <div className="mt-1 text-sm text-muted-foreground">
-                    {isPaid ? 'Saved for reference.' : 'Saved. You can replace it if needed.'}
+                    {canManageProofs ? 'Saved. You can remove and re-upload if needed.' : 'Saved for reference (locked after payment is recorded).'}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 px-4 pb-4">
@@ -251,7 +254,7 @@ export default function PublicInvoice() {
                       <a href={p.url} target="_blank" rel="noopener noreferrer" className="block">
                         <img src={p.url} alt={`Payment proof ${idx + 1}`} className="h-40 w-full bg-muted object-contain" />
                       </a>
-                      {!isPaid ? (
+                      {canManageProofs ? (
                         <button
                           type="button"
                           onClick={() => handleRemoveProof(p)}
@@ -264,7 +267,7 @@ export default function PublicInvoice() {
                   ))}
                 </div>
 
-                {!isPaid ? (
+                {canManageProofs ? (
                   <div className="border-t border-border px-4 py-3 flex gap-2">
                     <label
                       htmlFor="payment-proof-input"
@@ -310,8 +313,8 @@ export default function PublicInvoice() {
               </Card>
             )}
 
-            {/* Payment Proof Upload - only show if not fully paid */}
-            {!isPaid && (
+            {/* Payment Proof Upload - allow only before payment is recorded */}
+            {!isPaid && canManageProofs && (
               <Card className="no-print rounded-2xl shadow-sm">
                 <div className="px-4 py-3">
                   <div className="text-base font-semibold text-foreground">Upload Payment Proof</div>

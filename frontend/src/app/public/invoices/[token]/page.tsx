@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef } from "react"
 import { useParams } from "next/navigation"
 
-import { getPublicInvoice, uploadPaymentProof, type PublicInvoiceResponse } from "@/lib/api"
+import { deletePaymentProof, getPublicInvoice, uploadPaymentProof, type PublicInvoiceResponse } from "@/lib/api"
 import { InvoicePaper } from "@/components/invoice/InvoicePaper"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -33,7 +33,7 @@ export default function PublicInvoicePage() {
   const [error, setError] = useState<string | null>(null)
 
   // QR Popup state
-  const [selectedPayment, setSelectedPayment] = useState<(typeof PAYMENT_METHODS)[0] | null>(null)
+  const [selectedPayment, setSelectedPayment] = useState<(typeof PAYMENT_METHODS)[number] | null>(null)
 
   // Proof upload state
   const [showUpload, setShowUpload] = useState(false)
@@ -97,10 +97,41 @@ export default function PublicInvoicePage() {
       setUploadFile(null)
       setUploadPreview(null)
       setUploadNote("")
+      // Refresh invoice so the customer can see what they uploaded.
+      const next = await getPublicInvoice(token)
+      setData(next)
     } catch (err: any) {
       setUploadError(err?.message ?? "Failed to upload")
     } finally {
       setUploading(false)
+    }
+  }
+
+  const handleRemoveProof = async (proof: any) => {
+    if (!token) return
+    if (!confirm("Remove this payment proof?")) return
+    try {
+      const id = typeof proof?.id === "string" ? proof.id : null
+      const url = typeof proof?.url === "string" ? proof.url : null
+      await deletePaymentProof(token, id ? { id } : url ? { url } : undefined)
+      const next = await getPublicInvoice(token)
+      setData(next)
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to remove payment proof")
+    }
+  }
+
+  const handleReplaceAllProofs = async () => {
+    if (!token) return
+    if (!confirm("Replace all proofs? This will remove existing images.")) return
+    try {
+      await deletePaymentProof(token)
+      const next = await getPublicInvoice(token)
+      setData(next)
+      // Open file picker after clearing
+      fileInputRef.current?.click()
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to clear payment proofs")
     }
   }
 
@@ -121,6 +152,9 @@ export default function PublicInvoicePage() {
   const remainingBalance = data?.invoice ? Number(data.invoice.remainingBalance) : 0
   const isPaid = data?.invoice?.status === "PAID"
   const isVoid = data?.invoice?.status === "VOID"
+  const totalPaid = data?.invoice ? Number((data.invoice as any).totalPaid ?? 0) : 0
+  const canManageProofs = !isVoid && totalPaid <= 0 && data?.invoice?.status !== "PARTIAL" && data?.invoice?.status !== "PAID"
+  const proofs = Array.isArray((data?.invoice as any)?.pendingPaymentProofs) ? ((data?.invoice as any).pendingPaymentProofs as any[]) : []
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
@@ -185,6 +219,56 @@ export default function PublicInvoicePage() {
               </div>
             </div>
 
+            {/* Uploaded proofs (customer can view; can edit only before payment is recorded) */}
+            {proofs.length > 0 ? (
+              <Card className="no-print overflow-hidden">
+                <div className="px-6 py-4 border-b bg-slate-50">
+                  <h2 className="text-sm font-semibold text-slate-800">Your uploaded payment proofs</h2>
+                  <p className="text-xs text-slate-500 mt-1">
+                    {canManageProofs
+                      ? "You can remove and re-upload if you attached the wrong screenshot."
+                      : "Saved for reference (locked after the business records payment)."}
+                  </p>
+                </div>
+                <div className="p-6">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {proofs.map((p: any, idx: number) => (
+                      <div key={`${p?.id ?? p?.url ?? idx}`} className="overflow-hidden rounded-xl border bg-white">
+                        <a href={p.url} target="_blank" rel="noopener noreferrer" className="block">
+                          <img
+                            src={p.url}
+                            alt={`Payment proof ${idx + 1}`}
+                            className="h-44 w-full bg-slate-50 object-contain"
+                            loading="lazy"
+                          />
+                        </a>
+                        {canManageProofs ? (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveProof(p)}
+                            className="w-full border-t px-3 py-2 text-sm text-red-600 hover:bg-red-50"
+                          >
+                            Remove
+                          </button>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+
+                  {canManageProofs ? (
+                    <div className="mt-4 flex gap-3">
+                      <Button variant="outline" className="flex-1" onClick={() => setShowUpload(true)}>
+                        Add proof
+                      </Button>
+                      <Button variant="outline" className="flex-1" onClick={handleReplaceAllProofs}>
+                        Replace all
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+              </Card>
+            ) : null}
+
             {/* Payment Section - Only show if not paid/void */}
             {!isPaid && !isVoid && remainingBalance > 0 && (
               <Card className="no-print overflow-hidden">
@@ -233,6 +317,12 @@ export default function PublicInvoicePage() {
                       Upload your payment screenshot so we can confirm your payment faster.
                     </p>
 
+                    {!canManageProofs ? (
+                      <div className="mb-4 rounded-xl bg-slate-100 p-4 text-center text-sm text-slate-600">
+                        Payment proof is locked because the business has already recorded a payment.
+                      </div>
+                    ) : null}
+
                     {uploadSuccess ? (
                       <div className="rounded-xl bg-green-50 border border-green-200 p-4 text-center">
                         <div className="text-green-600 text-lg mb-1">✓</div>
@@ -254,7 +344,7 @@ export default function PublicInvoicePage() {
                           Upload another proof
                         </Button>
                       </div>
-                    ) : showUpload ? (
+                    ) : showUpload && canManageProofs ? (
                       <div className="space-y-4">
                         <input
                           type="file"
@@ -340,6 +430,7 @@ export default function PublicInvoicePage() {
                         variant="outline"
                         className="w-full"
                         onClick={() => setShowUpload(true)}
+                        disabled={!canManageProofs}
                       >
                         📎 Upload Payment Screenshot
                       </Button>

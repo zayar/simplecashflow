@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
 import { getItems, type Item } from '../lib/ar';
 import { AppBar, BackIcon, IconButton, SearchIcon } from '../components/AppBar';
@@ -8,11 +8,14 @@ import { BottomNav } from '../components/BottomNav';
 import { Fab, PlusIcon } from '../components/Fab';
 import { formatMoneyK, toNumber } from '../lib/format';
 import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
+import { usePullToRefresh } from '../lib/usePullToRefresh';
+import { PullToRefreshIndicator } from '../components/PullToRefresh';
 
 export default function Items() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [params] = useSearchParams();
   const mode = params.get('mode'); // 'pick' or null
   const [q, setQ] = useState('');
@@ -22,6 +25,14 @@ export default function Items() {
     queryKey: ['items', companyId],
     queryFn: async () => await getItems(companyId),
     enabled: companyId > 0
+  });
+
+  const handleRefresh = useCallback(async () => {
+    await queryClient.invalidateQueries({ queryKey: ['items', companyId] });
+  }, [queryClient, companyId]);
+
+  const { isRefreshing, pullDistance, handlers, containerRef } = usePullToRefresh({
+    onRefresh: handleRefresh
   });
 
   const rows = useMemo(() => {
@@ -47,11 +58,16 @@ export default function Items() {
     });
     const returnTo = draft.returnTo ?? '/invoices/new';
     setInvoiceDraft({ ...draft, lines: nextLines, activeLineIndex: null, returnTo: null });
-    navigate(`${returnTo}?picked=1`, { replace: true });
+    const sep = returnTo.includes('?') ? '&' : '?';
+    navigate(`${returnTo}${sep}picked=1`, { replace: true });
   }
 
   return (
-    <div className="min-h-dvh bg-slate-100">
+    <div
+      className="min-h-dvh bg-slate-100"
+      ref={containerRef}
+      {...handlers}
+    >
       <AppBar
         title="Items"
         left={
@@ -67,6 +83,8 @@ export default function Items() {
       />
 
       <div className="mx-auto max-w-xl px-3 pb-24 pt-3">
+        <PullToRefreshIndicator isRefreshing={isRefreshing} pullDistance={pullDistance} />
+
         {searchOpen ? (
           <div className="mb-3 rounded-lg bg-white p-3 shadow-sm">
             <input
@@ -106,7 +124,19 @@ export default function Items() {
         </div>
       </div>
 
-      {mode ? null : <Fab onClick={() => navigate('/items/new')} ariaLabel="New item" icon={<PlusIcon />} />}
+      <Fab
+        onClick={() => {
+          if (mode === 'pick') {
+            const draft = getInvoiceDraft();
+            const returnTo = draft.returnTo ?? '/invoices/new';
+            navigate(`/items/new?mode=pick&returnTo=${encodeURIComponent(returnTo)}`);
+            return;
+          }
+          navigate('/items/new');
+        }}
+        ariaLabel="New item"
+        icon={<PlusIcon />}
+      />
       {mode ? null : <BottomNav />}
     </div>
   );

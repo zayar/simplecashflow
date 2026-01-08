@@ -57,8 +57,9 @@ export default function VendorCreditDetailPage() {
   const missingAccountLines = useMemo(() => {
     const lines = (vc?.lines ?? []) as any[];
     const missing: number[] = [];
-    for (const [idx, l] of lines.entries()) {
-      if (!l.accountId) missing.push(idx + 1);
+    for (let idx = 0; idx < lines.length; idx++) {
+      const l = lines[idx];
+      if (!l?.accountId) missing.push(idx + 1);
     }
     return missing;
   }, [vc]);

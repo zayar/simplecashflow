@@ -48,6 +48,13 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [settings, setSettings] = useState<CompanySettings | null>(null)
+  const [meLoading, setMeLoading] = useState(false)
+  const [me, setMe] = useState<any | null>(null)
+
+  const [phoneForm, setPhoneForm] = useState({ phone: "", code: "" })
+  const [phoneOtpSent, setPhoneOtpSent] = useState(false)
+  const [phoneBusy, setPhoneBusy] = useState(false)
+  const [phoneError, setPhoneError] = useState<string | null>(null)
 
   const [form, setForm] = useState({
     baseCurrency: "MMK",
@@ -68,6 +75,15 @@ export default function SettingsPage() {
         })
       })
       .finally(() => setLoading(false))
+  }, [user?.companyId])
+
+  useEffect(() => {
+    if (!user?.companyId) return
+    setMeLoading(true)
+    fetchApi(`/me`)
+      .then(setMe)
+      .catch(() => setMe(null))
+      .finally(() => setMeLoading(false))
   }, [user?.companyId])
 
   const fiscalYearLabel = useMemo(() => {
@@ -195,6 +211,121 @@ export default function SettingsPage() {
               </div>
             </>
           )}
+        </CardContent>
+      </Card>
+
+      <Card className="shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg">Login & Security</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="text-sm text-muted-foreground">
+            Link a phone number so you can log in using OTP on both Web and PWA.
+          </div>
+
+          {meLoading ? (
+            <div className="text-sm text-muted-foreground">Loading…</div>
+          ) : (
+            <div className="rounded-lg border bg-muted/20 p-3 text-sm">
+              <div>
+                <b>Current phone:</b> {me?.phone ? me.phone : "Not set"}
+              </div>
+              <div>
+                <b>Verified:</b> {me?.phoneVerifiedAt ? "Yes" : "No"}
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="grid gap-2">
+              <Label>Phone</Label>
+              <Input
+                value={phoneForm.phone}
+                onChange={(e) => setPhoneForm({ ...phoneForm, phone: e.target.value })}
+                placeholder="e.g. 09xxxxxxxxx"
+                disabled={phoneOtpSent}
+              />
+            </div>
+
+            {phoneOtpSent ? (
+              <div className="grid gap-2">
+                <Label>OTP Code</Label>
+                <Input
+                  value={phoneForm.code}
+                  onChange={(e) => setPhoneForm({ ...phoneForm, code: e.target.value })}
+                  placeholder="6-digit code"
+                  inputMode="numeric"
+                />
+              </div>
+            ) : null}
+          </div>
+
+          {phoneError ? <div className="text-sm text-destructive">{phoneError}</div> : null}
+
+          <div className="flex flex-wrap gap-2">
+            {!phoneOtpSent ? (
+              <Button
+                variant="outline"
+                disabled={phoneBusy || !phoneForm.phone.trim()}
+                onClick={async () => {
+                  setPhoneError(null)
+                  setPhoneBusy(true)
+                  try {
+                    await fetchApi('/me/phone/request-otp', {
+                      method: 'POST',
+                      body: JSON.stringify({ phone: phoneForm.phone }),
+                    })
+                    setPhoneOtpSent(true)
+                  } catch (e: any) {
+                    setPhoneError(e?.message ?? 'Failed to send OTP')
+                  } finally {
+                    setPhoneBusy(false)
+                  }
+                }}
+              >
+                {phoneBusy ? "Sending..." : "Send OTP"}
+              </Button>
+            ) : (
+              <>
+                <Button
+                  disabled={phoneBusy || !phoneForm.code.trim()}
+                  onClick={async () => {
+                    setPhoneError(null)
+                    setPhoneBusy(true)
+                    try {
+                      await fetchApi('/me/phone/verify', {
+                        method: 'POST',
+                        body: JSON.stringify({ phone: phoneForm.phone, code: phoneForm.code }),
+                      })
+                      const updatedMe = await fetchApi('/me')
+                      setMe(updatedMe)
+                      setPhoneOtpSent(false)
+                      setPhoneForm({ phone: "", code: "" })
+                      alert("Phone linked.")
+                    } catch (e: any) {
+                      setPhoneError(e?.message ?? 'Failed to verify OTP')
+                    } finally {
+                      setPhoneBusy(false)
+                    }
+                  }}
+                >
+                  {phoneBusy ? "Verifying..." : "Verify & Link"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={phoneBusy}
+                  onClick={() => {
+                    setPhoneOtpSent(false)
+                    setPhoneForm({ phone: "", code: "" })
+                    setPhoneError(null)
+                  }}
+                >
+                  Cancel
+                </Button>
+              </>
+            )}
+          </div>
         </CardContent>
       </Card>
 

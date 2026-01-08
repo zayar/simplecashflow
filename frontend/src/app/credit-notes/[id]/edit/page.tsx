@@ -195,8 +195,15 @@ export default function EditCreditNotePage() {
       setError('Customer is required.');
       return;
     }
-    if (lines.length === 0 || lines.some((l) => !l.itemId)) {
-      setError('Please select items for all lines.');
+    if (
+      lines.length === 0 ||
+      lines.some((l) => {
+        const hasItem = !!String(l.itemId ?? '').trim();
+        const hasDesc = !!String(l.description ?? '').trim();
+        return !hasItem && !hasDesc;
+      })
+    ) {
+      setError('Please select an item or enter a description for all lines.');
       return;
     }
     setSaving(true);
@@ -210,7 +217,7 @@ export default function EditCreditNotePage() {
           customerNotes: customerNotes || null,
           termsAndConditions: termsAndConditions || null,
           lines: lines.map((l) => ({
-            itemId: Number(l.itemId),
+            itemId: String(l.itemId ?? '').trim() ? Number(l.itemId) : null,
             invoiceLineId: l.invoiceLineId ? Number(l.invoiceLineId) : null,
             description: l.description,
             quantity: Number(l.quantity),
@@ -359,8 +366,8 @@ export default function EditCreditNotePage() {
                           <TableCell className="align-top">
                             <Input
                               type="number"
-                              inputMode="numeric"
-                              step="1"
+                              inputMode="decimal"
+                              step="any"
                               min="0"
                               className="text-right"
                               value={l.unitPrice}

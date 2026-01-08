@@ -16,6 +16,12 @@ function formatMoneyWithCurrency(n: any, currency?: string) {
   return cur ? `${cur}${formatMoney(num)}` : formatMoney(num)
 }
 
+function formatMoneyExact3(n: any) {
+  const num = Number(n ?? 0)
+  if (Number.isNaN(num)) return String(n ?? "")
+  return num.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })
+}
+
 type InvoiceLike = {
   invoiceNumber: string
   status: string
@@ -44,6 +50,7 @@ type InvoiceLike = {
 function statusLabel(status: string) {
   const s = String(status ?? "").toUpperCase()
   if (!s) return "—"
+  if (s === "PARTIAL") return "Partially paid"
   return s.slice(0, 1) + s.slice(1).toLowerCase()
 }
 
@@ -55,6 +62,14 @@ export function InvoicePaper({
   displayCurrency,
   baseCurrency,
   fxRateToBase,
+  documentTitle,
+  partyLabel,
+  dateLabel,
+  dueDateLabel,
+  locationLabel,
+  rateLabel,
+  balanceLabel,
+  settledLabel,
 }: {
   invoice: InvoiceLike
   companyName: string
@@ -65,6 +80,16 @@ export function InvoicePaper({
   displayCurrency?: string | null
   baseCurrency?: string | null
   fxRateToBase?: number | null
+  // Optional overrides so we can reuse this renderer for Bills / Credit Notes
+  documentTitle?: string
+  partyLabel?: string
+  dateLabel?: string
+  dueDateLabel?: string
+  locationLabel?: string
+  rateLabel?: string
+  balanceLabel?: string
+  // Used for the "Payment Made" fallback row (when there is no payments/credits breakdown)
+  settledLabel?: string
 }) {
   const t: InvoiceTemplate = template ?? {
     version: 1,
@@ -98,6 +123,14 @@ export function InvoicePaper({
     return sum + Math.max(0, Number(l.discountAmount ?? 0))
   }, 0)
   const taxAmount = Number((invoice as any).taxAmount ?? 0)
+  const paymentsTotal = Array.isArray((invoice as any).payments)
+    ? ((invoice as any).payments as any[])
+        .filter((p: any) => !p?.reversedAt)
+        .reduce((sum: number, p: any) => sum + Number(p?.amount ?? 0), 0)
+    : null
+  const creditsTotal = Array.isArray((invoice as any).creditsApplied)
+    ? ((invoice as any).creditsApplied as any[]).reduce((sum: number, c: any) => sum + Number(c?.amount ?? 0), 0)
+    : null
 
   const rootStyle: React.CSSProperties = {
     fontFamily: t.fontFamily,
@@ -107,6 +140,15 @@ export function InvoicePaper({
     backgroundColor: t.tableHeaderBg,
     color: t.tableHeaderText,
   }
+
+  const title = (documentTitle ?? "Invoice").trim() || "Invoice"
+  const labelParty = (partyLabel ?? "Bill To").trim() || "Bill To"
+  const labelDate = (dateLabel ?? "Invoice Date").trim() || "Invoice Date"
+  const labelDue = (dueDateLabel ?? "Due Date").trim() || "Due Date"
+  const labelLoc = (locationLabel ?? "Location").trim() || "Location"
+  const labelRate = (rateLabel ?? "Rate").trim() || "Rate"
+  const labelBalance = (balanceLabel ?? "Balance Due").trim() || "Balance Due"
+  const labelSettled = (settledLabel ?? "Payment Made").trim() || "Payment Made"
 
   return (
     <div className="p-6 sm:p-10" style={rootStyle}>
@@ -136,7 +178,7 @@ export function InvoicePaper({
 
         <div className="space-y-2 text-left sm:text-right">
           <div className="text-3xl font-semibold tracking-tight" style={{ color: t.accentColor }}>
-            Invoice
+            {title}
           </div>
           <div className="text-sm text-muted-foreground">
             <div>
@@ -147,7 +189,7 @@ export function InvoicePaper({
             </div>
           </div>
           <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
-            <div className="text-xs font-medium text-muted-foreground">Balance Due</div>
+            <div className="text-xs font-medium text-muted-foreground">{labelBalance}</div>
             <div className="text-lg font-semibold tabular-nums">
               {formatMoneyWithCurrency(toDisp((invoice as any).remainingBalance), dispCur ?? undefined)}
             </div>
@@ -155,6 +197,13 @@ export function InvoicePaper({
               <div className="mt-1 text-[11px] text-muted-foreground">
                 Exchange rate: 1 {dispCur} = {baseCur}
                 {formatMoney(fx)}
+                <div className="no-print mt-1">
+                  Rounded for display (2 decimals). Exact total:{" "}
+                  <b>
+                    {dispCur}
+                    {formatMoneyExact3(toDisp((invoice as any).total))}
+                  </b>
+                </div>
               </div>
             ) : null}
           </div>
@@ -167,7 +216,7 @@ export function InvoicePaper({
       <div className="grid gap-6 sm:grid-cols-2">
         <div className="space-y-2">
           <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-            Bill To
+            {labelParty}
           </div>
           <div className="text-base font-semibold">{invoice.customer?.name ?? "—"}</div>
           <div className="text-sm text-muted-foreground">Customer address (optional)</div>
@@ -175,13 +224,13 @@ export function InvoicePaper({
 
         <div className="space-y-2 sm:justify-self-end sm:text-right">
           <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-            <div className="text-muted-foreground">Invoice Date</div>
+            <div className="text-muted-foreground">{labelDate}</div>
             <div className="font-medium">{formatDateInTimeZone(invoice.invoiceDate as any, tz)}</div>
-            <div className="text-muted-foreground">Due Date</div>
+            <div className="text-muted-foreground">{labelDue}</div>
             <div className="font-medium">
               {invoice.dueDate ? formatDateInTimeZone(invoice.dueDate as any, tz) : "—"}
             </div>
-            <div className="text-muted-foreground">Location</div>
+            <div className="text-muted-foreground">{labelLoc}</div>
             <div className="font-medium">{invoice.location?.name ?? invoice.warehouse?.name ?? "—"}</div>
             <div className="text-muted-foreground">Terms</div>
             <div className="font-medium">{invoice.dueDate ? "Net" : "—"}</div>
@@ -199,7 +248,7 @@ export function InvoicePaper({
               <th className="px-4 py-3 text-left font-medium">#</th>
               <th className="px-4 py-3 text-left font-medium">Item</th>
               <th className="px-4 py-3 text-right font-medium">Qty</th>
-              <th className="px-4 py-3 text-right font-medium">Rate</th>
+              <th className="px-4 py-3 text-right font-medium">{labelRate}</th>
               <th className="px-4 py-3 text-right font-medium">Amount</th>
             </tr>
           </thead>
@@ -297,12 +346,30 @@ export function InvoicePaper({
                 {formatMoneyWithCurrency(toDisp((invoice as any).total), dispCur ?? undefined)}
               </span>
             </div>
-            <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Payment Made</span>
-              <span className="font-medium tabular-nums">
-                {formatMoneyWithCurrency(toDisp((invoice as any).totalPaid), dispCur ?? undefined)}
-              </span>
-            </div>
+            {typeof paymentsTotal === "number" && paymentsTotal > 0 ? (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Payments Made</span>
+                <span className="font-medium tabular-nums">
+                  {formatMoneyWithCurrency(toDisp(paymentsTotal), dispCur ?? undefined)}
+                </span>
+              </div>
+            ) : null}
+            {typeof creditsTotal === "number" && creditsTotal > 0 ? (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Credits Applied</span>
+                <span className="font-medium tabular-nums">
+                  {formatMoneyWithCurrency(toDisp(creditsTotal), dispCur ?? undefined)}
+                </span>
+              </div>
+            ) : null}
+            {!(typeof paymentsTotal === "number" && paymentsTotal > 0) && !(typeof creditsTotal === "number" && creditsTotal > 0) ? (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">{labelSettled}</span>
+                <span className="font-medium tabular-nums">
+                  {formatMoneyWithCurrency(toDisp((invoice as any).totalPaid), dispCur ?? undefined)}
+                </span>
+              </div>
+            ) : null}
             <div className="mt-2 flex items-center justify-between border-t pt-2">
               <span className="font-semibold">Balance Due</span>
               <span className="font-semibold tabular-nums">

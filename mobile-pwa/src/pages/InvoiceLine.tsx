@@ -35,6 +35,19 @@ export default function InvoiceLine() {
   const [touched, setTouched] = useState(false);
 
   const line = draft.lines[safeIdx] ?? { quantity: 1, unitPrice: 0 };
+  const [unitPriceText, setUnitPriceText] = useState<string>(String(clampMoney(toNumber((line as any).unitPrice ?? 0))));
+  const [qtyText, setQtyText] = useState<string>(String(clampQty(toNumber((line as any).quantity ?? 1))));
+  const [discountText, setDiscountText] = useState<string>(String(clampMoney(toNumber((line as any).discountAmount ?? 0))));
+  const [taxPctText, setTaxPctText] = useState<string>(String(clampMoney(toNumber((line as any).taxRate ?? 0)) * 100));
+
+  // When changing line index (or after draft refresh), sync text fields from numeric values.
+  React.useEffect(() => {
+    setUnitPriceText(String(clampMoney(toNumber((line as any).unitPrice ?? 0))));
+    setQtyText(String(clampQty(toNumber((line as any).quantity ?? 1))));
+    setDiscountText(String(clampMoney(toNumber((line as any).discountAmount ?? 0))));
+    setTaxPctText(String(clampMoney(toNumber((line as any).taxRate ?? 0)) * 100));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [safeIdx, params.get('picked')]);
 
   // When returning from picker screens, refresh draft from storage.
   React.useEffect(() => {
@@ -65,7 +78,8 @@ export default function InvoiceLine() {
 
   function goBack() {
     const returnTo = draft.returnTo ?? '/invoices/new';
-    navigate(`${returnTo}?picked=1`, { replace: true });
+    const sep = returnTo.includes('?') ? '&' : '?';
+    navigate(`${returnTo}${sep}picked=1`, { replace: true });
   }
 
   const errors = useMemo(() => {
@@ -85,6 +99,11 @@ export default function InvoiceLine() {
     const net = Math.max(0, qty * unit - discount);
     return net + net * taxRate;
   }, [line.quantity, line.unitPrice, line.discountAmount, line.taxRate]);
+
+  const rowInputClass =
+    'h-9 w-28 rounded-xl border border-transparent bg-muted/40 px-2 py-1 text-right tabular-nums shadow-none focus-visible:border-input focus-visible:bg-background focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0';
+  const rowPrefixClass = 'pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-sm text-muted-foreground';
+  const rowSuffixClass = 'pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-sm text-muted-foreground';
 
   return (
     <div className="min-h-dvh bg-background pb-24">
@@ -134,7 +153,7 @@ export default function InvoiceLine() {
                 }
               }}
               placeholder="e.g. Calculator"
-              className="mt-2 h-9"
+              className="mt-2 h-10 rounded-xl border border-transparent bg-muted/40 shadow-none focus-visible:border-input focus-visible:bg-background focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0"
               list="invoice-items-datalist"
               autoComplete="off"
             />
@@ -152,85 +171,104 @@ export default function InvoiceLine() {
                 value={String(line.description ?? '')}
                 onChange={(e) => updateLine({ description: e.target.value })}
                 placeholder="Optional details…"
-                className="mt-2 min-h-16"
+                className="mt-2 min-h-20 rounded-xl border border-transparent bg-muted/40 shadow-none focus-visible:border-input focus-visible:bg-background focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0"
               />
             </div>
           </div>
 
-          <div className="border-t border-border px-4 py-4">
+          <div className="border-t border-border/70 px-4 py-3">
             <div className="flex items-center justify-between">
-              <div className="text-base font-semibold">Unit Cost</div>
-              <div className="flex items-center gap-2">
-                <div className="text-lg text-muted-foreground">K</div>
+              <div className="text-sm font-medium text-foreground">Unit Cost</div>
+              <div className="relative">
+                <div className={rowPrefixClass}>K</div>
                 <Input
-                  type="number"
-                  min={0}
-                  step="0.01"
                   inputMode="decimal"
-                  value={clampMoney(toNumber(line.unitPrice))}
-                  onChange={(e) => updateLine({ unitPrice: clampMoney(Number(e.target.value)) })}
-                  className="h-9 w-28 text-right"
+                  value={unitPriceText}
+                  onChange={(e) => setUnitPriceText(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onBlur={() => {
+                    setTouched(true);
+                    const raw = unitPriceText.trim();
+                    const n = raw === '' ? 0 : clampMoney(Number(raw));
+                    updateLine({ unitPrice: n });
+                    setUnitPriceText(String(n));
+                  }}
+                  className={`${rowInputClass} pl-6`}
                 />
               </div>
             </div>
             {touched && errors.unitPrice ? <div className="mt-2 text-sm text-destructive">{errors.unitPrice}</div> : null}
           </div>
 
-          <div className="border-t border-border px-4 py-4">
+          <div className="border-t border-border/70 px-4 py-3">
             <div className="flex items-center justify-between">
-              <div className="text-base font-semibold">Quantity</div>
+              <div className="text-sm font-medium text-foreground">Quantity</div>
               <Input
-                type="number"
-                min={1}
                 inputMode="numeric"
-                value={clampQty(toNumber(line.quantity))}
-                onChange={(e) => updateLine({ quantity: clampQty(Number(e.target.value)) })}
-                className="h-9 w-28 text-right"
+                value={qtyText}
+                onChange={(e) => setQtyText(e.target.value)}
+                onFocus={(e) => e.currentTarget.select()}
+                onBlur={() => {
+                  const raw = qtyText.trim();
+                  const n = raw === '' ? 1 : clampQty(Number(raw));
+                  updateLine({ quantity: n });
+                  setQtyText(String(n));
+                }}
+                className={rowInputClass}
               />
             </div>
           </div>
 
-          <div className="border-t border-border px-4 py-4">
+          <div className="border-t border-border/70 px-4 py-3">
             <div className="flex items-center justify-between">
-              <div className="text-base font-semibold">Discount</div>
-              <div className="flex items-center gap-2">
-                <div className="text-lg text-muted-foreground">K</div>
+              <div className="text-sm font-medium text-foreground">Discount</div>
+              <div className="relative">
+                <div className={rowPrefixClass}>K</div>
                 <Input
-                  type="number"
-                  min={0}
-                  step="0.01"
                   inputMode="decimal"
-                  value={clampMoney(toNumber(line.discountAmount ?? 0))}
-                  onChange={(e) => updateLine({ discountAmount: clampMoney(Number(e.target.value)) })}
-                  className="h-9 w-28 text-right"
+                  value={discountText}
+                  onChange={(e) => setDiscountText(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onBlur={() => {
+                    const raw = discountText.trim();
+                    const n = raw === '' ? 0 : clampMoney(Number(raw));
+                    updateLine({ discountAmount: n });
+                    setDiscountText(String(n));
+                  }}
+                  className={`${rowInputClass} pl-6`}
                 />
               </div>
             </div>
           </div>
 
           {/* We only implement tax using existing API field (taxRate). */}
-          <div className="border-t border-border px-4 py-4">
+          <div className="border-t border-border/70 px-4 py-3">
             <div className="flex items-center justify-between">
-              <div className="text-base font-semibold">Tax</div>
-              <div className="flex items-center gap-2">
+              <div className="text-sm font-medium text-foreground">Tax</div>
+              <div className="relative">
                 <Input
-                  type="number"
-                  min={0}
-                  step="0.01"
                   inputMode="decimal"
-                  value={clampMoney(toNumber(line.taxRate ?? 0)) * 100}
-                  onChange={(e) => updateLine({ taxRate: clampMoney(Number(e.target.value)) / 100 })}
-                  className="h-9 w-28 text-right"
+                  value={taxPctText}
+                  onChange={(e) => setTaxPctText(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  onBlur={() => {
+                    const raw = taxPctText.trim();
+                    const pct = raw === '' ? 0 : clampMoney(Number(raw));
+                    const rate = pct / 100;
+                    updateLine({ taxRate: rate });
+                    setTaxPctText(String(pct));
+                  }}
+                  className={`${rowInputClass} pr-6`}
                 />
-                <div className="text-lg text-muted-foreground">%</div>
+                <div className={rowSuffixClass}>%</div>
               </div>
             </div>
           </div>
 
-          <div className="border-t border-border px-4 py-4">
+          <div className="border-t border-border/70 px-4 py-3">
             <div className="flex items-center justify-between">
-              <div className="text-lg font-semibold">Total</div>
-              <div className="text-lg font-semibold">{formatMoneyK(total)}</div>
+              <div className="text-base font-semibold">Total</div>
+              <div className="text-base font-semibold">{formatMoneyK(total)}</div>
             </div>
           </div>
         </Card>

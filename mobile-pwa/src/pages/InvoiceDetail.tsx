@@ -8,6 +8,7 @@ import { formatMMDDYYYY, formatMoneyK, toNumber } from '../lib/format';
 import { Card } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { InvoicePaper } from '../components/invoice/InvoicePaper';
+import { setInvoiceDraft } from '../lib/invoiceDraft';
 
 export default function InvoiceDetail() {
   const { user } = useAuth();
@@ -119,10 +120,19 @@ export default function InvoiceDetail() {
           await navigator.share({ title, text, url });
           return;
         } catch (e: any) {
-          // User canceled share sheet — do not show as an error; fall back to copy.
+          // Some browsers (notably iOS Safari / in-app browsers) expose Web Share but block it
+          // in certain contexts, throwing e.g. "The request is not allowed by the user agent...".
+          // Treat these as "share not available" and fall back to copy/prompt silently.
           const name = String(e?.name ?? '');
-          const msg = String(e?.message ?? '');
-          if (name !== 'AbortError' && !msg.toLowerCase().includes('canceled')) throw e;
+          const msg = String(e?.message ?? '').toLowerCase();
+          const isUserCancel = name === 'AbortError' || msg.includes('canceled') || msg.includes('cancelled');
+          const isBlocked =
+            name === 'NotAllowedError' ||
+            name === 'SecurityError' ||
+            msg.includes('not allowed') ||
+            msg.includes('user agent') ||
+            msg.includes('denied permission');
+          if (!isUserCancel && !isBlocked) throw e;
         }
       }
       if (navigator.clipboard?.writeText) {
@@ -236,6 +246,54 @@ export default function InvoiceDetail() {
               {inv.status === 'DRAFT' ? (
                 <Button
                   className="w-full"
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    if (!inv) return;
+
+                    const toYyyyMmDd = (s: any): string => {
+                      const str = String(s ?? '');
+                      if (!str) return '';
+                      return str.length >= 10 ? str.slice(0, 10) : str;
+                    };
+
+                    const lines = (inv.lines ?? []).map((l: any) => {
+                      const rawDesc = String(l.description ?? '').trim();
+                      const [first, ...rest] = rawDesc.split('\n');
+                      const title = first?.trim() || null;
+                      const details = rest.join('\n').trim() || null;
+                      return {
+                        itemId: l.itemId ?? null,
+                        itemName: title,
+                        description: details,
+                        quantity: Math.max(1, Math.floor(toNumber(l.quantity))),
+                        unitPrice: Math.max(0, toNumber(l.unitPrice)),
+                        discountAmount: Math.max(0, toNumber(l.discountAmount ?? 0)),
+                        taxRate: Math.max(0, toNumber(l.taxRate ?? 0)),
+                      };
+                    });
+
+                    setInvoiceDraft({
+                      returnTo: null,
+                      editingInvoiceId: invoiceId,
+                      customerId: inv.customerId ?? null,
+                      customerName: inv.customerName ?? null,
+                      invoiceDate: toYyyyMmDd(inv.invoiceDate),
+                      dueDate: inv.dueDate ? toYyyyMmDd(inv.dueDate) : null,
+                      lines: lines.length ? lines : [{ quantity: 1, unitPrice: 0 }],
+                      activeLineIndex: null,
+                    });
+
+                    navigate('/invoices/new?edit=1');
+                  }}
+                >
+                  Edit Draft
+                </Button>
+              ) : null}
+
+              {inv.status === 'DRAFT' ? (
+                <Button
+                  className="mt-3 w-full"
                   type="button"
                   disabled={postInvoiceMutation.isPending}
                   onClick={() => postInvoiceMutation.mutate()}

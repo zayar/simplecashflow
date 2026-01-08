@@ -47,6 +47,81 @@ function sanitizeInvoiceTemplate(input) {
         tableHeaderText,
     };
 }
+function parseGcsUri(input) {
+    const s = String(input ?? '').trim();
+    if (!s.startsWith('gs://'))
+        return null;
+    const rest = s.slice('gs://'.length);
+    const idx = rest.indexOf('/');
+    if (idx <= 0)
+        return null;
+    const bucket = rest.slice(0, idx);
+    const objectName = rest.slice(idx + 1);
+    if (!bucket || !objectName)
+        return null;
+    return { bucket, objectName };
+}
+async function signedUrlForGcsUri(storage, gcsUri, ttlMs) {
+    const parsed = parseGcsUri(gcsUri);
+    if (!parsed)
+        return null;
+    try {
+        const [url] = await storage.bucket(parsed.bucket).file(parsed.objectName).getSignedUrl({
+            version: 'v4',
+            action: 'read',
+            expires: Date.now() + ttlMs,
+        });
+        return url;
+    }
+    catch {
+        return null;
+    }
+}
+function originFromRequest(request) {
+    const protoRaw = String(request?.headers?.['x-forwarded-proto'] ?? 'https');
+    const proto = (protoRaw.split(',')[0] || 'https').trim();
+    const hostRaw = String(request?.headers?.['x-forwarded-host'] ?? request?.headers?.host ?? '');
+    const host = (hostRaw.split(',')[0] || '').trim();
+    return host ? `${proto}://${host}` : '';
+}
+function guessContentTypeFromObjectName(objectName) {
+    const s = String(objectName ?? '').toLowerCase();
+    if (s.endsWith('.png'))
+        return 'image/png';
+    if (s.endsWith('.jpg') || s.endsWith('.jpeg'))
+        return 'image/jpeg';
+    if (s.endsWith('.gif'))
+        return 'image/gif';
+    if (s.endsWith('.webp'))
+        return 'image/webp';
+    return 'application/octet-stream';
+}
+async function presentPaymentProofs(storage, proofs, opts) {
+    const ttlMs = Number(opts?.signedUrlTtlMs ?? 15 * 60 * 1000); // 15 minutes
+    if (!Array.isArray(proofs))
+        return [];
+    const out = [];
+    for (const p of proofs) {
+        const submittedAt = typeof p?.submittedAt === 'string' ? p.submittedAt : null;
+        const note = typeof p?.note === 'string' ? p.note : p?.note === null ? null : null;
+        // New format: private object reference (signed URL on demand)
+        if (typeof p?.gcsUri === 'string' && typeof p?.id === 'string') {
+            const origin = originFromRequest(opts?.request);
+            const token = String(opts?.token ?? '').trim();
+            const id = String(p.id);
+            const publicUrl = origin && token ? `${origin}/public/invoices/${encodeURIComponent(token)}/payment-proof/${encodeURIComponent(id)}` : null;
+            const url = publicUrl ?? (await signedUrlForGcsUri(storage, String(p.gcsUri), ttlMs));
+            if (url)
+                out.push({ id, url, submittedAt, note });
+            continue;
+        }
+        // Legacy format: public URL stored directly
+        if (typeof p?.url === 'string' && String(p.url).trim()) {
+            out.push({ url: String(p.url).trim(), submittedAt, note });
+        }
+    }
+    return out;
+}
 export async function invoicePublicRoutes(fastify) {
     // Public invoice view: customer does NOT need to login.
     fastify.get('/public/invoices/:token', async (request, reply) => {
@@ -117,16 +192,9 @@ export async function invoicePublicRoutes(fastify) {
             const val = paymentQrCodes?.[key];
             qrCodes[key] = typeof val === 'string' && val.trim() ? val.trim() : null;
         }
-        // Sanitize pending payment proofs (customer-uploaded screenshots)
-        const pendingPaymentProofs = Array.isArray(invoice.pendingPaymentProofs)
-            ? invoice.pendingPaymentProofs
-                .map((p) => ({
-                url: typeof p?.url === 'string' ? p.url : null,
-                submittedAt: typeof p?.submittedAt === 'string' ? p.submittedAt : null,
-                note: typeof p?.note === 'string' ? p.note : p?.note === null ? null : null,
-            }))
-                .filter((p) => typeof p.url === 'string' && p.url)
-            : [];
+        // Payment proofs: support both legacy public URLs and new private proofs via signed URLs.
+        const storage = new Storage();
+        const pendingPaymentProofs = await presentPaymentProofs(storage, invoice.pendingPaymentProofs, { request, token });
         return {
             company: {
                 id: companyId,
@@ -163,6 +231,122 @@ export async function invoicePublicRoutes(fastify) {
             },
         };
     });
+    // Private access to a single payment proof image via short-lived token.
+    // This avoids relying on GCS signed URL generation (which can be blocked by IAM policy),
+    // while still keeping the object private in GCS.
+    fastify.get('/private/invoice-payment-proofs/:token', async (request, reply) => {
+        const token = String(request.params?.token ?? '').trim();
+        if (!token) {
+            reply.status(400);
+            return { error: 'token is required' };
+        }
+        let payload;
+        try {
+            payload = fastify.jwt.verify(token);
+        }
+        catch {
+            reply.status(404);
+            return { error: 'invalid or expired token' };
+        }
+        if (!payload || typeof payload !== 'object' || payload.typ !== 'invoice_payment_proof') {
+            reply.status(404);
+            return { error: 'invalid or expired token' };
+        }
+        const companyId = Number(payload.companyId ?? 0);
+        const invoiceId = Number(payload.invoiceId ?? 0);
+        const proofId = String(payload.proofId ?? '').trim();
+        if (!Number.isInteger(companyId) || companyId <= 0 || !Number.isInteger(invoiceId) || invoiceId <= 0 || !proofId) {
+            reply.status(404);
+            return { error: 'invalid or expired token' };
+        }
+        const inv = await prisma.invoice.findFirst({
+            where: { id: invoiceId, companyId },
+            select: { pendingPaymentProofs: true },
+        });
+        if (!inv) {
+            reply.status(404);
+            return { error: 'invoice not found' };
+        }
+        const proofs = Array.isArray(inv.pendingPaymentProofs) ? inv.pendingPaymentProofs : [];
+        const hit = proofs.find((p) => String(p?.id ?? '') === proofId) ?? null;
+        if (!hit) {
+            reply.status(404);
+            return { error: 'payment proof not found' };
+        }
+        // Legacy public URL: redirect
+        if (typeof hit?.url === 'string' && String(hit.url).trim()) {
+            reply.redirect(String(hit.url).trim());
+            return;
+        }
+        const gcsUri = typeof hit?.gcsUri === 'string' ? String(hit.gcsUri).trim() : '';
+        const parsed = parseGcsUri(gcsUri);
+        if (!parsed) {
+            reply.status(404);
+            return { error: 'payment proof not found' };
+        }
+        const storage = new Storage();
+        const file = storage.bucket(parsed.bucket).file(parsed.objectName);
+        reply.header('Cache-Control', 'private, max-age=900');
+        reply.type(guessContentTypeFromObjectName(parsed.objectName));
+        return await reply.send(file.createReadStream());
+    });
+    // Public view of a single payment proof image (requires the same invoice_public token).
+    fastify.get('/public/invoices/:token/payment-proof/:proofId', async (request, reply) => {
+        const token = String(request.params?.token ?? '').trim();
+        const proofId = String(request.params?.proofId ?? '').trim();
+        if (!token || !proofId) {
+            reply.status(400);
+            return { error: 'token and proofId are required' };
+        }
+        let payload;
+        try {
+            payload = fastify.jwt.verify(token);
+        }
+        catch {
+            reply.status(404);
+            return { error: 'invalid or expired link' };
+        }
+        if (!payload || typeof payload !== 'object' || payload.typ !== 'invoice_public') {
+            reply.status(404);
+            return { error: 'invalid or expired link' };
+        }
+        const companyId = Number(payload.companyId ?? 0);
+        const invoiceId = Number(payload.invoiceId ?? 0);
+        if (!Number.isInteger(companyId) || companyId <= 0 || !Number.isInteger(invoiceId) || invoiceId <= 0) {
+            reply.status(404);
+            return { error: 'invalid or expired link' };
+        }
+        const inv = await prisma.invoice.findFirst({
+            where: { id: invoiceId, companyId },
+            select: { pendingPaymentProofs: true },
+        });
+        if (!inv) {
+            reply.status(404);
+            return { error: 'invoice not found' };
+        }
+        const proofs = Array.isArray(inv.pendingPaymentProofs) ? inv.pendingPaymentProofs : [];
+        const hit = proofs.find((p) => String(p?.id ?? '') === proofId) ?? null;
+        if (!hit) {
+            reply.status(404);
+            return { error: 'payment proof not found' };
+        }
+        // Legacy public URL: redirect
+        if (typeof hit?.url === 'string' && String(hit.url).trim()) {
+            reply.redirect(String(hit.url).trim());
+            return;
+        }
+        const gcsUri = typeof hit?.gcsUri === 'string' ? String(hit.gcsUri).trim() : '';
+        const parsed = parseGcsUri(gcsUri);
+        if (!parsed) {
+            reply.status(404);
+            return { error: 'payment proof not found' };
+        }
+        const storage = new Storage();
+        const file = storage.bucket(parsed.bucket).file(parsed.objectName);
+        reply.header('Cache-Control', 'private, max-age=900');
+        reply.type(guessContentTypeFromObjectName(parsed.objectName));
+        return await reply.send(file.createReadStream());
+    });
     // ============================================================================
     // Customer Payment Proof Upload (Public, No Auth Required)
     // ============================================================================
@@ -197,15 +381,16 @@ export async function invoicePublicRoutes(fastify) {
         // Verify invoice exists and is in a state that can receive payment proofs
         const invoice = await prisma.invoice.findFirst({
             where: { id: invoiceId, companyId },
-            select: { id: true, status: true, pendingPaymentProofs: true },
+            select: { id: true, status: true, amountPaid: true, pendingPaymentProofs: true },
         });
         if (!invoice) {
             reply.status(404);
             return { error: 'invoice not found' };
         }
-        if (invoice.status === 'PAID' || invoice.status === 'VOID') {
+        const paid = Number(invoice.amountPaid ?? 0);
+        if (paid > 0 || invoice.status === 'PARTIAL' || invoice.status === 'PAID' || invoice.status === 'VOID') {
             reply.status(400);
-            return { error: 'this invoice is already paid or voided' };
+            return { error: 'payment proof can only be changed before the business records payment' };
         }
         // Get uploaded file
         const file = await request.file();
@@ -218,8 +403,8 @@ export async function invoicePublicRoutes(fastify) {
             reply.status(400);
             return { error: 'only image uploads are allowed' };
         }
-        // Upload to GCS
-        const bucketName = process.env.INVOICE_TEMPLATE_ASSETS_BUCKET;
+        // Upload to GCS (PRIVATE bucket preferred for payment proofs)
+        const bucketName = process.env.PAYMENT_PROOF_BUCKET || process.env.INVOICE_TEMPLATE_ASSETS_BUCKET;
         if (!bucketName) {
             reply.status(500);
             return { error: 'storage not configured' };
@@ -230,14 +415,17 @@ export async function invoicePublicRoutes(fastify) {
         const buf = await file.toBuffer();
         await storage.bucket(bucketName).file(objectName).save(buf, {
             contentType: mimetype,
-            metadata: { cacheControl: 'public, max-age=31536000' },
+            resumable: false,
+            metadata: { cacheControl: 'private, max-age=3600' },
         });
-        const publicUrl = `https://storage.googleapis.com/${bucketName}/${objectName}`;
         // Get body for optional note
         const body = (request.body ?? {});
         const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : null;
+        const proofId = uuidv4();
+        const gcsUri = `gs://${bucketName}/${objectName}`;
         const newProof = {
-            url: publicUrl,
+            id: proofId,
+            gcsUri,
             submittedAt: new Date().toISOString(),
             note: note || null,
         };
@@ -255,11 +443,13 @@ export async function invoicePublicRoutes(fastify) {
                 pendingPaymentProofs: [...existingProofs, newProof],
             },
         });
+        const presented = await presentPaymentProofs(storage, [...existingProofs, newProof], { request, token });
+        const presentedOne = presented.find((p) => p.id === proofId) ?? null;
         return {
             success: true,
             message: 'Payment proof uploaded. The business will review and confirm your payment.',
-            proof: newProof,
-            pendingPaymentProofs: [...existingProofs, newProof],
+            proof: presentedOne ?? { id: proofId, url: '', submittedAt: newProof.submittedAt, note: newProof.note },
+            pendingPaymentProofs: presented,
         };
     });
     // Delete one (or all) payment proofs uploaded by customer via public link.
@@ -288,25 +478,57 @@ export async function invoicePublicRoutes(fastify) {
             return { error: 'invalid or expired link' };
         }
         const url = typeof request.query?.url === 'string' ? String(request.query.url) : null;
+        const id = typeof request.query?.id === 'string' ? String(request.query.id) : null;
         const invoice = await prisma.invoice.findFirst({
             where: { id: invoiceId, companyId },
-            select: { status: true, pendingPaymentProofs: true },
+            select: { status: true, amountPaid: true, pendingPaymentProofs: true },
         });
         if (!invoice) {
             reply.status(404);
             return { error: 'invoice not found' };
         }
-        if (invoice.status === 'PAID' || invoice.status === 'VOID') {
+        const paid = Number(invoice.amountPaid ?? 0);
+        if (paid > 0 || invoice.status === 'PARTIAL' || invoice.status === 'PAID' || invoice.status === 'VOID') {
             reply.status(400);
-            return { error: 'this invoice is already paid or voided' };
+            return { error: 'payment proof can only be changed before the business records payment' };
         }
         const existing = Array.isArray(invoice.pendingPaymentProofs) ? invoice.pendingPaymentProofs : [];
-        const next = url ? existing.filter((p) => p?.url !== url) : [];
+        // Determine which proofs to remove (by id preferred; legacy by url)
+        const removeAll = !id && !url;
+        const toRemove = removeAll
+            ? existing
+            : id
+                ? existing.filter((p) => String(p?.id ?? '') === id)
+                : url
+                    ? existing.filter((p) => String(p?.url ?? '') === url)
+                    : [];
+        const next = removeAll
+            ? []
+            : id
+                ? existing.filter((p) => String(p?.id ?? '') !== id)
+                : url
+                    ? existing.filter((p) => String(p?.url ?? '') !== url)
+                    : existing;
+        // Best-effort delete objects for new-format proofs (gs://...)
+        const storage = new Storage();
+        for (const p of toRemove) {
+            const gcsUri = typeof p?.gcsUri === 'string' ? String(p.gcsUri) : null;
+            const parsed = gcsUri ? parseGcsUri(gcsUri) : null;
+            if (parsed) {
+                try {
+                    await storage.bucket(parsed.bucket).file(parsed.objectName).delete({ ignoreNotFound: true });
+                }
+                catch {
+                    // best-effort
+                }
+            }
+        }
         await prisma.invoice.updateMany({
             where: { id: invoiceId, companyId },
             data: { pendingPaymentProofs: next },
         });
-        return { success: true, pendingPaymentProofs: next };
+        const presented = await presentPaymentProofs(storage, next, { request, token });
+        return { success: true, pendingPaymentProofs: presented };
     });
 }
 //# sourceMappingURL=invoicePublic.routes.js.map

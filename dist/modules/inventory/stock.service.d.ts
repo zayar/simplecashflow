@@ -61,6 +61,51 @@ export declare function _test_replayStockMovesWithBackdatedInsert(args: {
     };
     finalBalance: ReplayBalance;
 };
+type StockMoveRowForValueReplay = {
+    id: number;
+    date: Date;
+    type: StockMoveInput['type'] | 'VALUE_ADJUSTMENT';
+    direction: StockMoveInput['direction'];
+    quantity: Prisma.Decimal;
+    unitCostApplied: Prisma.Decimal;
+    totalCostApplied: Prisma.Decimal;
+    referenceType: string | null;
+    referenceId: string | null;
+};
+/**
+ * Replay helper for value-only inserts (e.g., landed cost capitalization).
+ * Inserts an IN move with quantity = 0 and totalCostApplied = valueDelta.
+ *
+ * Invariant: stock on hand at insert point must be > 0 (otherwise avg cost is undefined).
+ */
+export declare function _test_replayStockMovesWithBackdatedValueInsert(args: {
+    existingMoves: StockMoveRowForValueReplay[];
+    insert: {
+        date: Date;
+        valueDelta: Prisma.Decimal;
+        referenceType?: string | null;
+        referenceId?: string | null;
+    };
+}): {
+    finalBalance: ReplayBalance;
+};
+export declare function applyStockValueAdjustmentWac(tx: PrismaTx, input: {
+    companyId: number;
+    locationId: number;
+    itemId: number;
+    date: Date;
+    valueDelta: Prisma.Decimal;
+    allowBackdated?: boolean;
+    referenceType?: string | null;
+    referenceId?: string | null;
+    correlationId?: string | null;
+    createdByUserId?: number | null;
+    journalEntryId?: number | null;
+}): Promise<{
+    balance: any;
+    move: any;
+    requiresInventoryRecalcFromDate: Date | null;
+}>;
 export declare function getCompanyInventoryConfig(tx: PrismaTx, companyId: number): Promise<{
     id: number;
     inventoryAssetAccountId: number | null;
@@ -108,6 +153,13 @@ export declare function applyStockMoveWac(tx: PrismaTx, input: Omit<StockMoveInp
     move: any;
     unitCostApplied: Prisma.Decimal;
     totalCostApplied: Prisma.Decimal;
+    requiresInventoryRecalcFromDate: Date;
+} | {
+    balance: any;
+    move: any;
+    unitCostApplied: Prisma.Decimal;
+    totalCostApplied: Prisma.Decimal;
+    requiresInventoryRecalcFromDate: null;
 }>;
 export declare function getStockBalanceForUpdate(tx: PrismaTx, input: {
     companyId: number;

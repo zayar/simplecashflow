@@ -134,21 +134,26 @@ export default function BankingAccountDetailPage() {
               {data.account?.name}
             </h1>
             <p className="text-sm text-muted-foreground">
-              {data.kind} • COA {data.account?.code} • {data.bankName ?? "—"}
+              {data.kind} • COA {data.account?.code} • {data.bankName ?? "—"} • {data.currency ?? "—"}
             </p>
           </div>
         </div>
 
-        {user?.companyId && data?.account?.id ? (
-          <AddTransaction
-            companyId={user.companyId}
-            timeZone={tz}
-            bankKind={data.kind}
-            bankAccountCoaId={Number(data.account.id)}
-            bankAccountLabel={`${data.kind} • ${data.account.code} - ${data.account.name}`}
-            onDone={load}
-          />
-        ) : null}
+        <div className="flex items-center gap-2">
+          <Link href={`/banking/${id}/edit`}>
+            <Button variant="outline">Edit</Button>
+          </Link>
+          {user?.companyId && data?.account?.id ? (
+            <AddTransaction
+              companyId={user.companyId}
+              timeZone={tz}
+              bankKind={data.kind}
+              bankAccountCoaId={Number(data.account.id)}
+              bankAccountLabel={`${data.kind} • ${data.account.code} - ${data.account.name}`}
+              onDone={load}
+            />
+          ) : null}
+        </div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
@@ -186,6 +191,10 @@ export default function BankingAccountDetailPage() {
             <div className="flex items-center justify-between gap-4">
               <span className="text-muted-foreground">Provider</span>
               <span className="font-medium">{data.bankName ?? "—"}</span>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-muted-foreground">Currency</span>
+              <span className="font-medium">{data.currency ?? "—"}</span>
             </div>
           </CardContent>
         </Card>

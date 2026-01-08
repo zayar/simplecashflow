@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
-import { createInvoice, getCompanySettings, getWarehouses } from '../lib/ar';
+import { createInvoice, getCompanySettings, getWarehouses, updateInvoice } from '../lib/ar';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
 import { Fab, SaveIcon } from '../components/Fab';
 import { clearInvoiceDraft, getInvoiceDraft, setInvoiceDraft, type DraftLine } from '../lib/invoiceDraft';
@@ -42,6 +42,9 @@ export default function InvoiceNew() {
 
   const [draft, setDraftState] = useState(() => getInvoiceDraft());
   const [error, setError] = useState<string | null>(null);
+  const editingInvoiceId = Number(draft.editingInvoiceId ?? 0);
+  const isEditing = Number.isFinite(editingInvoiceId) && editingInvoiceId > 0;
+  const editorPath = isEditing ? '/invoices/new?edit=1' : '/invoices/new';
 
   const settingsQuery = useQuery({
     queryKey: ['company-settings', companyId],
@@ -68,7 +71,7 @@ export default function InvoiceNew() {
     if (!next.invoiceDate) next.invoiceDate = yyyyMmDd(new Date());
     setDraftState(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.get('picked')]);
+  }, [params.get('picked'), params.get('edit')]);
 
   function updateDraft(next: typeof draft) {
     setDraftState(next);
@@ -86,7 +89,7 @@ export default function InvoiceNew() {
     return { subtotal, discount, tax, total };
   }, [draft.lines]);
 
-  const createMutation = useMutation({
+  const saveMutation = useMutation({
     mutationFn: async () => {
       if (!companyId) throw new Error('Missing companyId');
       if (!draft.customerId) throw new Error('Please select a client');
@@ -131,22 +134,35 @@ export default function InvoiceNew() {
           return payloadLine;
         });
 
-      return await createInvoice(companyId, {
+      const payload = {
         customerId: Number(draft.customerId),
         invoiceDate: draft.invoiceDate,
         dueDate: draft.dueDate ? draft.dueDate : undefined,
         lines
-      });
+      };
+
+      if (isEditing) {
+        await updateInvoice(companyId, editingInvoiceId, {
+          customerId: payload.customerId,
+          invoiceDate: payload.invoiceDate,
+          dueDate: draft.dueDate ? draft.dueDate : null,
+          lines: payload.lines
+        });
+        return { id: editingInvoiceId };
+      }
+
+      return await createInvoice(companyId, payload);
     },
     onSuccess: async (res: any) => {
       clearInvoiceDraft();
       await queryClient.invalidateQueries({ queryKey: ['invoices', companyId] });
       const id = res && typeof res === 'object' && 'id' in res ? Number((res as any).id) : 0;
+      if (id > 0) await queryClient.invalidateQueries({ queryKey: ['invoice', companyId, id] });
       if (id > 0) navigate(`/invoices/${id}`, { replace: true });
       else navigate('/invoices', { replace: true });
     },
     onError: (err: any) => {
-      setError(err?.message ?? 'Failed to create invoice');
+      setError(err?.message ?? 'Failed to save invoice');
     }
   });
 
@@ -198,7 +214,7 @@ export default function InvoiceNew() {
           <div className="flex items-start justify-between px-4 py-3">
             <div>
               {/* Only show invoice number if we actually have one; otherwise keep clean */}
-              <div className="text-3xl font-extrabold tracking-tight">New</div>
+              <div className="text-3xl font-extrabold tracking-tight">{isEditing ? 'Draft' : 'New'}</div>
             </div>
             <div className="text-right">
               <div className="text-sm text-muted-foreground">Due on receipt</div>
@@ -229,7 +245,7 @@ export default function InvoiceNew() {
           <button
             type="button"
             onClick={() => {
-              updateDraft({ ...draft, activeLineIndex: null, returnTo: '/invoices/new' });
+              updateDraft({ ...draft, activeLineIndex: null, returnTo: editorPath });
               navigate('/customers?mode=pick');
             }}
             className="flex w-full items-center justify-between border-t border-border px-4 py-3 text-left active:bg-muted/50"
@@ -246,7 +262,7 @@ export default function InvoiceNew() {
           <button
             type="button"
             onClick={() => {
-              navigate(`/warehouses?mode=pick&returnTo=${encodeURIComponent('/invoices/new')}`);
+              navigate(`/warehouses?mode=pick&returnTo=${encodeURIComponent(editorPath)}`);
             }}
             className="flex w-full items-center justify-between border-t border-border px-4 py-3 text-left active:bg-muted/50"
           >
@@ -269,7 +285,7 @@ export default function InvoiceNew() {
               const idx = next.lines.length;
               next.lines = [...(next.lines ?? []), { quantity: 1, unitPrice: 0 }];
               next.activeLineIndex = idx;
-              next.returnTo = '/invoices/new';
+              next.returnTo = editorPath;
               setInvoiceDraft(next);
               setDraftState(next);
               navigate(`/invoices/new/line?idx=${idx}`);
@@ -300,7 +316,7 @@ export default function InvoiceNew() {
                     onClick={() => {
                       const next = getInvoiceDraft();
                       next.activeLineIndex = idx;
-                      next.returnTo = '/invoices/new';
+                      next.returnTo = editorPath;
                       setInvoiceDraft(next);
                       setDraftState(next);
                       navigate(`/invoices/new/line?idx=${idx}`);
@@ -380,12 +396,12 @@ export default function InvoiceNew() {
       <Fab
         onClick={() => {
           setError(null);
-          createMutation.mutate();
+          saveMutation.mutate();
         }}
         ariaLabel="Save invoice"
         icon={<SaveIcon />}
         label="Save"
-        disabled={createMutation.isPending}
+        disabled={saveMutation.isPending}
       />
     </div>
   );

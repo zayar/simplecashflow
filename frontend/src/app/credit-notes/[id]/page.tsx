@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getInvoiceTemplate, unapplyCreditNote, type InvoiceTemplate } from '@/lib/api';
 import { formatDateInTimeZone } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { ArrowLeft, Loader2, Pencil } from 'lucide-react';
+import { InvoicePaper } from '@/components/invoice/InvoicePaper';
 
 function formatMoney(n: any) {
   const num = Number(n ?? 0);
@@ -24,12 +25,15 @@ export default function CreditNoteDetailPage() {
   const params = useParams();
   const id = params.id;
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const companyName = companySettings?.name ?? 'Company';
 
   const [cn, setCn] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [unapplying, setUnapplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [template, setTemplate] = useState<InvoiceTemplate | null>(null);
 
   async function refresh() {
     if (!user?.companyId || !id) return;
@@ -46,6 +50,13 @@ export default function CreditNoteDetailPage() {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId, id]);
+
+  useEffect(() => {
+    if (!user?.companyId) return;
+    getInvoiceTemplate(user.companyId)
+      .then((t) => setTemplate(t))
+      .catch(() => setTemplate(null));
+  }, [user?.companyId]);
 
   async function post() {
     if (!user?.companyId || !id) return;
@@ -77,11 +88,28 @@ export default function CreditNoteDetailPage() {
     }
   }
 
+  async function removeFromInvoice() {
+    if (!user?.companyId || !id) return;
+    if (unapplying) return;
+    if (!confirm('Remove this credit note from the applied invoice?')) return;
+    setError(null);
+    setUnapplying(true);
+    try {
+      await unapplyCreditNote(user.companyId, Number(id));
+      await refresh();
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setUnapplying(false);
+    }
+  }
+
   const missingAccountLines = useMemo(() => {
     const lines = (cn?.lines ?? []) as any[];
     const missing: number[] = [];
-    for (const [idx, l] of lines.entries()) {
-      if (!l.incomeAccountId) missing.push(idx + 1);
+    for (let idx = 0; idx < lines.length; idx++) {
+      const l = lines[idx];
+      if (!l?.incomeAccountId) missing.push(idx + 1);
     }
     return missing;
   }, [cn]);
@@ -132,20 +160,69 @@ export default function CreditNoteDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      {/* Print styles: show the paper only */}
+      <style jsx global>{`
+        @media print {
+          body * {
+            visibility: hidden !important;
+          }
+          .print-area,
+          .print-area * {
+            visibility: visible !important;
+          }
+          .print-area {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100% !important;
+          }
+          .no-print {
+            display: none !important;
+            visibility: hidden !important;
+          }
+          .print-paper {
+            box-shadow: none !important;
+            border: none !important;
+          }
+          body {
+            background: white !important;
+          }
+        }
+      `}</style>
+
+      {/* Top actions */}
+      <div className="no-print flex items-start justify-between gap-4">
+        <div className="flex items-start gap-4">
           <Link href="/credit-notes">
             <Button variant="ghost" size="icon">
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">{cn.creditNoteNumber}</h1>
-            <p className="text-sm text-muted-foreground">{formatDateInTimeZone(cn.creditNoteDate, tz)}</p>
+            <h1 className="text-2xl font-semibold tracking-tight">Credit Note</h1>
+            <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+              <span className="font-medium text-foreground">{cn.creditNoteNumber ?? `CN-${cn.id}`}</span>
+              <span>•</span>
+              <span>{cn.customer?.name ?? '—'}</span>
+              <span>•</span>
+              <Badge variant={cn.status === 'POSTED' ? 'secondary' : 'outline'}>{cn.status}</Badge>
+              <span>•</span>
+              <span>{formatDateInTimeZone(cn.creditNoteDate, tz)}</span>
+            </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={cn.status === 'POSTED' ? 'secondary' : 'outline'}>{cn.status}</Badge>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button variant="outline" onClick={() => window.print()}>Print</Button>
+          {cn.status === 'POSTED' && Number(cn.creditsRemaining ?? 0) > 0 ? (
+            <Link href={`/credit-notes/${cn.id}/refund`}>
+              <Button variant="outline">Refund</Button>
+            </Link>
+          ) : null}
+          {cn.journalEntryId ? (
+            <Link href={`/journal/${cn.journalEntryId}`}>
+              <Button variant="outline">View Journal Entry</Button>
+            </Link>
+          ) : null}
           {(cn.status === 'DRAFT' || cn.status === 'APPROVED') ? (
             <>
               {cn.status === 'DRAFT' ? (
@@ -176,9 +253,55 @@ export default function CreditNoteDetailPage() {
         </div>
       </div>
 
-      {error && <div className="text-sm text-red-600">{error}</div>}
+      {/* Credit Note paper preview (uses the same invoice template renderer) */}
+      <div className="print-area rounded-lg border bg-muted/20 p-4 sm:p-6">
+        <div className="print-paper mx-auto max-w-4xl rounded-lg border bg-white shadow-sm">
+          <div className="p-0">
+            <InvoicePaper
+              invoice={{
+                invoiceNumber: cn.creditNoteNumber ?? `CN-${cn.id}`,
+                status: cn.status,
+                invoiceDate: cn.creditNoteDate,
+                dueDate: null,
+                currency: cn.currency ?? null,
+                total: cn.total ?? 0,
+                totalPaid: Math.max(0, Number(cn.total ?? 0) - Number(cn.creditsRemaining ?? 0)),
+                remainingBalance: cn.creditsRemaining ?? 0,
+                customer: { name: cn.customer?.name ?? null },
+                location: { name: cn.location?.name ?? cn.warehouse?.name ?? null },
+                warehouse: { name: cn.warehouse?.name ?? null },
+                customerNotes: cn.customerNotes ?? null,
+                termsAndConditions: cn.termsAndConditions ?? null,
+                taxAmount: cn.taxAmount ?? 0,
+                lines: (cn.lines ?? []).map((l: any) => ({
+                  id: l.id,
+                  quantity: l.quantity,
+                  unitPrice: l.unitPrice,
+                  discountAmount: 0,
+                  description: l.description ?? null,
+                  item: l.item ?? null,
+                })),
+              } as any}
+              companyName={companyName}
+              tz={tz}
+              template={template}
+              documentTitle="Credit Note"
+              partyLabel="Customer"
+              dateLabel="Credit Note Date"
+              dueDateLabel="—"
+              locationLabel="Location"
+              rateLabel="Unit price"
+              balanceLabel="Credits remaining"
+              settledLabel="Credit used"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Everything below is details UI (hide on print; printed output should be paper only) */}
+      {error && <div className="no-print text-sm text-red-600">{error}</div>}
       {cn?.status === 'DRAFT' && missingAccountLines.length > 0 ? (
-        <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm">
+        <div className="no-print rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm">
           <div className="font-medium">Account mapping required to post</div>
           <div className="text-muted-foreground">
             Please select an income account for line(s): <b>{missingAccountLines.join(', ')}</b>. You can still keep this as a draft.
@@ -186,7 +309,7 @@ export default function CreditNoteDetailPage() {
         </div>
       ) : null}
 
-      <Card className="shadow-sm">
+      <Card className="no-print shadow-sm">
         <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-lg">Summary</CardTitle>
         </CardHeader>
@@ -198,6 +321,10 @@ export default function CreditNoteDetailPage() {
           <div>
             <div className="text-xs text-muted-foreground">Total</div>
             <div className="font-semibold tabular-nums">{formatMoney(cn.total)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">Credits remaining</div>
+            <div className="font-semibold tabular-nums">{formatMoney(cn.creditsRemaining ?? 0)}</div>
           </div>
           <div>
             <div className="text-xs text-muted-foreground">Subtotal / Tax</div>
@@ -212,7 +339,87 @@ export default function CreditNoteDetailPage() {
         </CardContent>
       </Card>
 
-      <Card className="shadow-sm">
+      {cn.appliedInvoice ? (
+        <Card className="no-print shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+            <CardTitle className="text-lg">Credit Applied Invoices</CardTitle>
+            <Button variant="outline" onClick={removeFromInvoice} disabled={unapplying}>
+              {unapplying ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Remove
+            </Button>
+          </CardHeader>
+          <CardContent className="pt-0">
+            <div className="rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-muted/40">
+                    <TableHead className="w-[160px]">Date</TableHead>
+                    <TableHead>Invoice Number</TableHead>
+                    <TableHead className="text-right">Amount Credited</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow>
+                    <TableCell className="text-muted-foreground">
+                      {String(cn.creditNoteDate ?? '').slice(0, 10)}
+                    </TableCell>
+                    <TableCell className="font-medium">
+                      <Link href={`/invoices/${cn.appliedInvoice.id}`} className="text-primary hover:underline">
+                        {cn.appliedInvoice.invoiceNumber}
+                      </Link>
+                    </TableCell>
+                    <TableCell className="text-right font-medium tabular-nums">{formatMoney(cn.total)}</TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {(cn.refunds ?? []).length > 0 ? (
+        <Card className="no-print shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-lg">Refunds</CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            <div className="rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-muted/40">
+                    <TableHead className="w-[160px]">Date</TableHead>
+                    <TableHead>From account</TableHead>
+                    <TableHead className="text-right">Amount</TableHead>
+                    <TableHead className="w-[120px]">Journal</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(cn.refunds ?? []).map((r: any) => (
+                    <TableRow key={r.id}>
+                      <TableCell className="text-muted-foreground">{String(r.refundDate ?? '').slice(0, 10)}</TableCell>
+                      <TableCell className="font-medium">
+                        {r.bankAccount?.code ? `${r.bankAccount.code} - ` : ''}{r.bankAccount?.name ?? '—'}
+                      </TableCell>
+                      <TableCell className="text-right font-medium tabular-nums">{formatMoney(r.amount)}</TableCell>
+                      <TableCell>
+                        {r.journalEntryId ? (
+                          <Link className="text-sm text-blue-600 hover:underline" href={`/journal/${r.journalEntryId}`}>
+                            View
+                          </Link>
+                        ) : (
+                          '—'
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      <Card className="no-print shadow-sm">
         <CardHeader>
           <CardTitle className="text-lg">Lines</CardTitle>
         </CardHeader>
@@ -254,7 +461,7 @@ export default function CreditNoteDetailPage() {
       </Card>
 
       {(cn.customerNotes || cn.termsAndConditions) ? (
-        <Card className="shadow-sm">
+        <Card className="no-print shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg">Notes &amp; Terms</CardTitle>
           </CardHeader>
@@ -276,7 +483,7 @@ export default function CreditNoteDetailPage() {
       ) : null}
 
       {cn.journalEntry ? (
-        <Card className="shadow-sm">
+        <Card className="no-print shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg">Journal Entry</CardTitle>
           </CardHeader>

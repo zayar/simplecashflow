@@ -6,15 +6,18 @@ import { getRedis } from '../../infrastructure/redis.js';
 import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
-import { isoNow, parseDateInput } from '../../utils/date.js';
+import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
+import { assertOpenPeriodOrThrow } from '../../utils/periodClosePolicy.js';
 import { ensureInventoryCompanyDefaults, ensureInventoryItem } from '../inventory/stock.service.js';
-import { applyStockMoveWac } from '../inventory/stock.service.js';
+import { applyStockMoveWac, applyStockValueAdjustmentWac } from '../inventory/stock.service.js';
 import { toMoneyDecimal } from '../../utils/money.js';
 import { nextPurchaseBillNumber } from '../sequence/sequence.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry, computeNetByAccount, diffNets, buildAdjustmentLinesFromNets } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
+import { ensureGrniAccount } from './grni.service.js';
+import { ensurePurchasePriceVarianceAccount } from './ppv.service.js';
 function generatePurchaseBillNumber() {
     // legacy fallback (should not be used in new code paths)
     return `PBILL-${Date.now()}`;
@@ -73,6 +76,22 @@ export async function purchaseBillsRoutes(fastify) {
             if (!vendor) {
                 reply.status(400);
                 return { error: 'vendorId not found in this company' };
+            }
+        }
+        if (body.purchaseReceiptId) {
+            const pr = await prisma.purchaseReceipt.findFirst({ where: { id: body.purchaseReceiptId, companyId }, select: { id: true, status: true, locationId: true } });
+            if (!pr) {
+                reply.status(400);
+                return { error: 'purchaseReceiptId not found in this company' };
+            }
+            if (pr.status !== 'POSTED') {
+                reply.status(400);
+                return { error: 'purchaseReceiptId must be POSTED before billing' };
+            }
+            // Enforce same location for v1 simplicity (prevents confusing partial receipts).
+            if (Number(pr.locationId) !== Number(locationId)) {
+                reply.status(400);
+                return { error: 'purchaseReceipt location must match bill location (v1)' };
             }
         }
         const loc = await prisma.location.findFirst({ where: { id: locationId, companyId } });
@@ -164,6 +183,7 @@ export async function purchaseBillsRoutes(fastify) {
                 data: {
                     companyId,
                     vendorId: body.vendorId ?? null,
+                    purchaseReceiptId: body.purchaseReceiptId ?? null,
                     locationId,
                     billNumber,
                     status: 'DRAFT',
@@ -177,6 +197,7 @@ export async function purchaseBillsRoutes(fastify) {
                 include: {
                     vendor: true,
                     location: true,
+                    purchaseReceipt: true,
                     lines: { include: { item: true, account: true } },
                 },
             });
@@ -200,6 +221,12 @@ export async function purchaseBillsRoutes(fastify) {
                 creditApplications: {
                     include: {
                         vendorCredit: { select: { id: true, creditNumber: true, creditDate: true, status: true } },
+                    },
+                    orderBy: { appliedDate: 'desc' },
+                },
+                vendorAdvanceApplications: {
+                    include: {
+                        vendorAdvance: { select: { id: true, advanceDate: true } },
                     },
                     orderBy: { appliedDate: 'desc' },
                 },
@@ -228,8 +255,14 @@ export async function purchaseBillsRoutes(fastify) {
         const totalPayments = (bill.payments ?? [])
             .filter((p) => !p.reversedAt)
             .reduce((sum, p) => sum + Number(p.amount), 0);
-        const totalCredits = (bill.creditApplications ?? []).reduce((sum, a) => sum + Number(a.amount), 0);
-        const totalPaid = totalPayments + totalCredits;
+        // Avoid TS reduce overload inference issues by using explicit loops.
+        let totalCredits = 0;
+        for (const a of (bill.creditApplications ?? []))
+            totalCredits += Number(a.amount ?? 0);
+        let totalAdvances = 0;
+        for (const a of (bill.vendorAdvanceApplications ?? []))
+            totalAdvances += Number(a.amount ?? 0);
+        const totalPaid = totalPayments + totalCredits + totalAdvances;
         return {
             id: bill.id,
             billNumber: bill.billNumber,
@@ -265,14 +298,28 @@ export async function purchaseBillsRoutes(fastify) {
                 reversalReason: p.reversalReason ?? null,
                 reversalJournalEntryId: p.reversalJournalEntryId ?? null,
             })),
-            creditsApplied: (bill.creditApplications ?? []).map((a) => ({
-                id: a.id,
-                appliedDate: a.appliedDate,
-                amount: a.amount,
-                vendorCredit: a.vendorCredit
-                    ? { id: a.vendorCredit.id, creditNumber: a.vendorCredit.creditNumber, creditDate: a.vendorCredit.creditDate, status: a.vendorCredit.status }
-                    : null,
-            })),
+            creditsApplied: [
+                ...(bill.creditApplications ?? []).map((a) => ({
+                    id: a.id,
+                    appliedDate: a.appliedDate,
+                    amount: a.amount,
+                    kind: 'VENDOR_CREDIT',
+                    vendorCredit: a.vendorCredit
+                        ? { id: a.vendorCredit.id, creditNumber: a.vendorCredit.creditNumber, creditDate: a.vendorCredit.creditDate, status: a.vendorCredit.status }
+                        : null,
+                    vendorAdvance: null,
+                    journalEntryId: null,
+                })),
+                ...(bill.vendorAdvanceApplications ?? []).map((a) => ({
+                    id: a.id,
+                    appliedDate: a.appliedDate,
+                    amount: a.amount,
+                    kind: 'VENDOR_ADVANCE',
+                    vendorCredit: null,
+                    vendorAdvance: a.vendorAdvance ? { id: a.vendorAdvance.id, advanceDate: a.vendorAdvance.advanceDate } : { id: a.vendorAdvanceId, advanceDate: null },
+                    journalEntryId: a.journalEntryId ?? null,
+                })),
+            ],
         };
     });
     // Update purchase bill (DRAFT only)
@@ -310,6 +357,21 @@ export async function purchaseBillsRoutes(fastify) {
             if (!vendor) {
                 reply.status(400);
                 return { error: 'vendorId not found in this company' };
+            }
+        }
+        if (body.purchaseReceiptId) {
+            const pr = await prisma.purchaseReceipt.findFirst({ where: { id: body.purchaseReceiptId, companyId }, select: { id: true, status: true, locationId: true } });
+            if (!pr) {
+                reply.status(400);
+                return { error: 'purchaseReceiptId not found in this company' };
+            }
+            if (pr.status !== 'POSTED') {
+                reply.status(400);
+                return { error: 'purchaseReceiptId must be POSTED before billing' };
+            }
+            if (Number(pr.locationId) !== Number(locationId)) {
+                reply.status(400);
+                return { error: 'purchaseReceipt location must match bill location (v1)' };
             }
         }
         const loc2 = await prisma.location.findFirst({ where: { id: locationId, companyId } });
@@ -409,6 +471,7 @@ export async function purchaseBillsRoutes(fastify) {
                 data: {
                     vendorId: body.vendorId ?? null,
                     locationId,
+                    purchaseReceiptId: body.purchaseReceiptId ?? null,
                     billDate,
                     dueDate: dueDate ?? null,
                     currency: body.currency ?? null,
@@ -595,6 +658,12 @@ export async function purchaseBillsRoutes(fastify) {
                 if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
                     throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be posted'), { statusCode: 400 });
                 }
+                // Period-close guard: block posting into closed periods (backdating rule).
+                await assertOpenPeriodOrThrow(tx, {
+                    companyId,
+                    transactionDate: new Date(bill.billDate),
+                    action: 'purchase_bill.post',
+                });
                 const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                 if (!cfg.inventoryAssetAccountId) {
                     throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
@@ -612,6 +681,26 @@ export async function purchaseBillsRoutes(fastify) {
                 // Apply stock moves for tracked items, and compute per-account debits.
                 let total = new Prisma.Decimal(0);
                 const debitByAccount = new Map();
+                let inventoryRecalcFromDate = null;
+                const linkedReceiptId = Number(bill.purchaseReceiptId ?? 0) || null;
+                let linkedReceipt = null;
+                if (linkedReceiptId) {
+                    linkedReceipt = await tx.purchaseReceipt.findFirst({
+                        where: { id: linkedReceiptId, companyId },
+                        select: { id: true, status: true, locationId: true, receiptDate: true, total: true, vendorId: true },
+                    });
+                    if (!linkedReceipt) {
+                        throw Object.assign(new Error('purchaseReceiptId not found in this company'), { statusCode: 400 });
+                    }
+                    if (linkedReceipt.status !== 'POSTED') {
+                        throw Object.assign(new Error('linked purchase receipt must be POSTED before billing'), { statusCode: 400 });
+                    }
+                    if (Number(linkedReceipt.locationId) !== Number(bill.locationId)) {
+                        throw Object.assign(new Error('linked purchase receipt location must match bill location (v1)'), { statusCode: 400 });
+                    }
+                }
+                let inventoryLinesTotal = new Prisma.Decimal(0);
+                let landedCostTotal = new Prisma.Decimal(0);
                 for (const [idx, l] of (bill.lines ?? []).entries()) {
                     const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                     const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
@@ -624,27 +713,52 @@ export async function purchaseBillsRoutes(fastify) {
                     const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
                     let debitAccountId = l.accountId ?? null;
                     if (isTracked) {
-                        debitAccountId = cfg.inventoryAssetAccountId;
-                        await ensureInventoryItem(tx, companyId, l.itemId);
-                        await applyStockMoveWac(tx, {
-                            companyId,
-                            locationId: bill.locationId,
-                            itemId: l.itemId,
-                            date: bill.billDate,
-                            type: 'PURCHASE_RECEIPT',
-                            direction: 'IN',
-                            quantity: qty,
-                            unitCostApplied: unitCost,
-                            // Preserve the exact discounted line total in inventory value / WAC.
-                            totalCostApplied: lineTotal,
-                            referenceType: 'PurchaseBill',
-                            referenceId: String(bill.id),
-                            correlationId,
-                            createdByUserId: request.user?.userId ?? null,
-                            journalEntryId: null,
-                        });
+                        if (linkedReceipt) {
+                            inventoryLinesTotal = inventoryLinesTotal.add(lineTotal);
+                            // We'll build the final JE after the loop:
+                            // - Dr GRNI (receiptTotal)
+                            // - Dr Inventory (landedCostTotal, via value-only stock moves)
+                            // - Dr/Cr PPV (inventoryLinesTotal - receiptTotal)
+                            // - Cr AP (billTotal)
+                            continue;
+                        }
+                        else {
+                            debitAccountId = cfg.inventoryAssetAccountId;
+                            await ensureInventoryItem(tx, companyId, l.itemId);
+                            const applied = await applyStockMoveWac(tx, {
+                                companyId,
+                                locationId: bill.locationId,
+                                itemId: l.itemId,
+                                date: bill.billDate,
+                                type: 'PURCHASE_RECEIPT',
+                                direction: 'IN',
+                                quantity: qty,
+                                unitCostApplied: unitCost,
+                                // Preserve the exact discounted line total in inventory value / WAC.
+                                totalCostApplied: lineTotal,
+                                referenceType: 'PurchaseBill',
+                                referenceId: String(bill.id),
+                                correlationId,
+                                createdByUserId: request.user?.userId ?? null,
+                                journalEntryId: null,
+                                // Allow backdating: WAC is recalculated by replaying the full move timeline.
+                                allowBackdated: true,
+                            });
+                            const from = applied?.requiresInventoryRecalcFromDate;
+                            if (from && !isNaN(new Date(from).getTime())) {
+                                inventoryRecalcFromDate =
+                                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                        ? new Date(from)
+                                        : inventoryRecalcFromDate;
+                            }
+                        }
                     }
                     else {
+                        if (linkedReceipt) {
+                            // Treat non-inventory lines on a linked receipt bill as landed cost (capitalized into inventory).
+                            landedCostTotal = landedCostTotal.add(lineTotal);
+                            continue;
+                        }
                         if (!debitAccountId) {
                             debitAccountId = item?.expenseAccountId ?? null;
                         }
@@ -659,6 +773,8 @@ export async function purchaseBillsRoutes(fastify) {
                     debitByAccount.set(debitAccountId, prev.add(lineTotal));
                 }
                 total = total.toDecimalPlaces(2);
+                inventoryLinesTotal = inventoryLinesTotal.toDecimalPlaces(2);
+                landedCostTotal = landedCostTotal.toDecimalPlaces(2);
                 // CRITICAL FIX #3: Rounding validation - ensure recomputed total matches stored total.
                 // This prevents debit != credit if line-level rounding drifted from sum-then-round.
                 const storedTotal = new Prisma.Decimal(bill.total).toDecimalPlaces(2);
@@ -670,6 +786,96 @@ export async function purchaseBillsRoutes(fastify) {
                     debit: amt.toDecimalPlaces(2),
                     credit: new Prisma.Decimal(0),
                 }));
+                // If linked to a receipt, override debits to clear GRNI + post PPV variance.
+                let finalDebitLines = debitLines;
+                if (linkedReceipt) {
+                    const grniId = await ensureGrniAccount(tx, companyId);
+                    const ppvId = await ensurePurchasePriceVarianceAccount(tx, companyId);
+                    const receiptTotal = new Prisma.Decimal(linkedReceipt.total).toDecimalPlaces(2);
+                    const variance = inventoryLinesTotal.sub(receiptTotal).toDecimalPlaces(2); // + => billed inventory > received
+                    if (inventoryLinesTotal.lessThanOrEqualTo(0)) {
+                        throw Object.assign(new Error('linked receipt bill must include at least one inventory line'), { statusCode: 400 });
+                    }
+                    finalDebitLines = [];
+                    // Dr GRNI (reduce liability) up to receipt total
+                    finalDebitLines.push({ accountId: grniId, debit: receiptTotal, credit: new Prisma.Decimal(0) });
+                    // Capitalize landed cost into inventory (value-only moves) and also debit Inventory in the bill JE.
+                    if (landedCostTotal.greaterThan(0)) {
+                        // IMPORTANT: these value moves are dated at the receipt date (so they revalue subsequent issues),
+                        // therefore they must also be inside an OPEN period.
+                        await assertOpenPeriodOrThrow(tx, {
+                            companyId,
+                            transactionDate: new Date(linkedReceipt.receiptDate),
+                            action: 'purchase_bill.post_landed_cost',
+                        });
+                        finalDebitLines.push({ accountId: cfg.inventoryAssetAccountId, debit: landedCostTotal, credit: new Prisma.Decimal(0) });
+                        const receiptLines = await tx.purchaseReceiptLine.findMany({
+                            where: { companyId, purchaseReceiptId: linkedReceiptId },
+                            select: { id: true, itemId: true, locationId: true, lineTotal: true, quantity: true },
+                            orderBy: [{ id: 'asc' }],
+                        });
+                        if (!receiptLines?.length) {
+                            throw Object.assign(new Error('linked receipt has no lines to allocate landed cost'), { statusCode: 400 });
+                        }
+                        const baseSum = receiptLines.reduce((sum, l) => sum.add(new Prisma.Decimal(l.lineTotal ?? 0).toDecimalPlaces(2)), new Prisma.Decimal(0)).toDecimalPlaces(2);
+                        if (baseSum.lessThanOrEqualTo(0)) {
+                            throw Object.assign(new Error('cannot allocate landed cost: receipt lines total is zero'), { statusCode: 400 });
+                        }
+                        // Clear prior allocations if any (idempotency safety for partial retries).
+                        await tx.purchaseBillLandedCostAllocation.deleteMany({
+                            where: { companyId, purchaseBillId: bill.id },
+                        });
+                        let allocated = new Prisma.Decimal(0);
+                        for (const [i, rl] of receiptLines.entries()) {
+                            const weight = new Prisma.Decimal(rl.lineTotal ?? 0).toDecimalPlaces(2).div(baseSum);
+                            let amt = i === receiptLines.length - 1
+                                ? landedCostTotal.sub(allocated).toDecimalPlaces(2)
+                                : landedCostTotal.mul(weight).toDecimalPlaces(2);
+                            if (amt.equals(0))
+                                continue;
+                            allocated = allocated.add(amt).toDecimalPlaces(2);
+                            await tx.purchaseBillLandedCostAllocation.create({
+                                data: {
+                                    companyId,
+                                    purchaseBillId: bill.id,
+                                    purchaseReceiptId: linkedReceiptId,
+                                    purchaseReceiptLineId: rl.id,
+                                    amount: amt,
+                                },
+                            });
+                            const applied = await applyStockValueAdjustmentWac(tx, {
+                                companyId,
+                                locationId: rl.locationId,
+                                itemId: rl.itemId,
+                                date: new Date(linkedReceipt.receiptDate),
+                                valueDelta: amt,
+                                allowBackdated: true,
+                                referenceType: 'PurchaseBillLandedCost',
+                                referenceId: String(bill.id),
+                                correlationId,
+                                createdByUserId: request.user?.userId ?? null,
+                                journalEntryId: null,
+                            });
+                            const from = applied?.requiresInventoryRecalcFromDate;
+                            if (from && !isNaN(new Date(from).getTime())) {
+                                inventoryRecalcFromDate =
+                                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                        ? new Date(from)
+                                        : inventoryRecalcFromDate;
+                            }
+                        }
+                    }
+                    if (!variance.equals(0)) {
+                        if (variance.greaterThan(0)) {
+                            // Bill > receipt: extra expense
+                            finalDebitLines.push({ accountId: ppvId, debit: variance, credit: new Prisma.Decimal(0) });
+                        }
+                        else {
+                            // Bill < receipt: credit variance account (reduces expense)
+                            finalDebitLines.push({ accountId: ppvId, debit: new Prisma.Decimal(0), credit: variance.abs() });
+                        }
+                    }
+                }
                 const je = await postJournalEntry(tx, {
                     companyId,
                     date: bill.billDate,
@@ -677,7 +883,7 @@ export async function purchaseBillsRoutes(fastify) {
                     createdByUserId: request.user?.userId ?? null,
                     skipAccountValidation: true,
                     lines: [
-                        ...debitLines,
+                        ...finalDebitLines,
                         { accountId: apAcc.id, debit: new Prisma.Decimal(0), credit: total },
                     ],
                 });
@@ -716,6 +922,34 @@ export async function purchaseBillsRoutes(fastify) {
                         payload: { journalEntryId: je.id, companyId },
                     },
                 });
+                // If we inserted a truly backdated stock move, schedule an inventory recalc forward from that date.
+                let inventoryRecalcEventId = null;
+                if (inventoryRecalcFromDate) {
+                    inventoryRecalcEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: inventoryRecalcEventId,
+                            eventType: 'inventory.recalc.requested',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: jeEventId,
+                            aggregateType: 'Company',
+                            aggregateId: String(companyId),
+                            type: 'InventoryRecalcRequested',
+                            payload: {
+                                companyId,
+                                fromDate: normalizeToDay(new Date(inventoryRecalcFromDate)).toISOString().slice(0, 10),
+                                reason: 'backdated_stock_move_insert',
+                                source: 'PurchaseBillPost',
+                                purchaseBillId: bill.id,
+                            },
+                        },
+                    });
+                }
                 await writeAuditLog(tx, {
                     companyId,
                     userId: request.user?.userId ?? null,
@@ -732,13 +966,23 @@ export async function purchaseBillsRoutes(fastify) {
                         journalEntryId: je.id,
                     },
                 });
-                return { purchaseBillId: updated.id, status: updated.status, journalEntryId: je.id, total: total.toString(), _jeEventId: jeEventId };
+                return {
+                    purchaseBillId: updated.id,
+                    status: updated.status,
+                    journalEntryId: je.id,
+                    total: total.toString(),
+                    _jeEventId: jeEventId,
+                    _inventoryRecalcEventId: inventoryRecalcEventId,
+                };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
         }, redis)));
         // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
         if (!replay && result._jeEventId) {
-            publishEventsFastPath([result._jeEventId]);
+            const ids = [result._jeEventId];
+            if (result._inventoryRecalcEventId)
+                ids.push(result._inventoryRecalcEventId);
+            publishEventsFastPath(ids);
         }
         return {
             purchaseBillId: result.purchaseBillId,
@@ -806,6 +1050,11 @@ export async function purchaseBillsRoutes(fastify) {
                     if (!bill.journalEntryId || !bill.journalEntry) {
                         throw Object.assign(new Error('purchase bill is POSTED but missing journal entry link'), { statusCode: 500 });
                     }
+                    await assertOpenPeriodOrThrow(tx, {
+                        companyId,
+                        transactionDate: adjustmentDate,
+                        action: 'purchase_bill.adjust',
+                    });
                     const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
                     if (payCount > 0)
                         throw Object.assign(new Error('cannot adjust a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
@@ -1068,6 +1317,7 @@ export async function purchaseBillsRoutes(fastify) {
                         throw Object.assign(new Error('only POSTED purchase bills can be voided'), { statusCode: 400 });
                     if (!bill.journalEntryId || !bill.journalEntry)
                         throw Object.assign(new Error('purchase bill is POSTED but missing journal entry link'), { statusCode: 500 });
+                    await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: voidDate, action: 'purchase_bill.void' });
                     const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
                     if (payCount > 0)
                         throw Object.assign(new Error('cannot void a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
@@ -1130,8 +1380,9 @@ export async function purchaseBillsRoutes(fastify) {
                         createdByUserId: request.user?.userId ?? null,
                     });
                     if ((origMoves ?? []).length > 0) {
+                        let inventoryRecalcFromDate = null;
                         for (const m of origMoves) {
-                            await applyStockMoveWac(tx, {
+                            const applied = await applyStockMoveWac(tx, {
                                 companyId,
                                 locationId: m.locationId,
                                 itemId: m.itemId,
@@ -1146,12 +1397,45 @@ export async function purchaseBillsRoutes(fastify) {
                                 correlationId,
                                 createdByUserId: request.user?.userId ?? null,
                                 journalEntryId: null,
+                                allowBackdated: true,
                             });
+                            const from = applied?.requiresInventoryRecalcFromDate;
+                            if (from && !isNaN(new Date(from).getTime())) {
+                                inventoryRecalcFromDate =
+                                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                        ? new Date(from)
+                                        : inventoryRecalcFromDate;
+                            }
                         }
                         await tx.stockMove.updateMany({
                             where: { companyId, correlationId, journalEntryId: null, referenceType: 'PurchaseBillVoid', referenceId: String(bill.id) },
                             data: { journalEntryId: reversal.id },
                         });
+                        if (inventoryRecalcFromDate) {
+                            await tx.event.create({
+                                data: {
+                                    companyId,
+                                    eventId: randomUUID(),
+                                    eventType: 'inventory.recalc.requested',
+                                    schemaVersion: 'v1',
+                                    occurredAt: new Date(occurredAt),
+                                    source: 'cashflow-api',
+                                    partitionKey: String(companyId),
+                                    correlationId,
+                                    causationId: String(bill.journalEntryId),
+                                    aggregateType: 'Company',
+                                    aggregateId: String(companyId),
+                                    type: 'InventoryRecalcRequested',
+                                    payload: {
+                                        companyId,
+                                        fromDate: normalizeToDay(new Date(inventoryRecalcFromDate)).toISOString().slice(0, 10),
+                                        reason: 'backdated_stock_move_insert',
+                                        source: 'PurchaseBillVoid',
+                                        purchaseBillId: bill.id,
+                                    },
+                                },
+                            });
+                        }
                     }
                     const createdEventId = randomUUID();
                     await tx.event.create({
@@ -1320,6 +1604,11 @@ export async function purchaseBillsRoutes(fastify) {
                     if (body.paymentDate && isNaN(paymentDate.getTime())) {
                         throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
                     }
+                    await assertOpenPeriodOrThrow(tx, {
+                        companyId,
+                        transactionDate: paymentDate,
+                        action: 'purchase_bill.payment.create',
+                    });
                     const amount = toMoneyDecimal(body.amount);
                     const sumAgg = await tx.purchaseBillPayment.aggregate({
                         where: { purchaseBillId: bill.id, companyId, reversedAt: null },

@@ -148,10 +148,9 @@ export function AccountPicker(props: {
       setPanelStyle(null);
       return;
     }
-    const btn = buttonRef.current;
-    if (!btn) return;
-
     function compute() {
+      const btn = buttonRef.current;
+      if (!btn) return;
       const r = btn.getBoundingClientRect();
       const dropdownH = 360; // max height; enough for search + list + footer
       const gap = 8;

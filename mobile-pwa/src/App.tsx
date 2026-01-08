@@ -19,8 +19,13 @@ import Warehouses from './pages/Warehouses';
 import PublicInvoice from './pages/PublicInvoice';
 import Expenses from './pages/Expenses';
 import ExpenseNew from './pages/ExpenseNew';
+import ExpenseDetail from './pages/ExpenseDetail';
+import ExpenseEdit from './pages/ExpenseEdit';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
+import Vendors from './pages/Vendors';
+import VendorNew from './pages/VendorNew';
+import VendorEdit from './pages/VendorEdit';
 
 function NotFound() {
   return (
@@ -168,10 +173,50 @@ export default function App() {
         }
       />
       <Route
+        path="/expenses/:id"
+        element={
+          <ProtectedRoute>
+            <ExpenseDetail />
+          </ProtectedRoute>
+        }
+      />
+      <Route
         path="/expenses/new"
         element={
           <ProtectedRoute>
             <ExpenseNew />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/expenses/:id/edit"
+        element={
+          <ProtectedRoute>
+            <ExpenseEdit />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/vendors"
+        element={
+          <ProtectedRoute>
+            <Vendors />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/vendors/new"
+        element={
+          <ProtectedRoute>
+            <VendorNew />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/vendors/:id"
+        element={
+          <ProtectedRoute>
+            <VendorEdit />
           </ProtectedRoute>
         }
       />

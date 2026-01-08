@@ -1035,111 +1035,190 @@ export async function ledgerRoutes(fastify) {
             return { error: 'invalid asOf date (YYYY-MM-DD)' };
         }
         asOfDate.setHours(0, 0, 0, 0);
-        // Aggregate from AccountBalance (daily increments) up to asOf (inclusive)
-        const grouped = await prisma.accountBalance.groupBy({
-            by: ['accountId'],
-            where: {
-                companyId,
-                date: { lte: asOfDate },
-            },
-            _sum: { debitTotal: true, creditTotal: true },
-        });
-        // Compute current earnings (net income) up to asOf from INCOME/EXPENSE accounts.
-        // This removes the confusing "Out of balance" warning in Balance Sheet before period close.
-        // After a period close, INCOME/EXPENSE accounts for closed periods are zeroed by the close entry,
-        // so this naturally trends toward 0 for closed periods.
-        const pnlGrouped = await prisma.accountBalance.groupBy({
-            by: ['accountId'],
-            where: { companyId, date: { lte: asOfDate } },
-            _sum: { debitTotal: true, creditTotal: true },
-        });
-        const pnlAccountIds = pnlGrouped.map((g) => g.accountId);
-        const pnlAccounts = await prisma.account.findMany({
-            where: { companyId, id: { in: pnlAccountIds }, type: { in: ['INCOME', 'EXPENSE'] } },
-            select: { id: true, type: true },
-        });
-        const pnlById = new Map(pnlAccounts.map((a) => [a.id, a]));
-        let totalIncome = new Prisma.Decimal(0);
-        let totalExpense = new Prisma.Decimal(0);
-        for (const g of pnlGrouped) {
-            const acc = pnlById.get(g.accountId);
-            if (!acc)
-                continue;
-            const debit = new Prisma.Decimal(g._sum.debitTotal ?? 0).toDecimalPlaces(2);
-            const credit = new Prisma.Decimal(g._sum.creditTotal ?? 0).toDecimalPlaces(2);
-            if (acc.type === 'INCOME')
-                totalIncome = totalIncome.add(credit.sub(debit));
-            if (acc.type === 'EXPENSE')
-                totalExpense = totalExpense.add(debit.sub(credit));
+        const compareYearsRaw = Number(query.compareYears ?? 0);
+        const compareYears = Number.isFinite(compareYearsRaw) ? Math.min(Math.max(compareYearsRaw, 0), 2) : 0;
+        function sameDayPreviousYear(d, yearsBack) {
+            const dd = new Date(d);
+            dd.setUTCFullYear(dd.getUTCFullYear() - yearsBack);
+            dd.setHours(0, 0, 0, 0);
+            return dd;
         }
-        totalIncome = totalIncome.toDecimalPlaces(2);
-        totalExpense = totalExpense.toDecimalPlaces(2);
-        const currentEarnings = totalIncome.sub(totalExpense).toDecimalPlaces(2);
-        const accountIds = grouped.map((g) => g.accountId);
-        const accounts = await prisma.account.findMany({
-            where: {
-                companyId,
-                id: { in: accountIds },
-                type: { in: ['ASSET', 'LIABILITY', 'EQUITY'] },
-            },
+        const asOfDates = [asOfDate];
+        for (let i = 1; i <= compareYears; i += 1) {
+            asOfDates.push(sameDayPreviousYear(asOfDate, i));
+        }
+        // Compute one balance sheet "snapshot" for a given asOf date.
+        async function computeSnapshot(d) {
+            // Aggregate from AccountBalance (daily increments) up to asOf (inclusive)
+            const grouped = await prisma.accountBalance.groupBy({
+                by: ['accountId'],
+                where: {
+                    companyId,
+                    date: { lte: d },
+                },
+                _sum: { debitTotal: true, creditTotal: true },
+            });
+            // Compute current earnings (net income) up to asOf from INCOME/EXPENSE accounts.
+            const pnlGrouped = await prisma.accountBalance.groupBy({
+                by: ['accountId'],
+                where: { companyId, date: { lte: d } },
+                _sum: { debitTotal: true, creditTotal: true },
+            });
+            const pnlAccountIds = pnlGrouped.map((g) => g.accountId);
+            const pnlAccounts = await prisma.account.findMany({
+                where: { companyId, id: { in: pnlAccountIds }, type: { in: ['INCOME', 'EXPENSE'] } },
+                select: { id: true, type: true },
+            });
+            const pnlById = new Map(pnlAccounts.map((a) => [a.id, a]));
+            let totalIncome = new Prisma.Decimal(0);
+            let totalExpense = new Prisma.Decimal(0);
+            for (const g of pnlGrouped) {
+                const acc = pnlById.get(g.accountId);
+                if (!acc)
+                    continue;
+                const debit = new Prisma.Decimal(g._sum.debitTotal ?? 0).toDecimalPlaces(2);
+                const credit = new Prisma.Decimal(g._sum.creditTotal ?? 0).toDecimalPlaces(2);
+                if (acc.type === 'INCOME')
+                    totalIncome = totalIncome.add(credit.sub(debit));
+                if (acc.type === 'EXPENSE')
+                    totalExpense = totalExpense.add(debit.sub(credit));
+            }
+            totalIncome = totalIncome.toDecimalPlaces(2);
+            totalExpense = totalExpense.toDecimalPlaces(2);
+            const currentEarnings = totalIncome.sub(totalExpense).toDecimalPlaces(2);
+            const accountIds = grouped.map((g) => g.accountId);
+            const accounts = await prisma.account.findMany({
+                where: {
+                    companyId,
+                    id: { in: accountIds },
+                    type: { in: ['ASSET', 'LIABILITY', 'EQUITY'] },
+                },
+                select: { id: true, code: true, name: true, type: true },
+            });
+            const accountById = new Map(accounts.map((a) => [a.id, a]));
+            const rows = grouped
+                .map((g) => {
+                const acc = accountById.get(g.accountId);
+                if (!acc)
+                    return null; // skip income/expense or missing
+                const debit = new Prisma.Decimal(g._sum.debitTotal ?? 0).toDecimalPlaces(2);
+                const credit = new Prisma.Decimal(g._sum.creditTotal ?? 0).toDecimalPlaces(2);
+                // Normal balance:
+                // - Assets: debit - credit
+                // - Liabilities/Equity: credit - debit
+                const balance = acc.type === 'ASSET' ? debit.sub(credit) : credit.sub(debit);
+                return {
+                    accountId: acc.id,
+                    code: acc.code,
+                    name: acc.name,
+                    type: acc.type,
+                    debit: debit.toString(),
+                    credit: credit.toString(),
+                    balance: balance.toDecimalPlaces(2).toString(),
+                };
+            })
+                .filter(Boolean);
+            const assets = rows.filter((r) => r.type === 'ASSET');
+            const liabilities = rows.filter((r) => r.type === 'LIABILITY');
+            const equity = rows.filter((r) => r.type === 'EQUITY');
+            // Add synthetic equity line for current earnings so accounting equation holds without requiring period close.
+            if (!currentEarnings.equals(0)) {
+                const credit = currentEarnings.greaterThan(0) ? currentEarnings : new Prisma.Decimal(0);
+                const debit = currentEarnings.lessThan(0) ? currentEarnings.abs() : new Prisma.Decimal(0);
+                equity.push({
+                    accountId: 0,
+                    code: '9999',
+                    name: 'Current Period Earnings',
+                    type: 'EQUITY',
+                    debit: debit.toString(),
+                    credit: credit.toString(),
+                    balance: credit.sub(debit).toDecimalPlaces(2).toString(),
+                });
+            }
+            const sumBalances = (items) => items.reduce((sum, r) => sum.add(new Prisma.Decimal(r.balance)), new Prisma.Decimal(0)).toDecimalPlaces(2);
+            const totalAssets = sumBalances(assets);
+            const totalLiabilities = sumBalances(liabilities);
+            const totalEquity = sumBalances(equity);
+            const label = d.toISOString().slice(0, 10);
+            const balanceByAccountId = new Map();
+            for (const r of [...assets, ...liabilities, ...equity]) {
+                balanceByAccountId.set(r.accountId, String(r.balance));
+            }
+            return {
+                asOf: label,
+                totals: {
+                    assets: totalAssets.toString(),
+                    liabilities: totalLiabilities.toString(),
+                    equity: totalEquity.toString(),
+                    balanced: totalAssets.equals(totalLiabilities.add(totalEquity)),
+                },
+                balanceByAccountId,
+                rowsByType: { assets, liabilities, equity },
+            };
+        }
+        const snapshots = await Promise.all(asOfDates.map((d) => computeSnapshot(d)));
+        // Build union of account rows from the "current" snapshot, plus any account that appears in older snapshots.
+        const allAccountIds = new Set();
+        for (const s of snapshots) {
+            for (const r of [...s.rowsByType.assets, ...s.rowsByType.liabilities, ...s.rowsByType.equity]) {
+                allAccountIds.add(r.accountId);
+            }
+        }
+        // Fetch metadata for real accounts (exclude synthetic id=0)
+        const metaAccounts = await prisma.account.findMany({
+            where: { companyId, id: { in: Array.from(allAccountIds).filter((id) => id > 0) } },
             select: { id: true, code: true, name: true, type: true },
         });
-        const accountById = new Map(accounts.map((a) => [a.id, a]));
-        const rows = grouped
-            .map((g) => {
-            const acc = accountById.get(g.accountId);
-            if (!acc)
-                return null; // skip income/expense or missing
-            const debit = new Prisma.Decimal(g._sum.debitTotal ?? 0).toDecimalPlaces(2);
-            const credit = new Prisma.Decimal(g._sum.creditTotal ?? 0).toDecimalPlaces(2);
-            // Normal balance:
-            // - Assets: debit - credit
-            // - Liabilities/Equity: credit - debit
-            const balance = acc.type === 'ASSET' ? debit.sub(credit) : credit.sub(debit);
-            return {
-                accountId: acc.id,
-                code: acc.code,
-                name: acc.name,
-                type: acc.type,
-                debit: debit.toString(),
-                credit: credit.toString(),
-                balance: balance.toString(),
-            };
-        })
-            .filter(Boolean);
-        const assets = rows.filter((r) => r.type === 'ASSET');
-        const liabilities = rows.filter((r) => r.type === 'LIABILITY');
-        const equity = rows.filter((r) => r.type === 'EQUITY');
-        // Add synthetic equity line for current earnings so accounting equation holds without requiring period close.
-        // If currentEarnings is 0, omit to reduce noise.
-        if (!currentEarnings.equals(0)) {
-            const credit = currentEarnings.greaterThan(0) ? currentEarnings : new Prisma.Decimal(0);
-            const debit = currentEarnings.lessThan(0) ? currentEarnings.abs() : new Prisma.Decimal(0);
-            equity.push({
-                accountId: 0,
-                code: '9999',
-                name: 'Current Period Earnings',
-                type: 'EQUITY',
-                debit: debit.toString(),
-                credit: credit.toString(),
-                // For equity, normal balance is credit - debit
-                balance: credit.sub(debit).toDecimalPlaces(2).toString(),
-            });
+        const metaById = new Map(metaAccounts.map((a) => [a.id, a]));
+        const columns = snapshots.map((s) => ({ asOf: s.asOf, label: s.asOf }));
+        function buildSection(type) {
+            // Union rows for this type from current snapshot to keep stable ordering,
+            // then add any missing accounts from older snapshots.
+            const sectionKey = (type === 'ASSET' ? 'assets' : type === 'LIABILITY' ? 'liabilities' : 'equity');
+            const firstSnapshot = snapshots[0];
+            if (!firstSnapshot)
+                return [];
+            const baseRows = [...firstSnapshot.rowsByType[sectionKey]];
+            const ids = new Set(baseRows.map((r) => Number(r.accountId)));
+            for (const s of snapshots) {
+                for (const r of s.rowsByType[sectionKey] ?? []) {
+                    if (!ids.has(Number(r.accountId))) {
+                        baseRows.push(r);
+                        ids.add(Number(r.accountId));
+                    }
+                }
+            }
+            const out = baseRows
+                .map((r) => {
+                const id = Number(r.accountId);
+                const meta = id > 0 ? metaById.get(id) : { id: 0, code: r.code, name: r.name, type: r.type };
+                const balances = snapshots.map((s) => s.balanceByAccountId.get(id) ?? '0.00');
+                return {
+                    accountId: id,
+                    code: meta?.code ?? r.code,
+                    name: meta?.name ?? r.name,
+                    type,
+                    // For backward compat: current column values
+                    debit: r.debit ?? '0.00',
+                    credit: r.credit ?? '0.00',
+                    balance: balances[0],
+                    balances,
+                };
+            })
+                .sort((a, b) => String(a.code ?? '').localeCompare(String(b.code ?? '')) || String(a.name ?? '').localeCompare(String(b.name ?? '')));
+            return out;
         }
-        const sumBalances = (items) => items.reduce((sum, r) => sum.add(new Prisma.Decimal(r.balance)), new Prisma.Decimal(0)).toDecimalPlaces(2);
-        const totalAssets = sumBalances(assets);
-        const totalLiabilities = sumBalances(liabilities);
-        const totalEquity = sumBalances(equity);
+        const assets = buildSection('ASSET');
+        const liabilities = buildSection('LIABILITY');
+        const equity = buildSection('EQUITY');
+        const firstSnapshot = snapshots[0];
+        const defaultTotals = { assets: '0.00', liabilities: '0.00', equity: '0.00', balanced: true };
         return {
             companyId,
             asOf: asOfDate.toISOString().slice(0, 10),
-            totals: {
-                assets: totalAssets.toString(),
-                liabilities: totalLiabilities.toString(),
-                equity: totalEquity.toString(),
-                // Accounting equation check (includes current earnings as synthetic equity line)
-                balanced: totalAssets.equals(totalLiabilities.add(totalEquity)),
-            },
+            columns,
+            totals: firstSnapshot?.totals ?? defaultTotals,
+            totalsByColumn: snapshots.map((s) => s.totals),
             assets,
             liabilities,
             equity,
@@ -1219,6 +1298,145 @@ export async function ledgerRoutes(fastify) {
             netProfit: netProfit.toString(),
             incomeAccounts,
             expenseAccounts,
+        };
+    });
+    // --- Account Transactions (drill-down from reports) ---
+    // GET /companies/:companyId/reports/account-transactions?accountId=123&from=YYYY-MM-DD&to=YYYY-MM-DD&take=200
+    fastify.get('/companies/:companyId/reports/account-transactions', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        const query = request.query;
+        const accountId = Number(query.accountId ?? 0);
+        if (!Number.isInteger(accountId) || accountId <= 0) {
+            reply.status(400);
+            return { error: 'accountId is required' };
+        }
+        if (!query.from || !query.to) {
+            reply.status(400);
+            return { error: 'from and to are required (YYYY-MM-DD)' };
+        }
+        const fromDate = normalizeToDay(new Date(query.from));
+        const toDate = normalizeToDay(new Date(query.to));
+        if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid from/to dates' };
+        }
+        if (fromDate.getTime() > toDate.getTime()) {
+            reply.status(400);
+            return { error: 'from must be <= to' };
+        }
+        const take = Math.min(Math.max(Number(query.take ?? 200) || 200, 1), 1000);
+        const account = await prisma.account.findFirst({
+            where: { companyId, id: accountId },
+            select: { id: true, code: true, name: true, type: true, normalBalance: true },
+        });
+        if (!account) {
+            reply.status(404);
+            return { error: 'account not found' };
+        }
+        // Opening balance (source-of-truth from journal lines, independent of worker projections)
+        const openingAgg = await prisma.journalLine.aggregate({
+            where: {
+                companyId,
+                accountId,
+                journalEntry: { date: { lt: fromDate } },
+            },
+            _sum: { debit: true, credit: true },
+        });
+        const openingDebit = new Prisma.Decimal(openingAgg._sum.debit ?? 0).toDecimalPlaces(2);
+        const openingCredit = new Prisma.Decimal(openingAgg._sum.credit ?? 0).toDecimalPlaces(2);
+        const openingNet = account.normalBalance === 'DEBIT' ? openingDebit.sub(openingCredit) : openingCredit.sub(openingDebit);
+        const openingAbs = openingNet.abs().toDecimalPlaces(2);
+        const openingSide = openingNet.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr');
+        // Pull journal lines for the period, include the parent journal entry
+        const lines = await prisma.journalLine.findMany({
+            where: {
+                companyId,
+                accountId,
+                journalEntry: { date: { gte: fromDate, lte: toDate } },
+            },
+            include: {
+                journalEntry: { select: { id: true, entryNumber: true, date: true, description: true } },
+            },
+            orderBy: [{ journalEntry: { date: 'asc' } }, { journalEntryId: 'asc' }, { id: 'asc' }],
+            take,
+        });
+        // Group by journal entry (one row per JE for this account)
+        const byEntry = new Map();
+        for (const l of lines) {
+            const jeId = Number(l.journalEntryId);
+            const prev = byEntry.get(jeId);
+            const debit = new Prisma.Decimal(l.debit ?? 0).toDecimalPlaces(2);
+            const credit = new Prisma.Decimal(l.credit ?? 0).toDecimalPlaces(2);
+            if (!prev) {
+                byEntry.set(jeId, { entry: l.journalEntry, debit, credit });
+            }
+            else {
+                prev.debit = prev.debit.add(debit).toDecimalPlaces(2);
+                prev.credit = prev.credit.add(credit).toDecimalPlaces(2);
+            }
+        }
+        const entryIds = Array.from(byEntry.keys());
+        // Best-effort source document inference (fast lookups by journalEntryId)
+        const [invoices, creditNotes, payments, expenses, purchaseBills, vendorCredits, pbPayments, expPayments] = await Promise.all([
+            prisma.invoice.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, invoiceNumber: true } }),
+            prisma.creditNote.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, creditNoteNumber: true } }),
+            prisma.payment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, invoiceId: true } }),
+            prisma.expense.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, expenseNumber: true } }),
+            prisma.purchaseBill.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, billNumber: true } }),
+            prisma.vendorCredit.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, creditNumber: true } }),
+            prisma.purchaseBillPayment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, purchaseBillId: true } }),
+            prisma.expensePayment.findMany({ where: { companyId, journalEntryId: { in: entryIds } }, select: { journalEntryId: true, id: true, expenseId: true } }),
+        ]);
+        const sourceByJeId = new Map();
+        for (const i of invoices)
+            sourceByJeId.set(Number(i.journalEntryId), { transactionType: 'Invoice', transactionNo: i.invoiceNumber, referenceNo: null });
+        for (const c of creditNotes)
+            sourceByJeId.set(Number(c.journalEntryId), { transactionType: 'Credit Note', transactionNo: c.creditNoteNumber ?? String(c.id), referenceNo: null });
+        for (const p of payments)
+            sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Payment', transactionNo: `PAY-${p.id}`, referenceNo: p.invoiceId ? `Invoice#${p.invoiceId}` : null });
+        for (const e of expenses)
+            sourceByJeId.set(Number(e.journalEntryId), { transactionType: 'Expense', transactionNo: e.expenseNumber ?? String(e.id), referenceNo: null });
+        for (const b of purchaseBills)
+            sourceByJeId.set(Number(b.journalEntryId), { transactionType: 'Purchase Bill', transactionNo: b.billNumber ?? String(b.id), referenceNo: null });
+        for (const v of vendorCredits)
+            sourceByJeId.set(Number(v.journalEntryId), { transactionType: 'Vendor Credit', transactionNo: v.creditNumber ?? String(v.id), referenceNo: null });
+        for (const p of pbPayments)
+            sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Bill Payment', transactionNo: `PB-PAY-${p.id}`, referenceNo: p.purchaseBillId ? `Bill#${p.purchaseBillId}` : null });
+        for (const p of expPayments)
+            sourceByJeId.set(Number(p.journalEntryId), { transactionType: 'Expense Payment', transactionNo: `EXP-PAY-${p.id}`, referenceNo: p.expenseId ? `Expense#${p.expenseId}` : null });
+        // Build rows + running balance
+        let running = openingNet.toDecimalPlaces(2);
+        const rows = Array.from(byEntry.values())
+            .sort((a, b) => new Date(a.entry.date).getTime() - new Date(b.entry.date).getTime() || Number(a.entry.id) - Number(b.entry.id))
+            .map((g) => {
+            const net = account.normalBalance === 'DEBIT' ? g.debit.sub(g.credit) : g.credit.sub(g.debit);
+            running = running.add(net).toDecimalPlaces(2);
+            const abs = net.abs().toDecimalPlaces(2);
+            const side = net.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr');
+            const src = sourceByJeId.get(Number(g.entry.id)) ?? null;
+            return {
+                date: new Date(g.entry.date).toISOString().slice(0, 10),
+                journalEntryId: g.entry.id,
+                entryNumber: g.entry.entryNumber,
+                description: g.entry.description,
+                debit: g.debit.toString(),
+                credit: g.credit.toString(),
+                amount: abs.toString(),
+                side,
+                runningBalance: running.abs().toString(),
+                runningSide: running.greaterThanOrEqualTo(0) ? (account.normalBalance === 'DEBIT' ? 'Dr' : 'Cr') : (account.normalBalance === 'DEBIT' ? 'Cr' : 'Dr'),
+                transactionType: src?.transactionType ?? 'Journal Entry',
+                transactionNo: src?.transactionNo ?? g.entry.entryNumber,
+                referenceNo: src?.referenceNo ?? null,
+            };
+        });
+        return {
+            companyId,
+            from: query.from,
+            to: query.to,
+            account: { id: account.id, code: account.code, name: account.name, type: account.type },
+            openingBalance: { amount: openingAbs.toString(), side: openingSide },
+            rows,
         };
     });
     // --- Cashflow Statement (Indirect Method) ---

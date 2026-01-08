@@ -111,7 +111,7 @@ export default function InventoryValuationDetailPage() {
           </Button>
         </Link>
         <div className="space-y-1 min-w-0">
-          <div className="text-xs text-muted-foreground truncate">{companySettings?.companyName ?? ''}</div>
+          <div className="text-xs text-muted-foreground truncate">{companySettings?.name ?? ''}</div>
           <h1 className="text-2xl font-semibold tracking-tight truncate">Inventory Valuation for {title}</h1>
           <div className="text-sm text-muted-foreground">
             From {from || '—'} to {to || '—'}

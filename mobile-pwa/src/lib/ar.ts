@@ -1,6 +1,6 @@
 import { fetchApi } from './api';
 
-export type InvoiceStatus = 'DRAFT' | 'POSTED' | 'PARTIAL' | 'PAID';
+export type InvoiceStatus = 'DRAFT' | 'APPROVED' | 'POSTED' | 'PARTIAL' | 'PAID' | 'VOID';
 
 export type InvoiceListRow = {
   id: number;
@@ -267,6 +267,7 @@ export async function recordInvoicePayment(
     amount: number;
     bankAccountId: number;
     attachmentUrl?: string; // Payment proof image URL
+    pendingProofId?: string; // Preferred: stable id from invoice.pendingPaymentProofs
   }
 ) {
   return await fetchApi(`/companies/${companyId}/invoices/${invoiceId}/payments`, {
@@ -295,6 +296,29 @@ export async function createInvoice(
 ) {
   return await fetchApi(`/companies/${companyId}/invoices`, {
     method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function updateInvoice(
+  companyId: number,
+  invoiceId: number,
+  payload: {
+    customerId: number;
+    invoiceDate?: string;
+    dueDate?: string | null;
+    lines: {
+      itemId?: number;
+      description?: string;
+      quantity: number;
+      unitPrice?: number;
+      taxRate?: number;
+      discountAmount?: number;
+    }[];
+  }
+) {
+  return await fetchApi(`/companies/${companyId}/invoices/${invoiceId}`, {
+    method: 'PUT',
     body: JSON.stringify(payload)
   });
 }

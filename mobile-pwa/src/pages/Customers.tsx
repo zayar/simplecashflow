@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
 import { getCustomers, getInvoices, type Customer, type InvoiceListRow } from '../lib/ar';
 import { AppBar, BackIcon, IconButton, SearchIcon } from '../components/AppBar';
@@ -8,6 +8,8 @@ import { BottomNav } from '../components/BottomNav';
 import { Fab, PlusIcon } from '../components/Fab';
 import { formatMoneyK, toNumber } from '../lib/format';
 import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
+import { usePullToRefresh } from '../lib/usePullToRefresh';
+import { PullToRefreshIndicator } from '../components/PullToRefresh';
 
 type Row = {
   customer: Customer;
@@ -19,6 +21,7 @@ export default function Customers() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [params] = useSearchParams();
   const mode = params.get('mode'); // 'pick' or null
   const [q, setQ] = useState('');
@@ -34,6 +37,17 @@ export default function Customers() {
     queryKey: ['invoices', companyId],
     queryFn: async () => await getInvoices(companyId),
     enabled: companyId > 0
+  });
+
+  const handleRefresh = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['customers', companyId] }),
+      queryClient.invalidateQueries({ queryKey: ['invoices', companyId] })
+    ]);
+  }, [queryClient, companyId]);
+
+  const { isRefreshing, pullDistance, handlers, containerRef } = usePullToRefresh({
+    onRefresh: handleRefresh
   });
 
   const rows = useMemo(() => {
@@ -67,11 +81,16 @@ export default function Customers() {
     const draft = getInvoiceDraft();
     setInvoiceDraft({ ...draft, customerId: c.id, customerName: c.name });
     const returnTo = draft.returnTo ?? '/invoices/new';
-    navigate(`${returnTo}?picked=1`, { replace: true });
+    const sep = returnTo.includes('?') ? '&' : '?';
+    navigate(`${returnTo}${sep}picked=1`, { replace: true });
   }
 
   return (
-    <div className="min-h-dvh bg-slate-100">
+    <div
+      className="min-h-dvh bg-slate-100"
+      ref={containerRef}
+      {...handlers}
+    >
       <AppBar
         title="Clients"
         left={
@@ -87,6 +106,8 @@ export default function Customers() {
       />
 
       <div className="mx-auto max-w-xl px-3 pb-24 pt-3">
+        <PullToRefreshIndicator isRefreshing={isRefreshing} pullDistance={pullDistance} />
+
         {searchOpen ? (
           <div className="mb-3 rounded-lg bg-white p-3 shadow-sm">
             <input
@@ -143,7 +164,19 @@ export default function Customers() {
         </div>
       </div>
 
-      {mode ? null : <Fab onClick={() => navigate('/customers/new')} ariaLabel="New client" icon={<PlusIcon />} />}
+      <Fab
+        onClick={() => {
+          if (mode === 'pick') {
+            const draft = getInvoiceDraft();
+            const returnTo = draft.returnTo ?? '/invoices/new';
+            navigate(`/customers/new?mode=pick&returnTo=${encodeURIComponent(returnTo)}`);
+            return;
+          }
+          navigate('/customers/new');
+        }}
+        ariaLabel="New client"
+        icon={<PlusIcon />}
+      />
       {mode ? null : <BottomNav />}
     </div>
   );

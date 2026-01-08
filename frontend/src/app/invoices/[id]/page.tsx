@@ -63,7 +63,7 @@ function statusBadge(status: string) {
     case "POSTED":
       return <Badge variant="outline">Posted</Badge>
     case "PARTIAL":
-      return <Badge variant="outline">Partial</Badge>
+      return <Badge variant="outline">Partially Paid</Badge>
     case "DRAFT":
       return <Badge variant="outline">Draft</Badge>
     default:
@@ -92,6 +92,9 @@ export default function InvoiceDetailPage() {
   const [refundModalOpen, setRefundModalOpen] = useState(false)
   const [refundPayment, setRefundPayment] = useState<any>(null)
   const [refundReason, setRefundReason] = useState("")
+  const [voidModalOpen, setVoidModalOpen] = useState(false)
+  const [voidReason, setVoidReason] = useState("")
+  const [voiding, setVoiding] = useState(false)
   const [shareError, setShareError] = useState<string | null>(null)
   const [sharing, setSharing] = useState(false)
 
@@ -297,6 +300,37 @@ export default function InvoiceDetailPage() {
     setRefundReason("")
   }
 
+  const openVoidDialog = () => {
+    setVoidReason("")
+    setVoidModalOpen(true)
+  }
+
+  const confirmVoid = async () => {
+    if (!user?.companyId || !invoiceId) return
+    const reason = voidReason.trim()
+    if (!reason) {
+      alert("Void reason is required.")
+      return
+    }
+    if (voiding) return
+    setVoiding(true)
+    try {
+      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/void`, {
+        method: "POST",
+        headers: { "Idempotency-Key": makeIdempotencyKey() },
+        body: JSON.stringify({ reason }),
+      })
+      setVoidModalOpen(false)
+      setVoidReason("")
+      await loadInvoice()
+    } catch (err: any) {
+      console.error(err)
+      alert(err?.message ?? "Failed to void invoice")
+    } finally {
+      setVoiding(false)
+    }
+  }
+
   const journals = useMemo(() => (invoice?.journalEntries ?? []) as any[], [invoice])
   const showJournal = invoice?.status && invoice.status !== "DRAFT"
 
@@ -360,6 +394,9 @@ export default function InvoiceDetailPage() {
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
   const creditsAvailable = Number((invoice as any)?.creditsAvailable ?? 0)
   const canApplyCredits = canReceivePayment && creditsAvailable > 0 && Number((invoice as any)?.remainingBalance ?? 0) > 0
+  const canEdit = invoice.status === "DRAFT"
+  const canDelete = (invoice.status === "DRAFT" || invoice.status === "APPROVED") && !invoice.journalEntryId
+  const canVoid = invoice.status === "POSTED" && Number((invoice as any)?.totalPaid ?? 0) <= 0
 
   return (
     <div className="space-y-6">
@@ -424,7 +461,7 @@ export default function InvoiceDetailPage() {
             {sharing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Share link
           </Button>
-          {invoice.status === "DRAFT" ? (
+          {canEdit ? (
             <>
               <Link href={`/invoices/${invoice.id}/edit`}>
                 <Button variant="outline" className="gap-2">
@@ -442,6 +479,11 @@ export default function InvoiceDetailPage() {
               <Button>Record payment</Button>
             </Link>
           )}
+          {canApplyCredits && (
+            <Link href={`/invoices/${invoice.id}/apply-credits`}>
+              <Button variant="secondary">Apply credits</Button>
+            </Link>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <DropdownMenu>
@@ -452,14 +494,33 @@ export default function InvoiceDetailPage() {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem
-                onClick={() => router.push(`/credit-notes/new?invoiceId=${invoice.id}`)}
+                onClick={() => {
+                  if (!canEdit) return
+                  router.push(`/invoices/${invoice.id}/edit`)
+                }}
+                disabled={!canEdit}
+              >
+                Edit
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  if (invoice.status === 'DRAFT') return;
+                  router.push(`/credit-notes/new?invoiceId=${invoice.id}`);
+                }}
+                disabled={invoice.status === 'DRAFT'}
               >
                 Create Credit Note (Return)
               </DropdownMenuItem>
-              {invoice.status !== "POSTED" &&
-              invoice.status !== "PAID" &&
-              invoice.status !== "PARTIAL" &&
-              !invoice.journalEntryId ? (
+              <DropdownMenuItem
+                onClick={() => {
+                  if (!canVoid) return
+                  openVoidDialog()
+                }}
+                disabled={!canVoid}
+              >
+                Void invoice
+              </DropdownMenuItem>
+              {canDelete ? (
                 <DropdownMenuItem
                   onClick={deleteInvoice}
                   className="text-destructive focus:text-destructive"
@@ -590,6 +651,37 @@ export default function InvoiceDetailPage() {
             ) : null}
             <Button type="button" onClick={() => setProofViewerOpen(false)}>
               Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Void invoice dialog */}
+      <Dialog open={voidModalOpen} onOpenChange={(o) => { setVoidModalOpen(o); if (!o) setVoidReason("") }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Void invoice</DialogTitle>
+            <DialogDescription>
+              Voiding keeps accounting correct: we will post a reversing journal entry and mark the invoice as VOID.
+              You can only void if there are no payments/credits applied.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Reason</div>
+            <Textarea
+              value={voidReason}
+              onChange={(e) => setVoidReason(e.target.value)}
+              placeholder="e.g. Customer cancelled order / duplicated invoice"
+              rows={3}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" type="button" onClick={() => setVoidModalOpen(false)} disabled={voiding}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={confirmVoid} disabled={voiding || !voidReason.trim()}>
+              {voiding ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Void invoice
             </Button>
           </DialogFooter>
         </DialogContent>

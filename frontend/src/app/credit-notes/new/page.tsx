@@ -26,7 +26,9 @@ import {
 
 type TaxOption = { id: number; name: string; ratePercent: number; type: 'rate' | 'group' };
 type Line = {
+  invoiceLineId?: number;
   itemId: string;
+  itemName?: string;
   description: string;
   quantity: number;
   unitPrice: number;
@@ -115,16 +117,18 @@ export default function NewCreditNotePage() {
       .then((inv) => {
         setSourceInvoice(inv);
         setCustomerId(String(inv.customerId ?? inv.customer?.id ?? ''));
-        // Prefill lines with invoice lines (qty defaults to 1; user can adjust)
+        // Prefill lines with invoice lines (qty defaults to invoice qty; user can adjust)
         const invLines = (inv.lines ?? []) as any[];
         if (invLines.length > 0) {
           setLines(
             invLines.map((l: any) => ({
+              invoiceLineId: Number(l.id),
               itemId: String(l.itemId),
+              itemName: l.item?.name ?? null,
               description: l.description ?? l.item?.name ?? '',
-              quantity: 1,
+              quantity: Number(l.quantity ?? 1),
               unitPrice: Number(l.unitPrice ?? 0),
-              taxRate: 0,
+              taxRate: Number(l.taxRate ?? 0),
               taxLabel: '',
               incomeAccountId: l.incomeAccountId ? String(l.incomeAccountId) : '',
             }))
@@ -154,6 +158,7 @@ export default function NewCreditNotePage() {
   }
 
   function handleItemChange(index: number, itemId: string) {
+    if (sourceInvoice) return; // locked when creating from invoice
     const item = items.find((i) => i.id.toString() === itemId);
     const next = [...lines];
     next[index].itemId = itemId;
@@ -194,8 +199,15 @@ export default function NewCreditNotePage() {
       setError('Customer is required.');
       return;
     }
-    if (lines.length === 0 || lines.some((l) => !l.itemId)) {
-      setError('Please select items for all lines.');
+    if (
+      lines.length === 0 ||
+      lines.some((l) => {
+        const hasItem = !!String(l.itemId ?? '').trim();
+        const hasDesc = !!String(l.description ?? '').trim();
+        return !hasItem && !hasDesc;
+      })
+    ) {
+      setError('Please select an item or enter a description for all lines.');
       return;
     }
     setLoading(true);
@@ -203,12 +215,10 @@ export default function NewCreditNotePage() {
       const invoiceId = search?.get('invoiceId');
       if (invoiceId) {
         // Clean returns: create credit note from invoice lines (prevents over-return and uses original cost).
-        const invLines = (sourceInvoice?.lines ?? []) as any[];
-        const byItem = new Map(invLines.map((l: any) => [String(l.itemId), l]));
         const payloadLines = lines
-          .filter((l) => l.itemId)
+          .filter((l) => l.invoiceLineId && Number(l.quantity) > 0)
           .map((l) => ({
-            invoiceLineId: Number(byItem.get(String(l.itemId))?.id),
+            invoiceLineId: Number(l.invoiceLineId),
             quantity: Number(l.quantity),
           }))
           .filter((l) => l.invoiceLineId && l.quantity > 0);
@@ -232,7 +242,7 @@ export default function NewCreditNotePage() {
             customerNotes: customerNotes || undefined,
             termsAndConditions: termsAndConditions || undefined,
           lines: lines.map((l) => ({
-            itemId: Number(l.itemId),
+            itemId: String(l.itemId ?? '').trim() ? Number(l.itemId) : null,
             description: l.description,
             quantity: Number(l.quantity),
             unitPrice: Number(l.unitPrice),
@@ -324,7 +334,11 @@ export default function NewCreditNotePage() {
                     <TableRow key={`main-${idx}`} className="border-b-0">
                       <TableCell className="align-top">
                         <div className="space-y-2">
-                <SelectNative value={l.itemId} onChange={(e) => handleItemChange(idx, e.target.value)}>
+                <SelectNative
+                  value={l.itemId}
+                  onChange={(e) => handleItemChange(idx, e.target.value)}
+                  disabled={!!sourceInvoice}
+                >
                   <option value="">Select item…</option>
                   {items.map((it) => (
                     <option key={it.id} value={String(it.id)}>
@@ -434,6 +448,7 @@ export default function NewCreditNotePage() {
                           onChange={(e) => updateLine(idx, { description: e.target.value })}
                           placeholder="Enter name or description"
                           className="min-h-[44px]"
+                          disabled={!!sourceInvoice}
                         />
                       </TableCell>
                       <TableCell colSpan={2} className="py-3">

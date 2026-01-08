@@ -1,9 +1,11 @@
 import { PrismaClient } from '@prisma/client';
 import { getTenantCompanyId } from './tenantContext.js';
-const base = new PrismaClient();
+// Base Prisma client (no tenant isolation). Use ONLY when you intentionally need
+// cross-tenant access (e.g., global uniqueness checks for phone OTP).
+export const rawPrisma = new PrismaClient();
 // Fintech safety rail: posted ledger data must be immutable.
 // If you need to "change" a posted entry, create an adjustment/reversal entry instead.
-base.$use(async (params, next) => {
+rawPrisma.$use(async (params, next) => {
     if (params.model === 'JournalEntry' || params.model === 'JournalLine') {
         const action = params.action;
         if (action === 'update' ||
@@ -44,10 +46,17 @@ const TENANT_MODELS = new Set([
     'JournalLine',
     'Payment',
     'PeriodClose',
+    'InventoryRecalcState',
+    'JournalEntryInventoryValuation',
     'ProcessedEvent',
     'PurchaseBill',
     'PurchaseBillLine',
     'PurchaseBillPayment',
+    'PurchaseBillLandedCostAllocation',
+    'PurchaseOrder',
+    'PurchaseOrderLine',
+    'PurchaseReceipt',
+    'PurchaseReceiptLine',
     'StockBalance',
     'StockMove',
     'TaxGroup',
@@ -55,6 +64,9 @@ const TENANT_MODELS = new Set([
     'TaxRate',
     'User', // tenant-scoped users (email is global-unique, but data access must still be scoped)
     'Vendor',
+    'VendorAdvance',
+    'VendorAdvanceApplication',
+    'CreditNoteRefund',
     'Location',
 ]);
 function whereHasCompanyId(where) {
@@ -122,7 +134,7 @@ function injectCreateCompanyId(args, companyId) {
     nextArgs.data = { ...nextArgs.data, companyId };
     return nextArgs;
 }
-export const prisma = base.$extends({
+export const prisma = rawPrisma.$extends({
     name: 'tenantIsolation',
     query: {
         $allModels: {

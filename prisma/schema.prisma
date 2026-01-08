@@ -7,6 +7,1397 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Company {
+  id                            Int                          @id @default(autoincrement())
+  name                          String
+  createdAt                     DateTime                     @default(now())
+  updatedAt                     DateTime                     @updatedAt
+  accountsReceivableAccountId   Int?
+  accountsPayableAccountId      Int?
+  inventoryAssetAccountId       Int?
+  cogsAccountId                 Int?
+  openingBalanceEquityAccountId Int?
+  goodsReceivedNotInvoicedAccountId Int?
+  purchasePriceVarianceAccountId Int?
+  defaultLocationId             Int?                         @map("defaultWarehouseId")
+  baseCurrency                  String?
+  timeZone                      String?
+  fiscalYearStartMonth          Int?                         @default(1)
+  invoiceTemplate               Json?
+  paymentQrCodes                Json?
+  accounts                      Account[]
+  accountBalances               AccountBalance[]
+  auditLogs                     AuditLog[]
+  bankingAccounts               BankingAccount[]
+  accountsPayableAccount        Account?                     @relation("Company_AP", fields: [accountsPayableAccountId], references: [id])
+  accountsReceivableAccount     Account?                     @relation("Company_AR", fields: [accountsReceivableAccountId], references: [id])
+  cogsAccount                   Account?                     @relation("Company_COGS", fields: [cogsAccountId], references: [id])
+  defaultLocation               Location?                    @relation("Company_DefaultLocation", fields: [defaultLocationId], references: [id])
+  inventoryAssetAccount         Account?                     @relation("Company_InventoryAsset", fields: [inventoryAssetAccountId], references: [id])
+  openingBalanceEquityAccount   Account?                     @relation("Company_OpeningEquity", fields: [openingBalanceEquityAccountId], references: [id])
+  goodsReceivedNotInvoicedAccount Account?                   @relation("Company_GRNI", fields: [goodsReceivedNotInvoicedAccountId], references: [id])
+  purchasePriceVarianceAccount  Account?                     @relation("Company_PPV", fields: [purchasePriceVarianceAccountId], references: [id])
+  creditNotes                   CreditNote[]
+  creditNoteLines               CreditNoteLine[]
+  creditNoteRefunds             CreditNoteRefund[]
+  currencies                    Currency[]
+  customers                     Customer[]
+  customerAdvances              CustomerAdvance[]
+  customerAdvanceApplications   CustomerAdvanceApplication[]
+  summaries                     DailySummary[]
+  documentSequences             DocumentSequence[]
+  events                        Event[]
+  exchangeRates                 ExchangeRate[]
+  expenses                      Expense[]
+  expensePayments               ExpensePayment[]
+  idempotentRequests            IdempotentRequest[]
+  integrationEntityMaps         IntegrationEntityMap[]
+  invoices                      Invoice[]
+  invoiceLines                  InvoiceLine[]
+  items                         Item[]
+  entries                       JournalEntry[]
+  journalLines                  JournalLine[]
+  payments                      Payment[]
+  periodCloses                  PeriodClose[]
+  processedEvents               ProcessedEvent[]
+  purchaseBills                 PurchaseBill[]
+  purchaseBillLines             PurchaseBillLine[]
+  purchaseBillPayments          PurchaseBillPayment[]
+  purchaseReceipts              PurchaseReceipt[]
+  purchaseReceiptLines          PurchaseReceiptLine[]
+  purchaseBillLandedCostAllocations PurchaseBillLandedCostAllocation[]
+  stockBalances                 StockBalance[]
+  stockMoves                    StockMove[]
+  taxGroups                     TaxGroup[]
+  taxRates                      TaxRate[]
+  users                         User[]
+  vendors                       Vendor[]
+  vendorAdvances                VendorAdvance[]
+  vendorAdvanceApplications     VendorAdvanceApplication[]
+  vendorCredits                 VendorCredit[]
+  vendorCreditApplications      VendorCreditApplication[]
+  vendorCreditLines             VendorCreditLine[]
+  purchaseOrders                PurchaseOrder[]
+  purchaseOrderLines            PurchaseOrderLine[]
+  locations                     Location[]
+  inventoryRecalcState          InventoryRecalcState?
+  journalEntryInventoryValuations JournalEntryInventoryValuation[]
+
+  @@index([accountsPayableAccountId], map: "Company_accountsPayableAccountId_fkey")
+  @@index([accountsReceivableAccountId], map: "Company_accountsReceivableAccountId_fkey")
+  @@index([cogsAccountId], map: "Company_cogsAccountId_fkey")
+  @@index([defaultLocationId], map: "Company_defaultWarehouseId_fkey")
+  @@index([inventoryAssetAccountId], map: "Company_inventoryAssetAccountId_fkey")
+  @@index([openingBalanceEquityAccountId], map: "Company_openingBalanceEquityAccountId_fkey")
+  @@index([goodsReceivedNotInvoicedAccountId], map: "Company_goodsReceivedNotInvoicedAccountId_fkey")
+  @@index([purchasePriceVarianceAccountId], map: "Company_purchasePriceVarianceAccountId_fkey")
+}
+
+model Account {
+  id                                Int                   @id @default(autoincrement())
+  companyId                         Int
+  code                              String
+  name                              String
+  type                              AccountType
+  isActive                          Boolean               @default(true)
+  createdAt                         DateTime              @default(now())
+  updatedAt                         DateTime              @updatedAt
+  normalBalance                     NormalBalance         @default(DEBIT)
+  reportGroup                       AccountReportGroup?
+  cashflowActivity                  CashflowActivity?
+  company                           Company               @relation(fields: [companyId], references: [id])
+  balances                          AccountBalance[]
+  bankingAccount                    BankingAccount?
+  accountsPayableFor                Company[]             @relation("Company_AP")
+  accountsReceivableFor             Company[]             @relation("Company_AR")
+  cogsFor                           Company[]             @relation("Company_COGS")
+  inventoryAssetFor                 Company[]             @relation("Company_InventoryAsset")
+  openingBalanceEquityFor           Company[]             @relation("Company_OpeningEquity")
+  creditNoteLinesIncome             CreditNoteLine[]      @relation("CreditNoteLine_IncomeAccount")
+  creditNoteRefundBankMovements     CreditNoteRefund[]    @relation("CreditNoteRefund_BankAccount")
+  customerAdvanceBankMovements      CustomerAdvance[]     @relation("CustomerAdvance_BankAccount")
+  customerAdvanceLiabilityMovements CustomerAdvance[]     @relation("CustomerAdvance_LiabilityAccount")
+  expenses                          Expense[]             @relation("Expense_ExpenseAccount")
+  bankExpensePayments               ExpensePayment[]      @relation("ExpensePayment_BankAccount")
+  invoiceLinesIncome                InvoiceLine[]         @relation("InvoiceLine_IncomeAccount")
+  expenseItems                      Item[]                @relation("Account_ExpenseItems")
+  incomeItems                       Item[]                @relation("Account_IncomeItems")
+  lines                             JournalLine[]
+  bankPayments                      Payment[]             @relation("Payment_BankAccount")
+  purchaseBillLines                 PurchaseBillLine[]
+  purchaseBillPayments              PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
+  vendorAdvanceBankMovements        VendorAdvance[]       @relation("VendorAdvance_BankAccount")
+  vendorAdvancePrepaymentMovements  VendorAdvance[]       @relation("VendorAdvance_PrepaymentAccount")
+  vendorCreditLines                 VendorCreditLine[]    @relation("VendorCreditLine_Account")
+  goodsReceivedNotInvoicedFor       Company[]             @relation("Company_GRNI")
+  purchasePriceVarianceFor          Company[]             @relation("Company_PPV")
+
+  @@unique([companyId, code])
+}
+
+model AccountBalance {
+  id          Int      @id @default(autoincrement())
+  companyId   Int
+  accountId   Int
+  date        DateTime
+  debitTotal  Decimal  @db.Decimal(18, 2)
+  creditTotal Decimal  @db.Decimal(18, 2)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  account     Account  @relation(fields: [accountId], references: [id])
+  company     Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, accountId, date])
+  @@index([companyId, date])
+  @@index([companyId, accountId])
+  @@index([accountId], map: "AccountBalance_accountId_fkey")
+}
+
+model BankingAccount {
+  id             Int                @id @default(autoincrement())
+  companyId      Int
+  accountId      Int                @unique
+  kind           BankingAccountKind
+  currency       String?            @db.VarChar(3)
+  bankName       String?
+  accountNumber  String?
+  identifierCode String?
+  branch         String?
+  description    String?            @db.Text
+  isPrimary      Boolean            @default(false)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  account        Account            @relation(fields: [accountId], references: [id])
+  company        Company            @relation(fields: [companyId], references: [id])
+
+  @@index([companyId])
+}
+
+model JournalEntry {
+  id                            Int                         @id @default(autoincrement())
+  companyId                     Int
+  date                          DateTime
+  description                   String
+  createdAt                     DateTime                    @default(now())
+  updatedAt                     DateTime                    @updatedAt
+  createdByUserId               Int?
+  postedAt                      DateTime                    @default(now())
+  reversalOfJournalEntryId      Int?                        @unique
+  reversalReason                String?                     @db.Text
+  entryNumber                   String?                     @db.VarChar(32)
+  voidedAt                      DateTime?
+  voidReason                    String?                     @db.Text
+  voidedByUserId                Int?
+  updatedByUserId               Int?
+  locationId                    Int?                        @map("warehouseId")
+  creditNote                    CreditNote?                 @relation("CreditNote_JournalEntry")
+  creditNoteLastAdjustmentFor   CreditNote[]                @relation("CreditNote_LastAdjustmentJournalEntry")
+  creditNoteVoidFor             CreditNote?                 @relation("CreditNote_VoidJournalEntry")
+  creditNoteRefund              CreditNoteRefund?           @relation("CreditNoteRefund_JournalEntry")
+  customerAdvance               CustomerAdvance?            @relation("CustomerAdvance_JournalEntry")
+  customerAdvanceApplication    CustomerAdvanceApplication? @relation("CustomerAdvanceApplication_JournalEntry")
+  expense                       Expense?                    @relation("Expense_JournalEntry")
+  expenseLastAdjustmentFor      Expense[]                   @relation("Expense_LastAdjustmentJournalEntry")
+  expenseVoidFor                Expense?                    @relation("Expense_VoidJournalEntry")
+  expensePayment                ExpensePayment?             @relation("ExpensePayment_JournalEntry")
+  expensePaymentReversal        ExpensePayment?             @relation("ExpensePayment_ReversalJournalEntry")
+  invoice                       Invoice?                    @relation("Invoice_JournalEntry")
+  invoiceLastAdjustmentFor      Invoice[]                   @relation("Invoice_LastAdjustmentJournalEntry")
+  invoiceVoidFor                Invoice?                    @relation("Invoice_VoidJournalEntry")
+  location                      Location?                   @relation(fields: [locationId], references: [id], map: "JE_wh_fk")
+  company                       Company                     @relation(fields: [companyId], references: [id])
+  createdByUser                 User?                       @relation(fields: [createdByUserId], references: [id])
+  reversalOfJournalEntry        JournalEntry?               @relation("JournalEntry_Reversal", fields: [reversalOfJournalEntryId], references: [id])
+  reversalEntry                 JournalEntry?               @relation("JournalEntry_Reversal")
+  updatedByUser                 User?                       @relation("User_UpdatedJournalEntries", fields: [updatedByUserId], references: [id])
+  voidedByUser                  User?                       @relation("User_VoidedJournalEntries", fields: [voidedByUserId], references: [id])
+  lines                         JournalLine[]
+  payment                       Payment?                    @relation("Payment_JournalEntry")
+  paymentReversal               Payment?                    @relation("Payment_ReversalJournalEntry")
+  periodClose                   PeriodClose?
+  purchaseBill                  PurchaseBill?
+  purchaseBillLastAdjustmentFor PurchaseBill[]              @relation("PurchaseBill_LastAdjustmentJournalEntry")
+  purchaseBillVoidFor           PurchaseBill?               @relation("PurchaseBill_VoidJournalEntry")
+  purchaseBillPayment           PurchaseBillPayment?        @relation("PurchaseBillPayment_JournalEntry")
+  purchaseBillPaymentReversal   PurchaseBillPayment?        @relation("PurchaseBillPayment_ReversalJournalEntry")
+  purchaseReceipt               PurchaseReceipt?            @relation("PurchaseReceipt_JournalEntry")
+  purchaseReceiptVoidFor        PurchaseReceipt?            @relation("PurchaseReceipt_VoidJournalEntry")
+  vendorAdvance                 VendorAdvance?              @relation("VendorAdvance_JournalEntry")
+  vendorAdvanceApplication      VendorAdvanceApplication?   @relation("VendorAdvanceApplication_JournalEntry")
+  vendorCredit                  VendorCredit?               @relation("VendorCredit_JournalEntry")
+  vendorCreditLastAdjustmentFor VendorCredit[]              @relation("VendorCredit_LastAdjustmentJournalEntry")
+  vendorCreditVoidFor           VendorCredit?               @relation("VendorCredit_VoidJournalEntry")
+  journalEntryInventoryValuations JournalEntryInventoryValuation[]
+
+  @@unique([companyId, entryNumber])
+  @@index([companyId, date])
+  @@index([companyId, locationId], map: "JE_co_wh_idx")
+  @@index([locationId], map: "JE_wh_idx")
+  @@index([createdByUserId], map: "JournalEntry_createdByUserId_fkey")
+  @@index([updatedByUserId], map: "JournalEntry_updatedByUserId_fkey")
+  @@index([voidedByUserId], map: "JournalEntry_voidedByUserId_fkey")
+}
+
+model JournalLine {
+  id             Int          @id @default(autoincrement())
+  journalEntryId Int
+  accountId      Int
+  debit          Decimal      @db.Decimal(18, 2)
+  credit         Decimal      @db.Decimal(18, 2)
+  companyId      Int
+  account        Account      @relation(fields: [accountId], references: [id])
+  company        Company      @relation(fields: [companyId], references: [id])
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id])
+
+  @@index([companyId])
+  @@index([accountId], map: "JournalLine_accountId_fkey")
+  @@index([journalEntryId], map: "JournalLine_journalEntryId_fkey")
+}
+
+model Event {
+  id                   Int       @id @default(autoincrement())
+  companyId            Int?
+  type                 String
+  payload              Json
+  createdAt            DateTime  @default(now())
+  eventId              String    @unique
+  eventType            String
+  schemaVersion        String
+  occurredAt           DateTime  @default(now())
+  source               String?
+  partitionKey         String?
+  correlationId        String?
+  causationId          String?
+  aggregateType        String?
+  aggregateId          String?
+  publishedAt          DateTime?
+  nextPublishAttemptAt DateTime? @default(now())
+  publishAttempts      Int       @default(0)
+  lastPublishError     String?   @db.Text
+  lockedAt             DateTime?
+  lockId               String?
+  company              Company?  @relation(fields: [companyId], references: [id])
+
+  @@index([publishedAt, nextPublishAttemptAt])
+  @@index([lockedAt])
+  @@index([companyId, occurredAt])
+}
+
+model ProcessedEvent {
+  id          Int      @id @default(autoincrement())
+  eventId     String   @unique
+  processedAt DateTime @default(now())
+  companyId   Int
+  company     Company  @relation(fields: [companyId], references: [id])
+
+  @@index([companyId])
+}
+
+model DailySummary {
+  id           Int      @id @default(autoincrement())
+  companyId    Int
+  date         DateTime
+  totalIncome  Decimal  @db.Decimal(18, 2)
+  totalExpense Decimal  @db.Decimal(18, 2)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  company      Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, date])
+}
+
+model Customer {
+  id               Int               @id @default(autoincrement())
+  companyId        Int
+  name             String
+  email            String?
+  phone            String?
+  currency         String?
+  openingBalance   Decimal?          @db.Decimal(18, 2)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  creditNotes      CreditNote[]
+  company          Company           @relation(fields: [companyId], references: [id])
+  customerAdvances CustomerAdvance[]
+  invoices         Invoice[]
+
+  @@index([companyId])
+}
+
+model Item {
+  id                Int                      @id @default(autoincrement())
+  companyId         Int
+  name              String
+  sku               String?
+  type              ItemType
+  sellingPrice      Decimal                  @db.Decimal(18, 2)
+  costPrice         Decimal?                 @db.Decimal(18, 2)
+  incomeAccountId   Int
+  expenseAccountId  Int?
+  isActive          Boolean                  @default(true)
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  trackInventory    Boolean                  @default(false)
+  valuationMethod   InventoryValuationMethod @default(WAC)
+  defaultLocationId Int?                     @map("defaultWarehouseId")
+  creditNoteLines   CreditNoteLine[]
+  expenses          Expense[]
+  invoiceLines      InvoiceLine[]
+  company           Company                  @relation(fields: [companyId], references: [id])
+  defaultLocation   Location?                @relation(fields: [defaultLocationId], references: [id])
+  expenseAccount    Account?                 @relation("Account_ExpenseItems", fields: [expenseAccountId], references: [id])
+  incomeAccount     Account                  @relation("Account_IncomeItems", fields: [incomeAccountId], references: [id])
+  purchaseBillLines PurchaseBillLine[]
+  purchaseOrderLines PurchaseOrderLine[]
+  purchaseReceiptLines PurchaseReceiptLine[]
+  stockBalances     StockBalance[]
+  stockMoves        StockMove[]
+  vendorCreditLines VendorCreditLine[]
+
+  @@index([companyId])
+  @@index([defaultLocationId], map: "Item_defaultWarehouseId_fkey")
+  @@index([expenseAccountId], map: "Item_expenseAccountId_fkey")
+  @@index([incomeAccountId], map: "Item_incomeAccountId_fkey")
+}
+
+model Location {
+  id                  Int                @id @default(autoincrement())
+  companyId           Int
+  name                String
+  isDefault           Boolean            @default(false)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  defaultForCompanies Company[]          @relation("Company_DefaultLocation")
+  customerAdvances    CustomerAdvance[]  @relation("CustomerAdvance_Location")
+  invoices            Invoice[]
+  items               Item[]
+  journalEntries      JournalEntry[]
+  purchaseBills       PurchaseBill[]
+  purchaseBillLines   PurchaseBillLine[]
+  purchaseOrders      PurchaseOrder[]
+  purchaseOrderLines  PurchaseOrderLine[]
+  purchaseReceipts    PurchaseReceipt[]
+  purchaseReceiptLines PurchaseReceiptLine[]
+  stockBalances       StockBalance[]
+  stockMoves          StockMove[]
+  vendorAdvances      VendorAdvance[]
+  vendorCredits       VendorCredit[]     @relation("VendorCredit_Location")
+  vendorCreditLines   VendorCreditLine[] @relation("VendorCreditLine_Location")
+  company             Company            @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@map("Warehouse")
+}
+
+model StockBalance {
+  id             Int      @id @default(autoincrement())
+  companyId      Int
+  locationId     Int      @map("warehouseId")
+  itemId         Int
+  qtyOnHand      Decimal  @db.Decimal(18, 2)
+  avgUnitCost    Decimal  @db.Decimal(18, 2)
+  inventoryValue Decimal  @db.Decimal(18, 2)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  company        Company  @relation(fields: [companyId], references: [id])
+  item           Item     @relation(fields: [itemId], references: [id])
+  location       Location @relation(fields: [locationId], references: [id])
+
+  @@unique([companyId, locationId, itemId])
+  @@index([companyId, itemId])
+  @@index([companyId, locationId])
+  @@index([itemId], map: "StockBalance_itemId_fkey")
+  @@index([locationId], map: "StockBalance_warehouseId_fkey")
+}
+
+model StockMove {
+  id               Int                @id @default(autoincrement())
+  companyId        Int
+  locationId       Int                @map("warehouseId")
+  itemId           Int
+  date             DateTime
+  type             StockMoveType
+  direction        StockMoveDirection
+  quantity         Decimal            @db.Decimal(18, 2)
+  unitCostApplied  Decimal            @db.Decimal(18, 2)
+  totalCostApplied Decimal            @db.Decimal(18, 2)
+  referenceType    String?
+  referenceId      String?
+  correlationId    String?
+  createdByUserId  Int?
+  journalEntryId   Int?
+  createdAt        DateTime           @default(now())
+  company          Company            @relation(fields: [companyId], references: [id])
+  item             Item               @relation(fields: [itemId], references: [id])
+  location         Location           @relation(fields: [locationId], references: [id])
+
+  @@index([companyId, date])
+  @@index([companyId, itemId])
+  @@index([companyId, locationId])
+  @@index([itemId], map: "StockMove_itemId_fkey")
+  @@index([locationId], map: "StockMove_warehouseId_fkey")
+}
+
+model Invoice {
+  id                           Int                          @id @default(autoincrement())
+  companyId                    Int
+  customerId                   Int
+  invoiceNumber                String
+  status                       InvoiceStatus
+  invoiceDate                  DateTime
+  dueDate                      DateTime?
+  currency                     String?
+  total                        Decimal                      @db.Decimal(18, 2)
+  journalEntryId               Int?                         @unique
+  createdAt                    DateTime                     @default(now())
+  updatedAt                    DateTime                     @updatedAt
+  amountPaid                   Decimal                      @default(0.00) @db.Decimal(18, 2)
+  customerNotes                String?                      @db.Text
+  termsAndConditions           String?                      @db.Text
+  subtotal                     Decimal                      @default(0.00) @db.Decimal(18, 2)
+  taxAmount                    Decimal                      @default(0.00) @db.Decimal(18, 2)
+  voidedAt                     DateTime?
+  voidReason                   String?                      @db.Text
+  voidedByUserId               Int?
+  voidJournalEntryId           Int?                         @unique
+  lastAdjustmentJournalEntryId Int?
+  updatedByUserId              Int?
+  locationId                   Int?                         @map("warehouseId")
+  pendingPaymentProofs         Json?
+  appliedCreditNotes           CreditNote[]                 @relation("CreditNote_AppliedInvoice")
+  creditNotes                  CreditNote[]                 @relation("CreditNote_SourceInvoice")
+  customerAdvanceApplications  CustomerAdvanceApplication[]
+  location                     Location?                    @relation(fields: [locationId], references: [id], map: "Inv_wh_fk")
+  company                      Company                      @relation(fields: [companyId], references: [id])
+  customer                     Customer                     @relation(fields: [customerId], references: [id])
+  journalEntry                 JournalEntry?                @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
+  lastAdjustmentJournalEntry   JournalEntry?                @relation("Invoice_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+  updatedByUser                User?                        @relation("User_UpdatedInvoices", fields: [updatedByUserId], references: [id])
+  voidJournalEntry             JournalEntry?                @relation("Invoice_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  voidedByUser                 User?                        @relation("User_VoidedInvoices", fields: [voidedByUserId], references: [id])
+  lines                        InvoiceLine[]
+  payments                     Payment[]
+
+  @@unique([companyId, invoiceNumber])
+  @@index([companyId, invoiceDate])
+  @@index([companyId, status])
+  @@index([companyId, locationId], map: "Inv_co_wh_idx")
+  @@index([locationId], map: "Inv_wh_idx")
+  @@index([customerId], map: "Invoice_customerId_fkey")
+  @@index([lastAdjustmentJournalEntryId], map: "Invoice_lastAdjustmentJournalEntryId_fkey")
+  @@index([updatedByUserId], map: "Invoice_updatedByUserId_fkey")
+  @@index([voidedByUserId], map: "Invoice_voidedByUserId_fkey")
+}
+
+model CreditNote {
+  id                           Int                @id @default(autoincrement())
+  companyId                    Int
+  invoiceId                    Int?
+  customerId                   Int
+  creditNoteNumber             String
+  status                       CreditNoteStatus
+  creditNoteDate               DateTime
+  currency                     String?
+  total                        Decimal            @db.Decimal(18, 2)
+  journalEntryId               Int?               @unique
+  createdAt                    DateTime           @default(now())
+  updatedAt                    DateTime           @updatedAt
+  subtotal                     Decimal            @default(0.00) @db.Decimal(18, 2)
+  taxAmount                    Decimal            @default(0.00) @db.Decimal(18, 2)
+  customerNotes                String?            @db.Text
+  termsAndConditions           String?            @db.Text
+  voidedAt                     DateTime?
+  voidReason                   String?            @db.Text
+  voidedByUserId               Int?
+  voidJournalEntryId           Int?               @unique
+  lastAdjustmentJournalEntryId Int?
+  updatedByUserId              Int?
+  appliedInvoiceId             Int?
+  amountRefunded               Decimal            @default(0.00) @db.Decimal(18, 2)
+  appliedInvoice               Invoice?           @relation("CreditNote_AppliedInvoice", fields: [appliedInvoiceId], references: [id])
+  company                      Company            @relation(fields: [companyId], references: [id])
+  customer                     Customer           @relation(fields: [customerId], references: [id])
+  invoice                      Invoice?           @relation("CreditNote_SourceInvoice", fields: [invoiceId], references: [id])
+  journalEntry                 JournalEntry?      @relation("CreditNote_JournalEntry", fields: [journalEntryId], references: [id])
+  lastAdjustmentJournalEntry   JournalEntry?      @relation("CreditNote_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+  updatedByUser                User?              @relation("User_UpdatedCreditNotes", fields: [updatedByUserId], references: [id])
+  voidJournalEntry             JournalEntry?      @relation("CreditNote_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  voidedByUser                 User?              @relation("User_VoidedCreditNotes", fields: [voidedByUserId], references: [id])
+  lines                        CreditNoteLine[]
+  refunds                      CreditNoteRefund[]
+
+  @@unique([companyId, creditNoteNumber])
+  @@index([companyId, creditNoteDate])
+  @@index([companyId, status])
+  @@index([companyId, invoiceId])
+  @@index([companyId, appliedInvoiceId])
+  @@index([appliedInvoiceId])
+  @@index([customerId], map: "CreditNote_customerId_fkey")
+  @@index([invoiceId], map: "CreditNote_invoiceId_fkey")
+  @@index([lastAdjustmentJournalEntryId], map: "CreditNote_lastAdjustmentJournalEntryId_fkey")
+  @@index([updatedByUserId], map: "CreditNote_updatedByUserId_fkey")
+  @@index([voidedByUserId], map: "CreditNote_voidedByUserId_fkey")
+}
+
+model CreditNoteRefund {
+  id              Int           @id @default(autoincrement())
+  companyId       Int
+  creditNoteId    Int
+  refundDate      DateTime
+  amount          Decimal       @db.Decimal(18, 2)
+  bankAccountId   Int
+  journalEntryId  Int?          @unique
+  reference       String?
+  description     String?       @db.Text
+  createdByUserId Int?
+  createdAt       DateTime      @default(now())
+  bankAccount     Account       @relation("CreditNoteRefund_BankAccount", fields: [bankAccountId], references: [id])
+  company         Company       @relation(fields: [companyId], references: [id])
+  createdByUser   User?         @relation("User_CreatedCreditNoteRefunds", fields: [createdByUserId], references: [id])
+  creditNote      CreditNote    @relation(fields: [creditNoteId], references: [id])
+  journalEntry    JournalEntry? @relation("CreditNoteRefund_JournalEntry", fields: [journalEntryId], references: [id])
+
+  @@index([companyId, refundDate])
+  @@index([companyId, creditNoteId])
+  @@index([bankAccountId], map: "CreditNoteRefund_bankAccountId_fkey")
+  @@index([createdByUserId], map: "CreditNoteRefund_createdByUserId_fkey")
+  @@index([creditNoteId], map: "CreditNoteRefund_creditNoteId_fkey")
+}
+
+model CreditNoteLine {
+  id              Int          @id @default(autoincrement())
+  companyId       Int
+  creditNoteId    Int
+  invoiceLineId   Int?
+  itemId          Int?
+  description     String?
+  quantity        Decimal      @db.Decimal(18, 2)
+  unitPrice       Decimal      @db.Decimal(18, 2)
+  lineTotal       Decimal      @db.Decimal(18, 2)
+  taxRate         Decimal?     @db.Decimal(5, 4)
+  taxAmount       Decimal      @default(0.00) @db.Decimal(18, 2)
+  incomeAccountId Int?
+  discountAmount  Decimal      @default(0.00) @db.Decimal(18, 2)
+  company         Company      @relation(fields: [companyId], references: [id])
+  creditNote      CreditNote   @relation(fields: [creditNoteId], references: [id])
+  incomeAccount   Account?     @relation("CreditNoteLine_IncomeAccount", fields: [incomeAccountId], references: [id])
+  invoiceLine     InvoiceLine? @relation(fields: [invoiceLineId], references: [id])
+  item            Item?        @relation(fields: [itemId], references: [id])
+
+  @@index([companyId])
+  @@index([creditNoteId])
+  @@index([invoiceLineId])
+  @@index([incomeAccountId])
+  @@index([itemId], map: "CreditNoteLine_itemId_fkey")
+}
+
+model InvoiceLine {
+  id              Int              @id @default(autoincrement())
+  invoiceId       Int
+  itemId          Int?
+  description     String?
+  quantity        Decimal          @db.Decimal(18, 2)
+  unitPrice       Decimal          @db.Decimal(18, 2)
+  lineTotal       Decimal          @db.Decimal(18, 2)
+  taxRate         Decimal?         @db.Decimal(5, 4)
+  companyId       Int
+  taxAmount       Decimal          @default(0.00) @db.Decimal(18, 2)
+  incomeAccountId Int?
+  discountAmount  Decimal          @default(0.00) @db.Decimal(18, 2)
+  creditNoteLines CreditNoteLine[]
+  company         Company          @relation(fields: [companyId], references: [id])
+  incomeAccount   Account?         @relation("InvoiceLine_IncomeAccount", fields: [incomeAccountId], references: [id])
+  invoice         Invoice          @relation(fields: [invoiceId], references: [id])
+  item            Item?            @relation(fields: [itemId], references: [id])
+
+  @@index([companyId])
+  @@index([incomeAccountId])
+  @@index([invoiceId], map: "InvoiceLine_invoiceId_fkey")
+  @@index([itemId], map: "InvoiceLine_itemId_fkey")
+}
+
+model Payment {
+  id                     Int           @id @default(autoincrement())
+  companyId              Int
+  invoiceId              Int
+  paymentDate            DateTime
+  amount                 Decimal       @db.Decimal(18, 2)
+  bankAccountId          Int
+  journalEntryId         Int?          @unique
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  reversedAt             DateTime?
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
+  reversedByUserId       Int?
+  attachmentUrl          String?       @db.Text
+  bankAccount            Account       @relation("Payment_BankAccount", fields: [bankAccountId], references: [id])
+  company                Company       @relation(fields: [companyId], references: [id])
+  invoice                Invoice       @relation(fields: [invoiceId], references: [id])
+  journalEntry           JournalEntry? @relation("Payment_JournalEntry", fields: [journalEntryId], references: [id])
+  reversalJournalEntry   JournalEntry? @relation("Payment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUser         User?         @relation("User_ReversedPayments", fields: [reversedByUserId], references: [id])
+
+  @@index([companyId, paymentDate])
+  @@index([invoiceId])
+  @@index([bankAccountId], map: "Payment_bankAccountId_fkey")
+  @@index([reversedByUserId], map: "Payment_reversedByUserId_fkey")
+}
+
+model Vendor {
+  id             Int             @id @default(autoincrement())
+  companyId      Int
+  name           String
+  email          String?
+  phone          String?
+  currency       String?         @db.VarChar(3)
+  openingBalance Decimal?        @db.Decimal(18, 2)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  expenses       Expense[]
+  purchaseBills  PurchaseBill[]
+  purchaseOrders PurchaseOrder[]
+  purchaseReceipts PurchaseReceipt[]
+  company        Company         @relation(fields: [companyId], references: [id])
+  vendorAdvances VendorAdvance[]
+  vendorCredits  VendorCredit[]
+
+  @@index([companyId])
+}
+
+model PurchaseBill {
+  id                           Int                        @id @default(autoincrement())
+  companyId                    Int
+  vendorId                     Int?
+  locationId                   Int                        @map("warehouseId")
+  billNumber                   String
+  status                       PurchaseBillStatus
+  billDate                     DateTime
+  dueDate                      DateTime?
+  currency                     String?
+  total                        Decimal                    @db.Decimal(18, 2)
+  amountPaid                   Decimal                    @default(0.00) @db.Decimal(18, 2)
+  journalEntryId               Int?                       @unique
+  createdAt                    DateTime                   @default(now())
+  updatedAt                    DateTime                   @updatedAt
+  voidedAt                     DateTime?
+  voidReason                   String?                    @db.Text
+  voidedByUserId               Int?
+  voidJournalEntryId           Int?                       @unique
+  lastAdjustmentJournalEntryId Int?
+  updatedByUserId              Int?
+  purchaseReceiptId            Int?                       @unique
+  company                      Company                    @relation(fields: [companyId], references: [id])
+  journalEntry                 JournalEntry?              @relation(fields: [journalEntryId], references: [id])
+  lastAdjustmentJournalEntry   JournalEntry?              @relation("PurchaseBill_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+  updatedByUser                User?                      @relation("User_UpdatedPurchaseBills", fields: [updatedByUserId], references: [id])
+  vendor                       Vendor?                    @relation(fields: [vendorId], references: [id])
+  voidJournalEntry             JournalEntry?              @relation("PurchaseBill_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  voidedByUser                 User?                      @relation("User_VoidedPurchaseBills", fields: [voidedByUserId], references: [id])
+  location                     Location                   @relation(fields: [locationId], references: [id])
+  purchaseReceipt              PurchaseReceipt?           @relation("PurchaseBill_PurchaseReceipt", fields: [purchaseReceiptId], references: [id])
+  lines                        PurchaseBillLine[]
+  landedCostAllocations        PurchaseBillLandedCostAllocation[]
+  payments                     PurchaseBillPayment[]
+  vendorAdvanceApplications    VendorAdvanceApplication[]
+  creditApplications           VendorCreditApplication[]
+
+  @@unique([companyId, billNumber])
+  @@index([companyId, billDate])
+  @@index([companyId, status])
+  @@index([lastAdjustmentJournalEntryId], map: "PurchaseBill_lastAdjustmentJournalEntryId_fkey")
+  @@index([updatedByUserId], map: "PurchaseBill_updatedByUserId_fkey")
+  @@index([vendorId], map: "PurchaseBill_vendorId_fkey")
+  @@index([voidedByUserId], map: "PurchaseBill_voidedByUserId_fkey")
+  @@index([locationId], map: "PurchaseBill_warehouseId_fkey")
+  @@index([purchaseReceiptId])
+}
+
+model PurchaseBillLandedCostAllocation {
+  id                   Int               @id @default(autoincrement())
+  companyId             Int
+  purchaseBillId        Int
+  purchaseReceiptId     Int
+  purchaseReceiptLineId Int
+  amount                Decimal           @db.Decimal(18, 2)
+  createdAt             DateTime          @default(now())
+
+  company              Company            @relation(fields: [companyId], references: [id])
+  purchaseBill         PurchaseBill       @relation(fields: [purchaseBillId], references: [id], onDelete: Cascade)
+  purchaseReceipt      PurchaseReceipt     @relation(fields: [purchaseReceiptId], references: [id], onDelete: Cascade)
+  purchaseReceiptLine  PurchaseReceiptLine @relation(fields: [purchaseReceiptLineId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([purchaseBillId])
+  @@index([purchaseReceiptId])
+  @@index([purchaseReceiptLineId])
+}
+
+enum PurchaseReceiptStatus {
+  DRAFT
+  POSTED
+  VOID
+}
+
+model PurchaseReceipt {
+  id               Int                 @id @default(autoincrement())
+  companyId         Int
+  vendorId          Int?
+  purchaseOrderId   Int?
+  locationId        Int                 @map("warehouseId")
+  receiptNumber     String
+  status            PurchaseReceiptStatus
+  receiptDate       DateTime
+  expectedDate      DateTime?
+  currency          String?             @db.VarChar(3)
+  total             Decimal             @db.Decimal(18, 2)
+  journalEntryId    Int?                @unique
+  voidJournalEntryId Int?               @unique
+  voidedAt          DateTime?
+  voidReason        String?             @db.Text
+  createdByUserId   Int?
+  updatedByUserId   Int?
+  voidedByUserId    Int?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  company        Company            @relation(fields: [companyId], references: [id])
+  vendor         Vendor?            @relation(fields: [vendorId], references: [id])
+  purchaseOrder  PurchaseOrder?     @relation(fields: [purchaseOrderId], references: [id])
+  location       Location           @relation(fields: [locationId], references: [id])
+  journalEntry   JournalEntry?      @relation("PurchaseReceipt_JournalEntry", fields: [journalEntryId], references: [id])
+  voidJournalEntry JournalEntry?    @relation("PurchaseReceipt_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  lines          PurchaseReceiptLine[]
+  billedBy       PurchaseBill?      @relation("PurchaseBill_PurchaseReceipt")
+  landedCostAllocations PurchaseBillLandedCostAllocation[]
+
+  @@unique([companyId, receiptNumber])
+  @@index([companyId, receiptDate])
+  @@index([companyId, status])
+  @@index([vendorId])
+  @@index([purchaseOrderId])
+  @@index([locationId], map: "PurchaseReceipt_warehouseId_fkey")
+}
+
+model PurchaseReceiptLine {
+  id               Int             @id @default(autoincrement())
+  companyId        Int
+  purchaseReceiptId Int
+  locationId       Int             @map("warehouseId")
+  itemId           Int
+  purchaseOrderLineId Int?
+  description      String?
+  quantity         Decimal         @db.Decimal(18, 2)
+  unitCost         Decimal         @db.Decimal(18, 2)
+  discountAmount   Decimal         @default(0.00) @db.Decimal(18, 2)
+  lineTotal        Decimal         @db.Decimal(18, 2)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  company         Company         @relation(fields: [companyId], references: [id])
+  purchaseReceipt PurchaseReceipt @relation(fields: [purchaseReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderLine PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id], onDelete: SetNull)
+  item            Item            @relation(fields: [itemId], references: [id])
+  location        Location        @relation(fields: [locationId], references: [id])
+  landedCostAllocations PurchaseBillLandedCostAllocation[]
+
+  @@index([companyId])
+  @@index([purchaseReceiptId])
+  @@index([companyId, itemId])
+  @@index([purchaseOrderLineId])
+  @@index([itemId], map: "PurchaseReceiptLine_itemId_fkey")
+  @@index([locationId], map: "PurchaseReceiptLine_warehouseId_fkey")
+}
+
+model VendorAdvance {
+  id                  Int                        @id @default(autoincrement())
+  companyId           Int
+  vendorId            Int
+  locationId          Int                        @map("warehouseId")
+  advanceDate         DateTime
+  currency            String?
+  amount              Decimal                    @db.Decimal(18, 2)
+  amountApplied       Decimal                    @default(0.00) @db.Decimal(18, 2)
+  bankAccountId       Int
+  prepaymentAccountId Int
+  receivedVia         BankingAccountKind?
+  reference           String?
+  description         String?                    @db.Text
+  journalEntryId      Int?                       @unique
+  createdByUserId     Int?
+  createdAt           DateTime                   @default(now())
+  updatedAt           DateTime                   @updatedAt
+  bankAccount         Account                    @relation("VendorAdvance_BankAccount", fields: [bankAccountId], references: [id])
+  company             Company                    @relation(fields: [companyId], references: [id])
+  createdByUser       User?                      @relation("User_CreatedVendorAdvances", fields: [createdByUserId], references: [id])
+  journalEntry        JournalEntry?              @relation("VendorAdvance_JournalEntry", fields: [journalEntryId], references: [id])
+  prepaymentAccount   Account                    @relation("VendorAdvance_PrepaymentAccount", fields: [prepaymentAccountId], references: [id])
+  vendor              Vendor                     @relation(fields: [vendorId], references: [id])
+  location            Location                   @relation(fields: [locationId], references: [id])
+  applications        VendorAdvanceApplication[]
+
+  @@index([companyId, advanceDate])
+  @@index([companyId, vendorId])
+  @@index([bankAccountId], map: "VendorAdvance_bankAccountId_fkey")
+  @@index([createdByUserId], map: "VendorAdvance_createdByUserId_fkey")
+  @@index([prepaymentAccountId], map: "VendorAdvance_prepaymentAccountId_fkey")
+  @@index([vendorId], map: "VendorAdvance_vendorId_fkey")
+  @@index([locationId], map: "VendorAdvance_warehouseId_fkey")
+}
+
+model VendorAdvanceApplication {
+  id              Int           @id @default(autoincrement())
+  companyId       Int
+  vendorAdvanceId Int
+  purchaseBillId  Int
+  appliedDate     DateTime
+  amount          Decimal       @db.Decimal(18, 2)
+  journalEntryId  Int?          @unique
+  createdByUserId Int?
+  createdAt       DateTime      @default(now())
+  company         Company       @relation(fields: [companyId], references: [id])
+  createdByUser   User?         @relation("User_CreatedVendorAdvanceApplications", fields: [createdByUserId], references: [id])
+  journalEntry    JournalEntry? @relation("VendorAdvanceApplication_JournalEntry", fields: [journalEntryId], references: [id])
+  purchaseBill    PurchaseBill  @relation(fields: [purchaseBillId], references: [id])
+  vendorAdvance   VendorAdvance @relation(fields: [vendorAdvanceId], references: [id])
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, vendorAdvanceId])
+  @@index([companyId, purchaseBillId])
+  @@index([createdByUserId], map: "VendorAdvanceApplication_createdByUserId_fkey")
+  @@index([purchaseBillId], map: "VendorAdvanceApplication_purchaseBillId_fkey")
+  @@index([vendorAdvanceId], map: "VendorAdvanceApplication_vendorAdvanceId_fkey")
+}
+
+model VendorCredit {
+  id                           Int                       @id @default(autoincrement())
+  companyId                    Int
+  vendorId                     Int?
+  locationId                   Int                       @map("warehouseId")
+  creditNumber                 String
+  status                       VendorCreditStatus
+  creditDate                   DateTime
+  currency                     String?
+  total                        Decimal                   @db.Decimal(18, 2)
+  amountApplied                Decimal                   @default(0.00) @db.Decimal(18, 2)
+  journalEntryId               Int?                      @unique
+  voidedAt                     DateTime?
+  voidReason                   String?                   @db.Text
+  voidedByUserId               Int?
+  voidJournalEntryId           Int?                      @unique
+  lastAdjustmentJournalEntryId Int?
+  updatedByUserId              Int?
+  createdAt                    DateTime                  @default(now())
+  updatedAt                    DateTime                  @updatedAt
+  company                      Company                   @relation(fields: [companyId], references: [id])
+  journalEntry                 JournalEntry?             @relation("VendorCredit_JournalEntry", fields: [journalEntryId], references: [id])
+  lastAdjustmentJournalEntry   JournalEntry?             @relation("VendorCredit_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+  updatedByUser                User?                     @relation("User_UpdatedVendorCredits", fields: [updatedByUserId], references: [id])
+  vendor                       Vendor?                   @relation(fields: [vendorId], references: [id])
+  voidJournalEntry             JournalEntry?             @relation("VendorCredit_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  voidedByUser                 User?                     @relation("User_VoidedVendorCredits", fields: [voidedByUserId], references: [id])
+  location                     Location                  @relation("VendorCredit_Location", fields: [locationId], references: [id])
+  applications                 VendorCreditApplication[]
+  lines                        VendorCreditLine[]
+
+  @@unique([companyId, creditNumber])
+  @@index([companyId, creditDate])
+  @@index([companyId, status])
+  @@index([companyId, vendorId])
+  @@index([lastAdjustmentJournalEntryId], map: "VendorCredit_lastAdjustmentJournalEntryId_fkey")
+  @@index([updatedByUserId], map: "VendorCredit_updatedByUserId_fkey")
+  @@index([vendorId], map: "VendorCredit_vendorId_fkey")
+  @@index([voidedByUserId], map: "VendorCredit_voidedByUserId_fkey")
+  @@index([locationId], map: "VendorCredit_warehouseId_fkey")
+}
+
+model VendorCreditLine {
+  id             Int          @id @default(autoincrement())
+  companyId      Int
+  vendorCreditId Int
+  locationId     Int          @map("warehouseId")
+  itemId         Int
+  accountId      Int?
+  description    String?
+  quantity       Decimal      @db.Decimal(18, 2)
+  unitCost       Decimal      @db.Decimal(18, 2)
+  lineTotal      Decimal      @db.Decimal(18, 2)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @default(now()) @updatedAt
+  account        Account?     @relation("VendorCreditLine_Account", fields: [accountId], references: [id])
+  company        Company      @relation(fields: [companyId], references: [id])
+  item           Item         @relation(fields: [itemId], references: [id])
+  vendorCredit   VendorCredit @relation(fields: [vendorCreditId], references: [id], onDelete: Cascade)
+  location       Location     @relation("VendorCreditLine_Location", fields: [locationId], references: [id])
+
+  @@index([companyId])
+  @@index([vendorCreditId])
+  @@index([companyId, itemId])
+  @@index([accountId], map: "VendorCreditLine_accountId_fkey")
+  @@index([itemId], map: "VendorCreditLine_itemId_fkey")
+  @@index([locationId], map: "VendorCreditLine_warehouseId_fkey")
+}
+
+model VendorCreditApplication {
+  id              Int          @id @default(autoincrement())
+  companyId       Int
+  vendorCreditId  Int
+  purchaseBillId  Int
+  appliedDate     DateTime
+  amount          Decimal      @db.Decimal(18, 2)
+  createdByUserId Int?
+  createdAt       DateTime     @default(now())
+  company         Company      @relation(fields: [companyId], references: [id])
+  createdByUser   User?        @relation("User_CreatedVendorCreditApplications", fields: [createdByUserId], references: [id])
+  purchaseBill    PurchaseBill @relation(fields: [purchaseBillId], references: [id])
+  vendorCredit    VendorCredit @relation(fields: [vendorCreditId], references: [id])
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, vendorCreditId])
+  @@index([companyId, purchaseBillId])
+  @@index([createdByUserId], map: "VendorCreditApplication_createdByUserId_fkey")
+  @@index([purchaseBillId], map: "VendorCreditApplication_purchaseBillId_fkey")
+  @@index([vendorCreditId], map: "VendorCreditApplication_vendorCreditId_fkey")
+}
+
+model CustomerAdvance {
+  id                 Int                          @id @default(autoincrement())
+  companyId          Int
+  customerId         Int
+  locationId         Int                          @map("warehouseId")
+  advanceDate        DateTime
+  currency           String?
+  amount             Decimal                      @db.Decimal(18, 2)
+  amountApplied      Decimal                      @default(0.00) @db.Decimal(18, 2)
+  bankAccountId      Int
+  liabilityAccountId Int
+  receivedVia        BankingAccountKind?
+  reference          String?
+  description        String?                      @db.Text
+  journalEntryId     Int?                         @unique
+  createdByUserId    Int?
+  createdAt          DateTime                     @default(now())
+  updatedAt          DateTime                     @updatedAt
+  bankAccount        Account                      @relation("CustomerAdvance_BankAccount", fields: [bankAccountId], references: [id])
+  company            Company                      @relation(fields: [companyId], references: [id])
+  createdByUser      User?                        @relation("User_CreatedCustomerAdvances", fields: [createdByUserId], references: [id])
+  customer           Customer                     @relation(fields: [customerId], references: [id])
+  journalEntry       JournalEntry?                @relation("CustomerAdvance_JournalEntry", fields: [journalEntryId], references: [id])
+  liabilityAccount   Account                      @relation("CustomerAdvance_LiabilityAccount", fields: [liabilityAccountId], references: [id])
+  location           Location                     @relation("CustomerAdvance_Location", fields: [locationId], references: [id])
+  applications       CustomerAdvanceApplication[]
+
+  @@index([companyId, advanceDate])
+  @@index([companyId, customerId])
+  @@index([bankAccountId], map: "CustomerAdvance_bankAccountId_fkey")
+  @@index([createdByUserId], map: "CustomerAdvance_createdByUserId_fkey")
+  @@index([customerId], map: "CustomerAdvance_customerId_fkey")
+  @@index([liabilityAccountId], map: "CustomerAdvance_liabilityAccountId_fkey")
+  @@index([locationId], map: "CustomerAdvance_warehouseId_fkey")
+}
+
+model CustomerAdvanceApplication {
+  id                Int             @id @default(autoincrement())
+  companyId         Int
+  customerAdvanceId Int
+  invoiceId         Int
+  appliedDate       DateTime
+  amount            Decimal         @db.Decimal(18, 2)
+  journalEntryId    Int?            @unique
+  createdByUserId   Int?
+  createdAt         DateTime        @default(now())
+  company           Company         @relation(fields: [companyId], references: [id])
+  createdByUser     User?           @relation("User_CreatedCustomerAdvanceApplications", fields: [createdByUserId], references: [id])
+  customerAdvance   CustomerAdvance @relation(fields: [customerAdvanceId], references: [id])
+  invoice           Invoice         @relation(fields: [invoiceId], references: [id])
+  journalEntry      JournalEntry?   @relation("CustomerAdvanceApplication_JournalEntry", fields: [journalEntryId], references: [id])
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, customerAdvanceId])
+  @@index([companyId, invoiceId])
+  @@index([createdByUserId], map: "CustomerAdvanceApplication_createdByUserId_fkey")
+  @@index([customerAdvanceId], map: "CustomerAdvanceApplication_customerAdvanceId_fkey")
+  @@index([invoiceId], map: "CustomerAdvanceApplication_invoiceId_fkey")
+}
+
+model PurchaseBillLine {
+  id             Int          @id @default(autoincrement())
+  companyId      Int
+  purchaseBillId Int
+  locationId     Int          @map("warehouseId")
+  itemId         Int
+  description    String?
+  quantity       Decimal      @db.Decimal(18, 2)
+  unitCost       Decimal      @db.Decimal(18, 2)
+  discountAmount Decimal      @default(0.00) @db.Decimal(18, 2)
+  lineTotal      Decimal      @db.Decimal(18, 2)
+  accountId      Int?
+  account        Account?     @relation(fields: [accountId], references: [id])
+  company        Company      @relation(fields: [companyId], references: [id])
+  item           Item         @relation(fields: [itemId], references: [id])
+  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
+  location       Location     @relation(fields: [locationId], references: [id])
+
+  @@index([companyId])
+  @@index([purchaseBillId])
+  @@index([companyId, itemId])
+  @@index([accountId])
+  @@index([itemId], map: "PurchaseBillLine_itemId_fkey")
+  @@index([locationId], map: "PurchaseBillLine_warehouseId_fkey")
+}
+
+model PurchaseBillPayment {
+  id                     Int           @id @default(autoincrement())
+  companyId              Int
+  purchaseBillId         Int
+  paymentDate            DateTime
+  amount                 Decimal       @db.Decimal(18, 2)
+  bankAccountId          Int
+  journalEntryId         Int?          @unique
+  reversedAt             DateTime?
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
+  reversedByUserId       Int?
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  bankAccount            Account       @relation("PurchaseBillPayment_BankAccount", fields: [bankAccountId], references: [id])
+  company                Company       @relation(fields: [companyId], references: [id])
+  journalEntry           JournalEntry? @relation("PurchaseBillPayment_JournalEntry", fields: [journalEntryId], references: [id])
+  purchaseBill           PurchaseBill  @relation(fields: [purchaseBillId], references: [id])
+  reversalJournalEntry   JournalEntry? @relation("PurchaseBillPayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUser         User?         @relation(fields: [reversedByUserId], references: [id])
+
+  @@index([companyId, paymentDate])
+  @@index([purchaseBillId])
+  @@index([bankAccountId], map: "PurchaseBillPayment_bankAccountId_fkey")
+  @@index([reversedByUserId], map: "PurchaseBillPayment_reversedByUserId_fkey")
+}
+
+model Expense {
+  id                           Int              @id @default(autoincrement())
+  companyId                    Int
+  expenseNumber                String
+  status                       ExpenseStatus
+  expenseDate                  DateTime
+  description                  String
+  amount                       Decimal          @db.Decimal(18, 2)
+  currency                     String?
+  itemId                       Int?
+  journalEntryId               Int?             @unique
+  createdAt                    DateTime         @default(now())
+  updatedAt                    DateTime         @updatedAt
+  vendorId                     Int?
+  dueDate                      DateTime?
+  amountPaid                   Decimal          @default(0.00) @db.Decimal(18, 2)
+  expenseAccountId             Int?
+  voidedAt                     DateTime?
+  voidReason                   String?          @db.Text
+  voidedByUserId               Int?
+  voidJournalEntryId           Int?             @unique
+  lastAdjustmentJournalEntryId Int?
+  updatedByUserId              Int?
+  attachmentUrl                String?          @db.Text
+  company                      Company          @relation(fields: [companyId], references: [id])
+  expenseAccount               Account?         @relation("Expense_ExpenseAccount", fields: [expenseAccountId], references: [id])
+  item                         Item?            @relation(fields: [itemId], references: [id])
+  journalEntry                 JournalEntry?    @relation("Expense_JournalEntry", fields: [journalEntryId], references: [id])
+  lastAdjustmentJournalEntry   JournalEntry?    @relation("Expense_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
+  updatedByUser                User?            @relation("User_UpdatedExpenses", fields: [updatedByUserId], references: [id])
+  vendor                       Vendor?          @relation(fields: [vendorId], references: [id])
+  voidJournalEntry             JournalEntry?    @relation("Expense_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
+  voidedByUser                 User?            @relation("User_VoidedExpenses", fields: [voidedByUserId], references: [id])
+  payments                     ExpensePayment[]
+
+  @@unique([companyId, expenseNumber])
+  @@index([companyId, expenseDate])
+  @@index([companyId, status])
+  @@index([expenseAccountId])
+  @@index([itemId], map: "Expense_itemId_fkey")
+  @@index([lastAdjustmentJournalEntryId], map: "Expense_lastAdjustmentJournalEntryId_fkey")
+  @@index([updatedByUserId], map: "Expense_updatedByUserId_fkey")
+  @@index([vendorId])
+  @@index([voidedByUserId], map: "Expense_voidedByUserId_fkey")
+}
+
+model ExpensePayment {
+  id                     Int           @id @default(autoincrement())
+  companyId              Int
+  expenseId              Int
+  paymentDate            DateTime
+  amount                 Decimal       @db.Decimal(18, 2)
+  bankAccountId          Int
+  journalEntryId         Int?          @unique
+  reversedAt             DateTime?
+  reversalReason         String?       @db.Text
+  reversalJournalEntryId Int?          @unique
+  reversedByUserId       Int?
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  bankAccount            Account       @relation("ExpensePayment_BankAccount", fields: [bankAccountId], references: [id])
+  company                Company       @relation(fields: [companyId], references: [id])
+  expense                Expense       @relation(fields: [expenseId], references: [id])
+  journalEntry           JournalEntry? @relation("ExpensePayment_JournalEntry", fields: [journalEntryId], references: [id])
+  reversalJournalEntry   JournalEntry? @relation("ExpensePayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
+  reversedByUser         User?         @relation("User_ReversedExpensePayments", fields: [reversedByUserId], references: [id])
+
+  @@index([companyId, paymentDate])
+  @@index([expenseId])
+  @@index([bankAccountId], map: "ExpensePayment_bankAccountId_fkey")
+  @@index([reversedByUserId], map: "ExpensePayment_reversedByUserId_fkey")
+}
+
+model User {
+  id                                 Int                          @id @default(autoincrement())
+  email                              String                       @unique
+  password                           String
+  name                               String?
+  companyId                          Int
+  createdAt                          DateTime                     @default(now())
+  updatedAt                          DateTime                     @updatedAt
+  role                               UserRole                     @default(OWNER)
+  phone                              String?                      @unique @db.VarChar(32)
+  phoneVerifiedAt                    DateTime?
+  auditLogs                          AuditLog[]
+  updatedCreditNotes                 CreditNote[]                 @relation("User_UpdatedCreditNotes")
+  voidedCreditNotes                  CreditNote[]                 @relation("User_VoidedCreditNotes")
+  creditNoteRefundsCreated           CreditNoteRefund[]           @relation("User_CreatedCreditNoteRefunds")
+  customerAdvancesCreated            CustomerAdvance[]            @relation("User_CreatedCustomerAdvances")
+  customerAdvanceApplicationsCreated CustomerAdvanceApplication[] @relation("User_CreatedCustomerAdvanceApplications")
+  updatedExpenses                    Expense[]                    @relation("User_UpdatedExpenses")
+  voidedExpenses                     Expense[]                    @relation("User_VoidedExpenses")
+  reversedExpensePayments            ExpensePayment[]             @relation("User_ReversedExpensePayments")
+  updatedInvoices                    Invoice[]                    @relation("User_UpdatedInvoices")
+  voidedInvoices                     Invoice[]                    @relation("User_VoidedInvoices")
+  journalEntriesCreated              JournalEntry[]
+  updatedJournalEntries              JournalEntry[]               @relation("User_UpdatedJournalEntries")
+  voidedJournalEntries               JournalEntry[]               @relation("User_VoidedJournalEntries")
+  reversedPayments                   Payment[]                    @relation("User_ReversedPayments")
+  periodClosesCreated                PeriodClose[]                @relation("User_PeriodClosesCreated")
+  updatedPurchaseBills               PurchaseBill[]               @relation("User_UpdatedPurchaseBills")
+  voidedPurchaseBills                PurchaseBill[]               @relation("User_VoidedPurchaseBills")
+  reversedPurchaseBillPayments       PurchaseBillPayment[]
+  company                            Company                      @relation(fields: [companyId], references: [id])
+  vendorAdvancesCreated              VendorAdvance[]              @relation("User_CreatedVendorAdvances")
+  vendorAdvanceApplicationsCreated   VendorAdvanceApplication[]   @relation("User_CreatedVendorAdvanceApplications")
+  updatedVendorCredits               VendorCredit[]               @relation("User_UpdatedVendorCredits")
+  voidedVendorCredits                VendorCredit[]               @relation("User_VoidedVendorCredits")
+  vendorCreditApplicationsCreated    VendorCreditApplication[]    @relation("User_CreatedVendorCreditApplications")
+
+  @@index([companyId])
+}
+
+model LoginOtp {
+  id          Int       @id @default(autoincrement())
+  phone       String    @db.VarChar(32)
+  codeHash    String
+  purpose     String    @db.VarChar(32)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  attempts    Int       @default(0)
+  requestedIp String?   @db.VarChar(64)
+  verifiedIp  String?   @db.VarChar(64)
+  createdAt   DateTime  @default(now())
+
+  @@index([phone, purpose, createdAt])
+  @@index([phone, purpose, expiresAt])
+}
+
+model AuditLog {
+  id             Int      @id @default(autoincrement())
+  companyId      Int
+  userId         Int?
+  action         String
+  entityType     String
+  entityId       String?
+  idempotencyKey String?
+  correlationId  String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  company        Company  @relation(fields: [companyId], references: [id])
+  user           User?    @relation(fields: [userId], references: [id])
+
+  @@index([companyId, createdAt])
+  @@index([companyId, entityType, entityId])
+  @@index([companyId, userId, createdAt])
+  @@index([userId], map: "AuditLog_userId_fkey")
+}
+
+model PeriodClose {
+  id              Int          @id @default(autoincrement())
+  companyId       Int
+  fromDate        DateTime
+  toDate          DateTime
+  journalEntryId  Int          @unique
+  createdByUserId Int?
+  createdAt       DateTime     @default(now())
+  company         Company      @relation(fields: [companyId], references: [id])
+  createdByUser   User?        @relation("User_PeriodClosesCreated", fields: [createdByUserId], references: [id])
+  journalEntry    JournalEntry @relation(fields: [journalEntryId], references: [id])
+
+  @@unique([companyId, fromDate, toDate])
+  @@index([companyId, toDate])
+  @@index([createdByUserId], map: "PeriodClose_createdByUserId_fkey")
+}
+
+// --- Backdated inventory recalculation state (per company) ---
+// Coalesces repeated "recalc requested" events into a single cursor.
+model InventoryRecalcState {
+  companyId         Int      @id
+  requestedFromDate DateTime?
+  requestedAt       DateTime?
+  runningAt         DateTime?
+  lockedAt          DateTime?
+  lockId            String?  @db.VarChar(64)
+  attempts          Int      @default(0)
+  lastError         String?  @db.Text
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([requestedAt])
+  @@index([runningAt])
+  @@index([lockedAt])
+}
+
+// Tracks the net COGS/inventory adjustment applied by the inventory revaluation pipeline
+// for a given source journal entry. This makes revaluation idempotent across retries.
+model JournalEntryInventoryValuation {
+  id                 Int      @id @default(autoincrement())
+  companyId           Int
+  sourceJournalEntryId Int
+  lastComputedCogs    Decimal  @default(0.00) @db.Decimal(18, 2)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  company          Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  sourceJournalEntry JournalEntry @relation(fields: [sourceJournalEntryId], references: [id], onDelete: Restrict)
+
+  @@unique([companyId, sourceJournalEntryId], map: "JEIV_uq")
+  @@index([companyId], map: "JEIV_companyId_idx")
+  @@index([sourceJournalEntryId], map: "JEIV_sourceJeId_idx")
+}
+
+model IdempotentRequest {
+  id        Int      @id @default(autoincrement())
+  companyId Int
+  key       String
+  response  Json
+  createdAt DateTime @default(now())
+  company   Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, key])
+  @@index([companyId, createdAt])
+}
+
+model DocumentSequence {
+  id         Int      @id @default(autoincrement())
+  companyId  Int
+  key        String
+  nextNumber Int      @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  company    Company  @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, key])
+  @@index([companyId])
+}
+
+model TaxRate {
+  id               Int              @id @default(autoincrement())
+  companyId        Int
+  name             String
+  rate             Decimal          @db.Decimal(5, 4)
+  isCompound       Boolean          @default(false)
+  isActive         Boolean          @default(true)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  groupMemberships TaxGroupMember[]
+  company          Company          @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model TaxGroup {
+  id        Int              @id @default(autoincrement())
+  companyId Int
+  name      String
+  totalRate Decimal          @db.Decimal(5, 4)
+  isActive  Boolean          @default(true)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  company   Company          @relation(fields: [companyId], references: [id])
+  members   TaxGroupMember[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model TaxGroupMember {
+  id        Int      @id @default(autoincrement())
+  groupId   Int
+  taxRateId Int
+  createdAt DateTime @default(now())
+  group     TaxGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  taxRate   TaxRate  @relation(fields: [taxRateId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, taxRateId])
+  @@index([groupId])
+  @@index([taxRateId])
+}
+
+model IntegrationEntityMap {
+  id          Int      @id @default(autoincrement())
+  companyId   Int
+  integration String   @db.VarChar(32)
+  entityType  String   @db.VarChar(32)
+  externalId  String   @db.VarChar(128)
+  internalId  String   @db.VarChar(128)
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  company     Company  @relation(fields: [companyId], references: [id], map: "IEM_companyId_fkey")
+
+  @@unique([companyId, integration, entityType, externalId], map: "IEM_uq")
+  @@index([companyId, integration, entityType], map: "IEM_idx")
+}
+
+model Currency {
+  id            Int            @id @default(autoincrement())
+  companyId     Int
+  code          String         @db.VarChar(3)
+  name          String?
+  symbol        String?        @db.VarChar(16)
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  exchangeRates ExchangeRate[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+}
+
+model ExchangeRate {
+  id           Int      @id @default(autoincrement())
+  companyId    Int
+  currencyId   Int
+  baseCurrency String   @db.VarChar(3)
+  rateToBase   Decimal  @db.Decimal(18, 8)
+  asOfDate     DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  currency     Currency @relation(fields: [currencyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, currencyId, asOfDate])
+  @@index([companyId, currencyId, asOfDate])
+  @@index([companyId, asOfDate])
+  @@index([currencyId], map: "ExchangeRate_currencyId_fkey")
+}
+
 enum AccountType {
   ASSET
   LIABILITY
@@ -20,23 +1411,16 @@ enum NormalBalance {
   CREDIT
 }
 
-// Optional taxonomy used by Reporting v1 (Trial Balance, P&L, Cashflow later).
-// Keep this small initially; we can expand safely later.
 enum AccountReportGroup {
-  // Balance sheet groupings (working capital + structure)
   CASH_AND_CASH_EQUIVALENTS
   ACCOUNTS_RECEIVABLE
   INVENTORY
   OTHER_CURRENT_ASSET
   FIXED_ASSET
-
   ACCOUNTS_PAYABLE
   OTHER_CURRENT_LIABILITY
   LONG_TERM_LIABILITY
-
   EQUITY
-
-  // P&L groupings
   SALES_REVENUE
   OTHER_INCOME
   COGS
@@ -108,6 +1492,7 @@ enum StockMoveType {
   PURCHASE_RETURN
   TRANSFER_OUT
   TRANSFER_IN
+  VALUE_ADJUSTMENT
 }
 
 enum StockMoveDirection {
@@ -124,1376 +1509,72 @@ enum PurchaseBillStatus {
   VOID
 }
 
+enum PurchaseOrderStatus {
+  DRAFT
+  APPROVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id            Int                @id @default(autoincrement())
+  companyId     Int
+  vendorId      Int?
+  locationId    Int                @map("warehouseId")
+  poNumber      String
+  status        PurchaseOrderStatus
+  orderDate     DateTime
+  expectedDate  DateTime?
+  currency      String?            @db.VarChar(3)
+  total         Decimal            @db.Decimal(18, 2)
+  notes         String?            @db.Text
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  createdByUserId Int?
+  updatedByUserId Int?
+
+  company       Company            @relation(fields: [companyId], references: [id])
+  vendor        Vendor?            @relation(fields: [vendorId], references: [id])
+  location      Location           @relation(fields: [locationId], references: [id])
+  lines         PurchaseOrderLine[]
+  purchaseReceipts PurchaseReceipt[]
+
+  @@unique([companyId, poNumber])
+  @@index([companyId, orderDate])
+  @@index([companyId, status])
+  @@index([vendorId], map: "PurchaseOrder_vendorId_fkey")
+  @@index([locationId], map: "PurchaseOrder_warehouseId_fkey")
+}
+
+model PurchaseOrderLine {
+  id              Int          @id @default(autoincrement())
+  companyId       Int
+  purchaseOrderId Int
+  locationId      Int          @map("warehouseId")
+  itemId          Int
+  description     String?
+  quantity        Decimal      @db.Decimal(18, 2)
+  unitCost        Decimal      @db.Decimal(18, 2)
+  discountAmount  Decimal      @default(0.00) @db.Decimal(18, 2)
+  lineTotal       Decimal      @db.Decimal(18, 2)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  company         Company      @relation(fields: [companyId], references: [id])
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  item            Item         @relation(fields: [itemId], references: [id])
+  location        Location     @relation(fields: [locationId], references: [id])
+  receiptLines    PurchaseReceiptLine[]
+
+  @@index([companyId])
+  @@index([purchaseOrderId])
+  @@index([companyId, itemId])
+  @@index([itemId], map: "PurchaseOrderLine_itemId_fkey")
+  @@index([locationId], map: "PurchaseOrderLine_warehouseId_fkey")
+}
+
 enum VendorCreditStatus {
   DRAFT
   APPROVED
   POSTED
   VOID
-}
-
-model Company {
-  id                   Int                   @id @default(autoincrement())
-  name                 String
-  // Invoice print/template customization (simple JSON blob; evolve with versioning).
-  invoiceTemplate      Json?
-  // Payment method QR codes for customer self-service payments.
-  // JSON: { kbz?: string, ayaPay?: string, uabPay?: string, aPlus?: string }
-  paymentQrCodes       Json?
-  // --- Company profile / reporting preferences ---
-  // Base currency for the tenant. Treat as immutable after transactions exist.
-  baseCurrency         String? // e.g. "MMK"
-  // IANA timezone name (preferred), e.g. "Asia/Yangon"
-  timeZone             String? // affects display + date boundaries for reporting
-  // Fiscal year start month (1-12). If null, assume January.
-  fiscalYearStartMonth Int?                  @default(1)
-  accounts             Account[]
-  entries              JournalEntry[]
-  events               Event[]
-  summaries            DailySummary[]
-  accountBalances      AccountBalance[]
-  customers            Customer[]
-  vendors              Vendor[]
-  items                Item[]
-  invoices             Invoice[]
-  payments             Payment[]
-  creditNotes          CreditNote[]
-  expenses             Expense[]
-  expensePayments      ExpensePayment[]
-  users                User[]
-  auditLogs            AuditLog[]
-  journalLines         JournalLine[]
-  processedEvents      ProcessedEvent[]
-  invoiceLines         InvoiceLine[]
-  creditNoteLines      CreditNoteLine[]
-  bankingAccounts      BankingAccount[]
-  locations            Location[]
-  stockBalances        StockBalance[]
-  stockMoves           StockMove[]
-  purchaseBills        PurchaseBill[]
-  purchaseBillLines    PurchaseBillLine[]
-  purchaseBillPayments PurchaseBillPayment[]
-  vendorCredits        VendorCredit[]
-  vendorCreditLines    VendorCreditLine[]
-  vendorCreditApplications VendorCreditApplication[]
-  customerAdvances     CustomerAdvance[]
-  customerAdvanceApplications CustomerAdvanceApplication[]
-  // Reference-only currencies + exchange rates (Option 1)
-  currencies           Currency[]
-  exchangeRates        ExchangeRate[]
-
-  // Default account settings for this company (multi-tenant safe).
-  // Used when posting invoices (Debit AR).
-  accountsReceivableAccountId Int?
-  accountsReceivableAccount   Account? @relation("Company_AR", fields: [accountsReceivableAccountId], references: [id])
-
-  // Default Accounts Payable account (LIABILITY). Used when posting bills/expenses (Credit AP).
-  accountsPayableAccountId Int?
-  accountsPayableAccount   Account? @relation("Company_AP", fields: [accountsPayableAccountId], references: [id])
-
-  // --- Inventory settings (V1) ---
-  // Default Inventory asset account (ASSET, reportGroup = INVENTORY).
-  inventoryAssetAccountId Int?
-  inventoryAssetAccount   Account? @relation("Company_InventoryAsset", fields: [inventoryAssetAccountId], references: [id])
-
-  // Default COGS account (EXPENSE, reportGroup = COGS).
-  cogsAccountId Int?
-  cogsAccount   Account? @relation("Company_COGS", fields: [cogsAccountId], references: [id])
-
-  // Opening balance equity account (EQUITY). Used when setting opening stock.
-  openingBalanceEquityAccountId Int?
-  openingBalanceEquityAccount   Account? @relation("Company_OpeningEquity", fields: [openingBalanceEquityAccountId], references: [id])
-
-  // Default location for inventory operations.
-  defaultLocationId Int?       @map("defaultWarehouseId")
-  defaultLocation   Location?  @relation("Company_DefaultLocation", fields: [defaultLocationId], references: [id])
-
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  idempotentRequests IdempotentRequest[]
-  periodCloses       PeriodClose[]
-  documentSequences  DocumentSequence[]
-  taxRates           TaxRate[]
-  taxGroups          TaxGroup[]
-
-  // Integrations mapping (external IDs <-> internal IDs)
-  integrationEntityMaps IntegrationEntityMap[]
-}
-
-model Account {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  code String // e.g. "1000", "4100"
-  name String // e.g. "Cash on Hand"
-  type AccountType
-
-  // Reporting semantics:
-  // - normalBalance: how the account "normally" carries a balance (used for Trial Balance presentation)
-  // - reportGroup: optional classification for P&L and Cashflow statement logic
-  // - cashflowActivity: optional mapping (Operating/Investing/Financing) for Cashflow statement v1+
-  normalBalance    NormalBalance       @default(DEBIT)
-  reportGroup      AccountReportGroup?
-  cashflowActivity CashflowActivity?
-
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  lines    JournalLine[]
-  balances AccountBalance[]
-
-  // Books layer relations
-  accountsReceivableFor   Company[]             @relation("Company_AR")
-  accountsPayableFor      Company[]             @relation("Company_AP")
-  inventoryAssetFor       Company[]             @relation("Company_InventoryAsset")
-  cogsFor                 Company[]             @relation("Company_COGS")
-  openingBalanceEquityFor Company[]             @relation("Company_OpeningEquity")
-  incomeItems             Item[]                @relation("Account_IncomeItems")
-  expenseItems            Item[]                @relation("Account_ExpenseItems")
-  bankPayments            Payment[]             @relation("Payment_BankAccount")
-  bankExpensePayments     ExpensePayment[]      @relation("ExpensePayment_BankAccount")
-  bankingAccount          BankingAccount?
-  expenses                Expense[]             @relation("Expense_ExpenseAccount")
-  purchaseBillLines       PurchaseBillLine[]
-  purchaseBillPayments    PurchaseBillPayment[] @relation("PurchaseBillPayment_BankAccount")
-  vendorCreditLines       VendorCreditLine[]    @relation("VendorCreditLine_Account")
-  customerAdvanceBankMovements      CustomerAdvance[] @relation("CustomerAdvance_BankAccount")
-  customerAdvanceLiabilityMovements CustomerAdvance[] @relation("CustomerAdvance_LiabilityAccount")
-
-  // Income account mapping on document lines (required opposite relations for Prisma named relations)
-  invoiceLinesIncome    InvoiceLine[]    @relation("InvoiceLine_IncomeAccount")
-  creditNoteLinesIncome CreditNoteLine[] @relation("CreditNoteLine_IncomeAccount")
-
-  @@unique([companyId, code]) // one code per company
-}
-
-// Daily per-account totals. Used to generate Balance Sheet quickly.
-// This is maintained by the worker when journal entries are posted.
-model AccountBalance {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  accountId Int
-  account   Account @relation(fields: [accountId], references: [id])
-
-  // Store the "day" (00:00 time) here. Balances are per-day increments.
-  date DateTime
-
-  debitTotal  Decimal @db.Decimal(18, 2)
-  creditTotal Decimal @db.Decimal(18, 2)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, accountId, date])
-  @@index([companyId, date])
-  @@index([companyId, accountId])
-}
-
-model BankingAccount {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  // Each banking account maps 1:1 to a Chart of Accounts Account (ASSET).
-  accountId Int     @unique
-  account   Account @relation(fields: [accountId], references: [id])
-
-  kind BankingAccountKind
-
-  bankName       String?
-  accountNumber  String?
-  identifierCode String?
-  branch         String?
-  description    String? @db.Text
-  isPrimary      Boolean @default(false)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId])
-}
-
-model JournalEntry {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  // Optional location tagging (replaces the old "Warehouse as Branch" concept).
-  // Used for reporting/filtering without affecting double-entry correctness.
-  locationId Int?       @map("warehouseId")
-  location   Location?  @relation(fields: [locationId], references: [id])
-
-  // Gapless, audit-friendly journal entry number (distinct from PK id).
-  // Allocated atomically inside the posting transaction using DocumentSequence
-  // (per company per year).
-  entryNumber String @db.VarChar(32)
-
-  date        DateTime
-  description String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  // Audit trail: who created this entry (nullable for system/integration jobs)
-  createdByUserId Int?
-  createdByUser   User? @relation(fields: [createdByUserId], references: [id])
-
-  // Immutable ledger semantics:
-  // - Journal entries should never be edited after creation (use reversal/adjustment).
-  // - Reversal links back to the original entry.
-  postedAt                 DateTime      @default(now())
-  reversalOfJournalEntryId Int?          @unique
-  reversalOfJournalEntry   JournalEntry? @relation("JournalEntry_Reversal", fields: [reversalOfJournalEntryId], references: [id])
-  reversalEntry            JournalEntry? @relation("JournalEntry_Reversal")
-  reversalReason           String?       @db.Text
-
-  // Soft-void metadata (does NOT modify lines; used to mark an entry as voided via reversal).
-  voidedAt       DateTime?
-  voidReason     String?   @db.Text
-  voidedByUserId Int?
-  voidedByUser   User?     @relation("User_VoidedJournalEntries", fields: [voidedByUserId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedJournalEntries", fields: [updatedByUserId], references: [id])
-
-  lines JournalLine[]
-
-  // Documents that created this journal entry (optional)
-  invoice                       Invoice?             @relation("Invoice_JournalEntry")
-  invoiceVoidFor                Invoice?             @relation("Invoice_VoidJournalEntry")
-  invoiceLastAdjustmentFor      Invoice[]            @relation("Invoice_LastAdjustmentJournalEntry")
-  payment                       Payment?             @relation("Payment_JournalEntry")
-  paymentReversal               Payment?             @relation("Payment_ReversalJournalEntry")
-  expense                       Expense?             @relation("Expense_JournalEntry")
-  expenseVoidFor                Expense?             @relation("Expense_VoidJournalEntry")
-  expenseLastAdjustmentFor      Expense[]            @relation("Expense_LastAdjustmentJournalEntry")
-  expensePayment                ExpensePayment?      @relation("ExpensePayment_JournalEntry")
-  expensePaymentReversal        ExpensePayment?      @relation("ExpensePayment_ReversalJournalEntry")
-  purchaseBill                  PurchaseBill?
-  purchaseBillVoidFor           PurchaseBill?        @relation("PurchaseBill_VoidJournalEntry")
-  purchaseBillLastAdjustmentFor PurchaseBill[]       @relation("PurchaseBill_LastAdjustmentJournalEntry")
-  purchaseBillPayment           PurchaseBillPayment? @relation("PurchaseBillPayment_JournalEntry")
-  purchaseBillPaymentReversal   PurchaseBillPayment? @relation("PurchaseBillPayment_ReversalJournalEntry")
-  creditNote                    CreditNote?          @relation("CreditNote_JournalEntry")
-  creditNoteVoidFor             CreditNote?          @relation("CreditNote_VoidJournalEntry")
-  creditNoteLastAdjustmentFor   CreditNote[]         @relation("CreditNote_LastAdjustmentJournalEntry")
-  vendorCredit                  VendorCredit?        @relation("VendorCredit_JournalEntry")
-  vendorCreditVoidFor           VendorCredit?        @relation("VendorCredit_VoidJournalEntry")
-  vendorCreditLastAdjustmentFor VendorCredit[]       @relation("VendorCredit_LastAdjustmentJournalEntry")
-  customerAdvance               CustomerAdvance?     @relation("CustomerAdvance_JournalEntry")
-  customerAdvanceApplication    CustomerAdvanceApplication? @relation("CustomerAdvanceApplication_JournalEntry")
-  periodClose                   PeriodClose?
-
-  @@unique([companyId, entryNumber])
-  @@index([companyId, date])
-  @@index([companyId, locationId])
-  @@index([locationId])
-}
-
-model JournalLine {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  journalEntryId Int
-  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id])
-
-  accountId Int
-  account   Account @relation(fields: [accountId], references: [id])
-
-  debit  Decimal @db.Decimal(18, 2)
-  credit Decimal @db.Decimal(18, 2)
-
-  @@index([companyId])
-}
-
-model Event {
-  id        Int      @id @default(autoincrement())
-  companyId Int?
-  company   Company? @relation(fields: [companyId], references: [id])
-
-  eventId       String   @unique // same ID we publish to Pub/Sub
-  eventType     String // e.g. "journal.entry.created"
-  schemaVersion String // e.g. "v1"
-  occurredAt    DateTime @default(now())
-  source        String? // e.g. "cashflow-api"
-
-  // --- Event envelope metadata (Step 1) ---
-  partitionKey  String? // recommended: String(companyId)
-  correlationId String? // recommended: eventId for first event in flow
-  causationId   String?
-  aggregateType String? // e.g. "JournalEntry"
-  aggregateId   String? // e.g. "123"
-
-  // --- Outbox fields (Step 2) ---
-  publishedAt          DateTime?
-  nextPublishAttemptAt DateTime? @default(now())
-  publishAttempts      Int       @default(0)
-  lastPublishError     String?   @db.Text
-  lockedAt             DateTime?
-  lockId               String?
-
-  type      String // e.g. "JournalEntryCreated"
-  payload   Json // flexible JSON payload
-  createdAt DateTime @default(now())
-
-  @@index([publishedAt, nextPublishAttemptAt])
-  @@index([lockedAt])
-  @@index([companyId, occurredAt])
-}
-
-model ProcessedEvent {
-  id          Int      @id @default(autoincrement())
-  eventId     String   @unique
-  companyId   Int
-  company     Company  @relation(fields: [companyId], references: [id])
-  processedAt DateTime @default(now())
-
-  @@index([companyId])
-}
-
-model DailySummary {
-  id           Int      @id @default(autoincrement())
-  companyId    Int
-  company      Company  @relation(fields: [companyId], references: [id])
-  date         DateTime // we will store "day" (00:00 time) here
-  totalIncome  Decimal  @db.Decimal(18, 2)
-  totalExpense Decimal  @db.Decimal(18, 2)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  @@unique([companyId, date])
-}
-
-// --- Books layer (documents on top of ledger) ---
-
-model Customer {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name           String
-  email          String?
-  phone          String?
-  currency       String? // e.g. "MMK"
-  openingBalance Decimal? @db.Decimal(18, 2)
-
-  invoices    Invoice[]
-  creditNotes CreditNote[]
-  customerAdvances CustomerAdvance[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId])
-}
-
-model Item {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name         String
-  sku          String?
-  type         ItemType
-  sellingPrice Decimal  @db.Decimal(18, 2)
-  costPrice    Decimal? @db.Decimal(18, 2)
-
-  // Inventory tracking (V1). Only meaningful for GOODS.
-  trackInventory     Boolean                  @default(false)
-  valuationMethod    InventoryValuationMethod @default(WAC)
-  defaultLocationId Int?      @map("defaultWarehouseId")
-  defaultLocation   Location? @relation(fields: [defaultLocationId], references: [id])
-
-  // Revenue account for sales (should be INCOME)
-  incomeAccountId Int
-  incomeAccount   Account @relation("Account_IncomeItems", fields: [incomeAccountId], references: [id])
-
-  // Optional expense account for COGS later
-  expenseAccountId Int?
-  expenseAccount   Account? @relation("Account_ExpenseItems", fields: [expenseAccountId], references: [id])
-
-  isActive          Boolean            @default(true)
-  invoiceLines      InvoiceLine[]
-  creditNoteLines   CreditNoteLine[]
-  expenses          Expense[]
-  stockBalances     StockBalance[]
-  stockMoves        StockMove[]
-  purchaseBillLines PurchaseBillLine[]
-  vendorCreditLines VendorCreditLine[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId])
-}
-
-model Location {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name      String
-  isDefault Boolean @default(false)
-
-  items               Item[]
-  stockBalances       StockBalance[]
-  stockMoves          StockMove[]
-  purchaseBills       PurchaseBill[]
-  purchaseBillLines   PurchaseBillLine[]
-  defaultForCompanies Company[]          @relation("Company_DefaultLocation")
-  invoices            Invoice[]
-  journalEntries      JournalEntry[]
-  vendorCredits       VendorCredit[]     @relation("VendorCredit_Location")
-  vendorCreditLines   VendorCreditLine[] @relation("VendorCreditLine_Location")
-  customerAdvances    CustomerAdvance[]  @relation("CustomerAdvance_Location")
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, name])
-  @@index([companyId])
-  @@map("Warehouse")
-}
-
-model StockBalance {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  locationId Int      @map("warehouseId")
-  location   Location @relation(fields: [locationId], references: [id])
-
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
-
-  // Accounting stock (V1): qty + weighted-average valuation
-  qtyOnHand      Decimal @db.Decimal(18, 2)
-  avgUnitCost    Decimal @db.Decimal(18, 2)
-  inventoryValue Decimal @db.Decimal(18, 2)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, locationId, itemId])
-  @@index([companyId, itemId])
-  @@index([companyId, locationId])
-}
-
-model StockMove {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  locationId Int      @map("warehouseId")
-  location   Location @relation(fields: [locationId], references: [id])
-
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
-
-  date      DateTime
-  type      StockMoveType
-  direction StockMoveDirection
-  quantity  Decimal            @db.Decimal(18, 2)
-
-  // Cost applied for this move (audit).
-  unitCostApplied  Decimal @db.Decimal(18, 2)
-  totalCostApplied Decimal @db.Decimal(18, 2)
-
-  referenceType   String?
-  referenceId     String?
-  correlationId   String?
-  createdByUserId Int?
-
-  // Link to GL posting (optional but helpful)
-  journalEntryId Int?
-
-  createdAt DateTime @default(now())
-
-  @@index([companyId, date])
-  @@index([companyId, itemId])
-  @@index([companyId, locationId])
-}
-
-model Invoice {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  customerId Int
-  customer   Customer @relation(fields: [customerId], references: [id])
-
-  // Optional location tagging.
-  locationId Int?       @map("warehouseId")
-  location   Location?  @relation(fields: [locationId], references: [id])
-
-  invoiceNumber      String
-  status             InvoiceStatus
-  invoiceDate        DateTime
-  dueDate            DateTime?
-  currency           String?
-  // Amounts:
-  // - subtotal: sum of line subtotals (qty * unitPrice)
-  // - taxAmount: sum of line taxes (subtotal * taxRate)
-  // - total: subtotal + taxAmount
-  subtotal           Decimal       @default(0) @db.Decimal(18, 2)
-  taxAmount          Decimal       @default(0) @db.Decimal(18, 2)
-  total              Decimal       @db.Decimal(18, 2) // recomputed and stored when posted
-  // Free-form text blocks shown on the printed invoice (like Zoho-style Customer Notes / Terms).
-  customerNotes      String?       @db.Text
-  termsAndConditions String?       @db.Text
-  // Denormalized for performance (avoid summing Payment table on every payment record).
-  amountPaid         Decimal       @default(0) @db.Decimal(18, 2)
-
-  // Customer-submitted payment proofs (before payment is recorded by owner).
-  // JSON array: [{ url: string, submittedAt: string, note?: string }]
-  pendingPaymentProofs Json?
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("Invoice_JournalEntry", fields: [journalEntryId], references: [id])
-
-  // Void/cancel metadata (immutable ledger: void uses a reversal JE)
-  voidedAt           DateTime?
-  voidReason         String?       @db.Text
-  voidedByUserId     Int?
-  voidedByUser       User?         @relation("User_VoidedInvoices", fields: [voidedByUserId], references: [id])
-  voidJournalEntryId Int?          @unique
-  voidJournalEntry   JournalEntry? @relation("Invoice_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
-
-  // Posted edit support: store the latest adjustment JE id (audit trail still lives in AuditLog).
-  lastAdjustmentJournalEntryId Int?
-  lastAdjustmentJournalEntry   JournalEntry? @relation("Invoice_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedInvoices", fields: [updatedByUserId], references: [id])
-
-  lines       InvoiceLine[]
-  payments    Payment[]
-  creditNotes CreditNote[]
-  customerAdvanceApplications CustomerAdvanceApplication[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, invoiceNumber])
-  @@index([companyId, invoiceDate])
-  @@index([companyId, status])
-  @@index([companyId, locationId])
-  @@index([locationId])
-}
-
-model CreditNote {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  // Clean returns: link to original invoice (optional for service-only credits)
-  invoiceId Int?
-  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
-
-  customerId Int
-  customer   Customer @relation(fields: [customerId], references: [id])
-
-  creditNoteNumber String
-  status           CreditNoteStatus
-  creditNoteDate   DateTime
-  currency         String?
-
-  // Amounts:
-  // - subtotal: sum of line subtotals (qty * unitPrice)
-  // - taxAmount: sum of line taxes (subtotal * taxRate)
-  // - total: subtotal + taxAmount (what AR is reduced by)
-  subtotal  Decimal @default(0) @db.Decimal(18, 2)
-  taxAmount Decimal @default(0) @db.Decimal(18, 2)
-  total     Decimal @db.Decimal(18, 2) // recomputed and stored when posted
-
-  // Free-form text blocks shown on the printed credit note.
-  customerNotes      String? @db.Text
-  termsAndConditions String? @db.Text
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("CreditNote_JournalEntry", fields: [journalEntryId], references: [id])
-
-  voidedAt           DateTime?
-  voidReason         String?       @db.Text
-  voidedByUserId     Int?
-  voidedByUser       User?         @relation("User_VoidedCreditNotes", fields: [voidedByUserId], references: [id])
-  voidJournalEntryId Int?          @unique
-  voidJournalEntry   JournalEntry? @relation("CreditNote_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
-
-  lastAdjustmentJournalEntryId Int?
-  lastAdjustmentJournalEntry   JournalEntry? @relation("CreditNote_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedCreditNotes", fields: [updatedByUserId], references: [id])
-
-  lines CreditNoteLine[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, creditNoteNumber])
-  @@index([companyId, creditNoteDate])
-  @@index([companyId, status])
-  @@index([companyId, invoiceId])
-}
-
-model CreditNoteLine {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  creditNoteId Int
-  creditNote   CreditNote @relation(fields: [creditNoteId], references: [id])
-
-  // Clean returns: link to original invoice line when credit note is created from an invoice.
-  invoiceLineId Int?
-  invoiceLine   InvoiceLine? @relation(fields: [invoiceLineId], references: [id])
-
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
-
-  // Income account mapping for this credit line (revenue reversal).
-  // Default UX: Sales Income (code 4000). Optional for backward-compat; posting will enforce a valid income account.
-  incomeAccountId Int?
-  incomeAccount   Account? @relation("CreditNoteLine_IncomeAccount", fields: [incomeAccountId], references: [id])
-
-  description    String?
-  quantity       Decimal @db.Decimal(18, 2)
-  unitPrice      Decimal @db.Decimal(18, 2)
-  discountAmount Decimal @default(0) @db.Decimal(18, 2)
-  lineTotal      Decimal @db.Decimal(18, 2)
-
-  // Tax per line (tax-exclusive):
-  // taxRate is stored as decimal (e.g., 0.0700 for 7%).
-  taxRate   Decimal? @db.Decimal(5, 4)
-  taxAmount Decimal  @default(0) @db.Decimal(18, 2)
-
-  @@index([companyId])
-  @@index([creditNoteId])
-  @@index([invoiceLineId])
-  @@index([incomeAccountId])
-}
-
-model InvoiceLine {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  invoiceId Int
-  invoice   Invoice @relation(fields: [invoiceId], references: [id])
-
-  // Optional: allow free-text/custom lines without an Item (non-inventory).
-  itemId Int?
-  item   Item? @relation(fields: [itemId], references: [id])
-
-  // Income account mapping (UI-friendly revenue mapping).
-  // Default UX: Sales Income (code 4000). Optional for backward-compat; posting will enforce a valid income account.
-  incomeAccountId Int?
-  incomeAccount   Account? @relation("InvoiceLine_IncomeAccount", fields: [incomeAccountId], references: [id])
-
-  description     String?
-  quantity        Decimal          @db.Decimal(18, 2)
-  unitPrice       Decimal          @db.Decimal(18, 2)
-  discountAmount  Decimal          @default(0) @db.Decimal(18, 2)
-  lineTotal       Decimal          @db.Decimal(18, 2)
-  // Tax per line (tax-exclusive):
-  // taxRate is stored as decimal (e.g., 0.0700 for 7%).
-  taxRate         Decimal?         @db.Decimal(5, 4)
-  taxAmount       Decimal          @default(0) @db.Decimal(18, 2)
-  creditNoteLines CreditNoteLine[]
-
-  @@index([companyId])
-  @@index([incomeAccountId])
-}
-
-model Payment {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  invoiceId Int
-  invoice   Invoice @relation(fields: [invoiceId], references: [id])
-
-  paymentDate DateTime
-  amount      Decimal  @db.Decimal(18, 2)
-
-  bankAccountId Int
-  bankAccount   Account @relation("Payment_BankAccount", fields: [bankAccountId], references: [id])
-
-  // Optional payment proof attachment (screenshot, receipt image)
-  attachmentUrl String? @db.Text
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("Payment_JournalEntry", fields: [journalEntryId], references: [id])
-
-  // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
-  reversedAt             DateTime?
-  reversalReason         String?       @db.Text
-  reversalJournalEntryId Int?          @unique
-  reversalJournalEntry   JournalEntry? @relation("Payment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
-  reversedByUserId       Int?
-  reversedByUser         User?         @relation("User_ReversedPayments", fields: [reversedByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId, paymentDate])
-  @@index([invoiceId])
-}
-
-model Vendor {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name  String
-  email String?
-  phone String?
-
-  expenses      Expense[]
-  purchaseBills PurchaseBill[]
-  vendorCredits VendorCredit[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId])
-}
-
-model PurchaseBill {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  vendorId Int?
-  vendor   Vendor? @relation(fields: [vendorId], references: [id])
-
-  locationId Int      @map("warehouseId")
-  location   Location @relation(fields: [locationId], references: [id])
-
-  billNumber String
-  status     PurchaseBillStatus
-  billDate   DateTime
-  dueDate    DateTime?
-  currency   String?
-
-  total      Decimal @db.Decimal(18, 2)
-  amountPaid Decimal @default(0) @db.Decimal(18, 2)
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation(fields: [journalEntryId], references: [id])
-
-  voidedAt           DateTime?
-  voidReason         String?       @db.Text
-  voidedByUserId     Int?
-  voidedByUser       User?         @relation("User_VoidedPurchaseBills", fields: [voidedByUserId], references: [id])
-  voidJournalEntryId Int?          @unique
-  voidJournalEntry   JournalEntry? @relation("PurchaseBill_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
-
-  lastAdjustmentJournalEntryId Int?
-  lastAdjustmentJournalEntry   JournalEntry? @relation("PurchaseBill_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedPurchaseBills", fields: [updatedByUserId], references: [id])
-
-  lines    PurchaseBillLine[]
-  payments PurchaseBillPayment[]
-  creditApplications VendorCreditApplication[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, billNumber])
-  @@index([companyId, billDate])
-  @@index([companyId, status])
-}
-
-model VendorCredit {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  vendorId Int?
-  vendor   Vendor? @relation(fields: [vendorId], references: [id])
-
-  // Optional location tagging (same as other purchase documents).
-  locationId Int      @map("warehouseId")
-  location   Location @relation("VendorCredit_Location", fields: [locationId], references: [id])
-
-  creditNumber String
-  status       VendorCreditStatus
-  creditDate   DateTime
-  currency     String?
-
-  total        Decimal @db.Decimal(18, 2)
-  amountApplied Decimal @default(0) @db.Decimal(18, 2)
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("VendorCredit_JournalEntry", fields: [journalEntryId], references: [id])
-
-  voidedAt           DateTime?
-  voidReason         String?       @db.Text
-  voidedByUserId     Int?
-  voidedByUser       User?         @relation("User_VoidedVendorCredits", fields: [voidedByUserId], references: [id])
-  voidJournalEntryId Int?          @unique
-  voidJournalEntry   JournalEntry? @relation("VendorCredit_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
-
-  lastAdjustmentJournalEntryId Int?
-  lastAdjustmentJournalEntry   JournalEntry? @relation("VendorCredit_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedVendorCredits", fields: [updatedByUserId], references: [id])
-
-  lines         VendorCreditLine[]
-  applications  VendorCreditApplication[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, creditNumber])
-  @@index([companyId, creditDate])
-  @@index([companyId, status])
-  @@index([companyId, vendorId])
-}
-
-model VendorCreditLine {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  vendorCreditId Int
-  vendorCredit   VendorCredit @relation(fields: [vendorCreditId], references: [id])
-
-  locationId Int      @map("warehouseId")
-  location   Location @relation("VendorCreditLine_Location", fields: [locationId], references: [id])
-
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
-
-  // Account to credit (inventory asset or expense). Posting will enforce tenant + type rules.
-  accountId Int?
-  account   Account? @relation("VendorCreditLine_Account", fields: [accountId], references: [id])
-
-  description String?
-  quantity    Decimal @db.Decimal(18, 2)
-  unitCost    Decimal @db.Decimal(18, 2)
-  lineTotal   Decimal @db.Decimal(18, 2)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId])
-  @@index([vendorCreditId])
-  @@index([companyId, itemId])
-}
-
-model VendorCreditApplication {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  vendorCreditId Int
-  vendorCredit   VendorCredit @relation(fields: [vendorCreditId], references: [id])
-
-  purchaseBillId Int
-  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
-
-  appliedDate DateTime
-  amount      Decimal @db.Decimal(18, 2)
-
-  createdByUserId Int?
-  createdByUser   User? @relation("User_CreatedVendorCreditApplications", fields: [createdByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@index([companyId, appliedDate])
-  @@index([companyId, vendorCreditId])
-  @@index([companyId, purchaseBillId])
-}
-
-// Customer advance / deposit (liability) that can be applied to invoices later.
-// GL:
-// - On receipt:   Dr Bank/Cash, Cr Customer Deposits (LIABILITY)
-// - On apply:     Dr Customer Deposits, Cr Accounts Receivable
-model CustomerAdvance {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  customerId Int
-  customer   Customer @relation(fields: [customerId], references: [id])
-
-  // Optional location tagging (same as invoices/purchase docs).
-  locationId Int      @map("warehouseId")
-  location   Location @relation("CustomerAdvance_Location", fields: [locationId], references: [id])
-
-  advanceDate DateTime
-  currency    String?
-
-  amount        Decimal @db.Decimal(18, 2)
-  amountApplied Decimal @default(0) @db.Decimal(18, 2)
-
-  // Deposit (liquidity) account used on receipt (ASSET)
-  bankAccountId Int
-  bankAccount   Account @relation("CustomerAdvance_BankAccount", fields: [bankAccountId], references: [id])
-
-  // Liability account for customer deposits/advances (LIABILITY)
-  liabilityAccountId Int
-  liabilityAccount   Account @relation("CustomerAdvance_LiabilityAccount", fields: [liabilityAccountId], references: [id])
-
-  receivedVia BankingAccountKind?
-  reference   String?
-  description String? @db.Text
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("CustomerAdvance_JournalEntry", fields: [journalEntryId], references: [id])
-
-  applications CustomerAdvanceApplication[]
-
-  createdByUserId Int?
-  createdByUser   User? @relation("User_CreatedCustomerAdvances", fields: [createdByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId, advanceDate])
-  @@index([companyId, customerId])
-}
-
-model CustomerAdvanceApplication {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  customerAdvanceId Int
-  customerAdvance   CustomerAdvance @relation(fields: [customerAdvanceId], references: [id])
-
-  invoiceId Int
-  invoice   Invoice @relation(fields: [invoiceId], references: [id])
-
-  appliedDate DateTime
-  amount      Decimal  @db.Decimal(18, 2)
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("CustomerAdvanceApplication_JournalEntry", fields: [journalEntryId], references: [id])
-
-  createdByUserId Int?
-  createdByUser   User? @relation("User_CreatedCustomerAdvanceApplications", fields: [createdByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@index([companyId, appliedDate])
-  @@index([companyId, customerAdvanceId])
-  @@index([companyId, invoiceId])
-}
-
-model PurchaseBillLine {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  purchaseBillId Int
-  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
-
-  locationId Int      @map("warehouseId")
-  location   Location @relation(fields: [locationId], references: [id])
-
-  itemId Int
-  item   Item @relation(fields: [itemId], references: [id])
-
-  // Chart of Accounts account for this line.
-  // For tracked inventory items, this should be the Inventory Asset account.
-  accountId Int?
-  account   Account? @relation(fields: [accountId], references: [id])
-
-  description String?
-  quantity    Decimal @db.Decimal(18, 2)
-  unitCost    Decimal @db.Decimal(18, 2)
-  // Absolute discount amount for this line (in document currency).
-  // Applied as: lineTotal = quantity * unitCost - discountAmount
-  discountAmount Decimal @default(0) @db.Decimal(18, 2)
-  lineTotal   Decimal @db.Decimal(18, 2)
-
-  @@index([companyId])
-  @@index([purchaseBillId])
-  @@index([companyId, itemId])
-}
-
-model PurchaseBillPayment {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  purchaseBillId Int
-  purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
-
-  paymentDate DateTime
-  amount      Decimal  @db.Decimal(18, 2)
-
-  bankAccountId Int
-  bankAccount   Account @relation("PurchaseBillPayment_BankAccount", fields: [bankAccountId], references: [id])
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("PurchaseBillPayment_JournalEntry", fields: [journalEntryId], references: [id])
-
-  // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
-  reversedAt             DateTime?
-  reversalReason         String?       @db.Text
-  reversalJournalEntryId Int?          @unique
-  reversalJournalEntry   JournalEntry? @relation("PurchaseBillPayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
-  reversedByUserId       Int?
-  reversedByUser         User?         @relation(fields: [reversedByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId, paymentDate])
-  @@index([purchaseBillId])
-}
-
-model Expense {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  vendorId Int?
-  vendor   Vendor? @relation(fields: [vendorId], references: [id])
-
-  expenseNumber String
-  status        ExpenseStatus
-  expenseDate   DateTime
-  dueDate       DateTime?
-  description   String
-
-  amount     Decimal @db.Decimal(18, 2)
-  amountPaid Decimal @default(0) @db.Decimal(18, 2)
-  currency   String?
-
-  // Optional item reference for COGS tracking
-  itemId Int?
-  item   Item? @relation(fields: [itemId], references: [id])
-
-  // Expense account (Debit) used when posting (must be EXPENSE).
-  expenseAccountId Int?
-  expenseAccount   Account? @relation("Expense_ExpenseAccount", fields: [expenseAccountId], references: [id])
-
-  // When posted, links to journal entry (Dr expense / Cr AP)
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("Expense_JournalEntry", fields: [journalEntryId], references: [id])
-
-  voidedAt           DateTime?
-  voidReason         String?       @db.Text
-  voidedByUserId     Int?
-  voidedByUser       User?         @relation("User_VoidedExpenses", fields: [voidedByUserId], references: [id])
-  voidJournalEntryId Int?          @unique
-  voidJournalEntry   JournalEntry? @relation("Expense_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
-
-  lastAdjustmentJournalEntryId Int?
-  lastAdjustmentJournalEntry   JournalEntry? @relation("Expense_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
-
-  updatedByUserId Int?
-  updatedByUser   User? @relation("User_UpdatedExpenses", fields: [updatedByUserId], references: [id])
-
-  payments ExpensePayment[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, expenseNumber])
-  @@index([companyId, expenseDate])
-  @@index([companyId, status])
-}
-
-model ExpensePayment {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  expenseId Int
-  expense   Expense @relation(fields: [expenseId], references: [id])
-
-  paymentDate DateTime
-  amount      Decimal  @db.Decimal(18, 2)
-
-  bankAccountId Int
-  bankAccount   Account @relation("ExpensePayment_BankAccount", fields: [bankAccountId], references: [id])
-
-  journalEntryId Int?          @unique
-  journalEntry   JournalEntry? @relation("ExpensePayment_JournalEntry", fields: [journalEntryId], references: [id])
-
-  // Reversal (immutable audit): never delete/edit payment; record reversal metadata.
-  reversedAt             DateTime?
-  reversalReason         String?       @db.Text
-  reversalJournalEntryId Int?          @unique
-  reversalJournalEntry   JournalEntry? @relation("ExpensePayment_ReversalJournalEntry", fields: [reversalJournalEntryId], references: [id])
-  reversedByUserId       Int?
-  reversedByUser         User?         @relation("User_ReversedExpensePayments", fields: [reversedByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([companyId, paymentDate])
-  @@index([expenseId])
-}
-
-model User {
-  id        Int      @id @default(autoincrement())
-  email     String   @unique
-  password  String // hashed
-  name      String?
-  role      UserRole @default(OWNER)
-  companyId Int
-  company   Company  @relation(fields: [companyId], references: [id])
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  journalEntriesCreated JournalEntry[]
-  voidedJournalEntries  JournalEntry[] @relation("User_VoidedJournalEntries")
-  updatedJournalEntries JournalEntry[] @relation("User_UpdatedJournalEntries")
-
-  voidedInvoices               Invoice[]             @relation("User_VoidedInvoices")
-  updatedInvoices              Invoice[]             @relation("User_UpdatedInvoices")
-  voidedCreditNotes            CreditNote[]          @relation("User_VoidedCreditNotes")
-  updatedCreditNotes           CreditNote[]          @relation("User_UpdatedCreditNotes")
-  voidedExpenses               Expense[]             @relation("User_VoidedExpenses")
-  updatedExpenses              Expense[]             @relation("User_UpdatedExpenses")
-  voidedPurchaseBills          PurchaseBill[]        @relation("User_VoidedPurchaseBills")
-  updatedPurchaseBills         PurchaseBill[]        @relation("User_UpdatedPurchaseBills")
-  voidedVendorCredits          VendorCredit[]        @relation("User_VoidedVendorCredits")
-  updatedVendorCredits         VendorCredit[]        @relation("User_UpdatedVendorCredits")
-  vendorCreditApplicationsCreated VendorCreditApplication[] @relation("User_CreatedVendorCreditApplications")
-  customerAdvancesCreated      CustomerAdvance[]     @relation("User_CreatedCustomerAdvances")
-  customerAdvanceApplicationsCreated CustomerAdvanceApplication[] @relation("User_CreatedCustomerAdvanceApplications")
-  reversedPayments             Payment[]             @relation("User_ReversedPayments")
-  reversedExpensePayments      ExpensePayment[]      @relation("User_ReversedExpensePayments")
-  reversedPurchaseBillPayments PurchaseBillPayment[]
-  periodClosesCreated          PeriodClose[]         @relation("User_PeriodClosesCreated")
-  auditLogs                    AuditLog[]
-
-  @@index([companyId])
-}
-
-model AuditLog {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  userId Int?
-  user   User? @relation(fields: [userId], references: [id])
-
-  // Action semantics: stable strings like "invoice.post", "invoice.payment.create"
-  action     String
-  entityType String
-  entityId   String?
-
-  // Correlation for retries/tracing.
-  idempotencyKey String?
-  correlationId  String?
-
-  // Extra context (safe, non-sensitive): totals, dates, ids, etc.
-  metadata Json?
-
-  createdAt DateTime @default(now())
-
-  @@index([companyId, createdAt])
-  @@index([companyId, entityType, entityId])
-  @@index([companyId, userId, createdAt])
-}
-
-// Period close (month-end/year-end) to move INCOME/EXPENSE into Retained Earnings.
-// Prevents accidental double-close for the same period.
-model PeriodClose {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  fromDate DateTime
-  toDate   DateTime
-
-  journalEntryId Int          @unique
-  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id])
-
-  createdByUserId Int?
-  createdByUser   User? @relation("User_PeriodClosesCreated", fields: [createdByUserId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@unique([companyId, fromDate, toDate])
-  @@index([companyId, toDate])
-}
-
-// Command-level idempotency for HTTP writes (safe under retries).
-// Unique per (companyId, key). Store the previously returned response so retries can return the same result.
-model IdempotentRequest {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  key      String
-  response Json
-
-  createdAt DateTime @default(now())
-
-  @@unique([companyId, key])
-  @@index([companyId, createdAt])
-}
-
-// Per-company sequence generator for document numbers (e.g., Purchase Bills).
-model DocumentSequence {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  key        String
-  nextNumber Int    @default(1)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, key])
-  @@index([companyId])
-}
-
-// Tax Module: Individual tax rates (e.g., VAT, Sales Tax, GST)
-model TaxRate {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name String // e.g., "Income tax", "Commercial Tax"
-  rate Decimal @db.Decimal(5, 4) // e.g., 0.0500 for 5%
-
-  // Compound tax applies tax on top of other taxes (tax-on-tax)
-  isCompound Boolean @default(false)
-
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Relations
-  groupMemberships TaxGroupMember[]
-
-  @@unique([companyId, name])
-  @@index([companyId])
-}
-
-// Tax Module: Tax groups combine multiple tax rates (e.g., "Myanmar [7%]" = 2% Income + 5% Commercial)
-model TaxGroup {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  name String // e.g., "Myanmar", "Total Sales Tax"
-
-  // Computed total rate for display (sum of member rates)
-  totalRate Decimal @db.Decimal(5, 4) // e.g., 0.0700 for 7%
-
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Relations
-  members TaxGroupMember[]
-
-  @@unique([companyId, name])
-  @@index([companyId])
-}
-
-// Tax Module: Join table for tax groups (many-to-many)
-model TaxGroupMember {
-  id      Int      @id @default(autoincrement())
-  groupId Int
-  group   TaxGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
-
-  taxRateId Int
-  taxRate   TaxRate @relation(fields: [taxRateId], references: [id], onDelete: Cascade)
-
-  createdAt DateTime @default(now())
-
-  @@unique([groupId, taxRateId])
-  @@index([groupId])
-  @@index([taxRateId])
-}
-
-// --- Integrations (external system mappings) ---
-//
-// Purpose:
-// - Keep stable links between external IDs (e.g., Piti saleId/productId/customerId)
-//   and internal Cashflow IDs (Invoice/Item/Customer/etc).
-// - Prevent duplicates under retries even if callers accidentally change Idempotency-Key.
-model IntegrationEntityMap {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  // e.g. "piti"
-  integration String @db.VarChar(32)
-  // e.g. "Sale", "Refund", "Item", "Customer"
-  entityType  String @db.VarChar(32)
-
-  // External identifier (from the source system). Keep as string for flexibility.
-  externalId String @db.VarChar(128)
-  // Internal identifier (Cashflow). Stored as string because not all targets are ints (future-proof).
-  internalId String @db.VarChar(128)
-
-  // Optional debug metadata (safe to store non-sensitive info only).
-  metadata Json?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, integration, entityType, externalId])
-  @@index([companyId, integration, entityType])
-}
-
-// --- Reference-only multi-currency support (Option 1) ---
-// These tables are for display/reference exchange rates only.
-// They do NOT affect posting, ledger balances, or reports today.
-
-model Currency {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  // ISO 4217-like 3-letter currency code (stored normalized uppercase).
-  code   String  @db.VarChar(3)
-  name   String?
-  symbol String? @db.VarChar(16)
-
-  isActive Boolean @default(true)
-
-  exchangeRates ExchangeRate[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, code])
-  @@index([companyId])
-}
-
-model ExchangeRate {
-  id        Int     @id @default(autoincrement())
-  companyId Int
-  company   Company @relation(fields: [companyId], references: [id])
-
-  currencyId Int
-  currency   Currency @relation(fields: [currencyId], references: [id], onDelete: Cascade)
-
-  // Snapshot base currency code at the time this rate was created.
-  // Rates are interpreted as: 1 unit of `currency.code` = `rateToBase` units of `baseCurrency`.
-  baseCurrency String @db.VarChar(3)
-
-  // Store with enough precision for most SMEs.
-  rateToBase Decimal @db.Decimal(18, 8)
-  asOfDate   DateTime
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([companyId, currencyId, asOfDate])
-  @@index([companyId, currencyId, asOfDate])
-  @@index([companyId, asOfDate])
 }

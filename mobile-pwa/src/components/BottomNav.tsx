@@ -102,6 +102,7 @@ export function BottomNav() {
     open ||
     location.pathname.startsWith('/customers') ||
     location.pathname.startsWith('/items') ||
+    location.pathname.startsWith('/vendors') ||
     location.pathname.startsWith('/warehouses') ||
     location.pathname.startsWith('/more');
 
@@ -145,6 +146,14 @@ export function BottomNav() {
               onClick={() => {
                 setOpen(false);
                 navigate('/customers');
+              }}
+            />
+            <div className="h-px bg-border" />
+            <SheetRow
+              label="Vendors"
+              onClick={() => {
+                setOpen(false);
+                navigate('/vendors');
               }}
             />
             <div className="h-px bg-border" />

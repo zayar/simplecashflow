@@ -11,7 +11,10 @@ import { invoicePublicRoutes } from './modules/books/invoicePublic.routes.js';
 import { pitiRoutes } from './modules/integrations/piti.routes.js';
 import { inventoryRoutes } from './modules/inventory/inventory.routes.js';
 import { purchaseBillsRoutes } from './modules/purchases/purchaseBills.routes.js';
+import { purchaseOrdersRoutes } from './modules/purchases/purchaseOrders.routes.js';
+import { purchaseReceiptsRoutes } from './modules/purchases/purchaseReceipts.routes.js';
 import { vendorCreditsRoutes } from './modules/purchases/vendorCredits.routes.js';
+import { vendorAdvancesRoutes } from './modules/purchases/vendorAdvances.routes.js';
 import { apAgingRoutes } from './modules/reports/apAging.routes.js';
 import { dashboardRoutes } from './modules/reports/dashboard.routes.js';
 import { arApSummaryRoutes } from './modules/reports/arApSummary.routes.js';
@@ -67,6 +70,10 @@ async function buildApp() {
     const authMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10);
     const globalWindowMs = Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS ?? 60_000);
     const globalMax = Number(process.env.GLOBAL_RATE_LIMIT_MAX ?? 300);
+    const publicWindowMs = Number(process.env.PUBLIC_RATE_LIMIT_WINDOW_MS ?? 60_000);
+    const publicMax = Number(process.env.PUBLIC_RATE_LIMIT_MAX ?? 120);
+    const publicUploadWindowMs = Number(process.env.PUBLIC_UPLOAD_RATE_LIMIT_WINDOW_MS ?? 60_000);
+    const publicUploadMax = Number(process.env.PUBLIC_UPLOAD_RATE_LIMIT_MAX ?? 10);
     const buckets = new Map();
     let seen = 0;
     function hit(key, max, windowMs, nowMs) {
@@ -87,11 +94,24 @@ async function buildApp() {
         const ip = (request.ip ?? request.socket?.remoteAddress ?? 'unknown').toString();
         const path = (request.url ?? '').split('?')[0] ?? '';
         // Stricter limits for auth endpoints
-        const isAuthEndpoint = request.method === 'POST' && (path === '/login' || path === '/register');
-        const key = `${isAuthEndpoint ? 'auth' : 'global'}:${ip}`;
+        const isAuthEndpoint = request.method === 'POST' &&
+            (path === '/login' ||
+                path === '/register' ||
+                path === '/login/otp/request' ||
+                path === '/login/otp/verify' ||
+                path === '/me/phone/request-otp' ||
+                path === '/me/phone/verify');
+        // Public invoice links are anonymous by design; add a stricter bucket to reduce abuse.
+        const isPublicInvoice = typeof path === 'string' && path.startsWith('/public/invoices/');
+        const isPublicUpload = isPublicInvoice && (request.method === 'POST' || request.method === 'DELETE') && path.includes('/payment-proof');
+        const key = `${isAuthEndpoint ? 'auth' : isPublicUpload ? 'publicUpload' : isPublicInvoice ? 'public' : 'global'}:${ip}`;
         const ok = isAuthEndpoint
             ? hit(key, authMax, authWindowMs, nowMs)
-            : hit(key, globalMax, globalWindowMs, nowMs);
+            : isPublicUpload
+                ? hit(key, publicUploadMax, publicUploadWindowMs, nowMs)
+                : isPublicInvoice
+                    ? hit(key, publicMax, publicWindowMs, nowMs)
+                    : hit(key, globalMax, globalWindowMs, nowMs);
         if (!ok) {
             reply.status(429).send({ error: 'Too Many Requests' });
             return;
@@ -140,7 +160,10 @@ async function buildApp() {
     await fastify.register(pitiRoutes);
     await fastify.register(inventoryRoutes);
     await fastify.register(purchaseBillsRoutes);
+    await fastify.register(purchaseOrdersRoutes);
+    await fastify.register(purchaseReceiptsRoutes);
     await fastify.register(vendorCreditsRoutes);
+    await fastify.register(vendorAdvancesRoutes);
     await fastify.register(apAgingRoutes);
     await fastify.register(dashboardRoutes);
     await fastify.register(arApSummaryRoutes);

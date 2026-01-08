@@ -15,6 +15,8 @@ export type DraftLine = {
 export type InvoiceDraft = {
   // If the user went to a picker screen, where should we return after selecting?
   returnTo?: string | null;
+  // When set, InvoiceNew should UPDATE the existing invoice (PUT) instead of creating a new one (POST).
+  editingInvoiceId?: number | null;
   customerId?: number | null;
   customerName?: string | null;
   invoiceDate: string; // YYYY-MM-DD
@@ -26,6 +28,7 @@ export type InvoiceDraft = {
 export function defaultDraft(): InvoiceDraft {
   return {
     returnTo: null,
+    editingInvoiceId: null,
     customerId: null,
     customerName: null,
     invoiceDate: yyyyMmDd(new Date()),

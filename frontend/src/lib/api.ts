@@ -216,6 +216,31 @@ export async function uploadPaymentProof(token: string, file: File, note?: strin
   return res.json();
 }
 
+// Delete payment proof(s) (public, no auth). If no opts provided, deletes all proofs.
+export async function deletePaymentProof(
+  token: string,
+  opts?: { id?: string; url?: string }
+): Promise<{ success: true; pendingPaymentProofs: any[] }> {
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+  const safe = encodeURIComponent(token);
+  const qs =
+    opts?.id ? `?id=${encodeURIComponent(opts.id)}` : opts?.url ? `?url=${encodeURIComponent(opts.url)}` : '';
+
+  const res = await fetch(`${API_BASE_URL}/public/invoices/${safe}/payment-proof${qs}`, {
+    method: 'DELETE',
+    headers: {
+      'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    },
+  });
+
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload?.error || payload?.message || 'Failed to delete payment proof');
+  }
+
+  return res.json();
+}
+
 // Report types based on our backend response
 export interface TrialBalanceReport {
   companyId: number;
@@ -382,6 +407,8 @@ export interface Vendor {
   name: string;
   email: string | null;
   phone: string | null;
+  currency?: string | null;
+  openingBalance?: string | null;
   createdAt: string;
 }
 
@@ -396,7 +423,7 @@ export async function getVendor(companyId: number, vendorId: number): Promise<Ve
 export async function updateVendor(
   companyId: number,
   vendorId: number,
-  data: { name: string; email?: string; phone?: string }
+  data: { name: string; email?: string; phone?: string; currency?: string; openingBalance?: number }
 ): Promise<Vendor> {
   return fetchApi(`/companies/${companyId}/vendors/${vendorId}`, {
     method: 'PUT',
@@ -404,6 +431,8 @@ export async function updateVendor(
       name: data.name,
       email: data.email ?? null,
       phone: data.phone ?? null,
+      currency: data.currency ?? null,
+      openingBalance: data.openingBalance === undefined ? undefined : data.openingBalance,
     }),
   });
 }
@@ -431,6 +460,26 @@ export async function applyCreditNoteToInvoice(
     method: 'POST',
     headers: { 'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}` },
     body: JSON.stringify({ creditNoteId }),
+  });
+}
+
+export async function unapplyCreditNote(companyId: number, creditNoteId: number): Promise<{ creditNoteId: number; invoiceId: number; status: string }> {
+  return fetchApi(`/companies/${companyId}/credit-notes/${creditNoteId}/unapply`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function refundCreditNote(companyId: number, creditNoteId: number, data: {
+  amount: number;
+  refundDate?: string;
+  bankAccountId: number;
+  reference?: string | null;
+  description?: string | null;
+}): Promise<{ creditNoteRefundId: number; journalEntryId: number }> {
+  return fetchApi(`/companies/${companyId}/credit-notes/${creditNoteId}/refunds`, {
+    method: 'POST',
+    body: JSON.stringify(data),
   });
 }
 
@@ -497,6 +546,49 @@ export async function getVendorCredits(
   if (opts?.status) qs.set('status', String(opts.status));
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   return fetchApi(`/companies/${companyId}/vendor-credits${suffix}`);
+}
+
+// --- Vendor Advances (Supplier Prepayments) ---
+export type VendorAdvanceListRow = {
+  id: number;
+  advanceDate: string;
+  amount: string;
+  amountApplied: string;
+  remaining: string;
+  receivedVia: 'CASH' | 'BANK' | 'E_WALLET' | 'CREDIT_CARD' | null;
+  reference: string | null;
+  description: string | null;
+  journalEntryId: number | null;
+};
+
+export async function getVendorAdvances(companyId: number, vendorId: number, onlyOpen: boolean = true): Promise<VendorAdvanceListRow[]> {
+  const qp = new URLSearchParams({ onlyOpen: onlyOpen ? '1' : '0' }).toString();
+  return fetchApi(`/companies/${companyId}/vendors/${vendorId}/vendor-advances?${qp}`);
+}
+
+export async function createVendorAdvance(companyId: number, data: {
+  vendorId: number;
+  locationId: number;
+  advanceDate?: string;
+  currency?: string | null;
+  amount: number;
+  bankAccountId: number;
+  receivedVia?: 'CASH' | 'BANK' | 'E_WALLET' | 'CREDIT_CARD' | null;
+  reference?: string | null;
+  description?: string | null;
+}): Promise<{ vendorAdvanceId: number; journalEntryId: number }> {
+  return fetchApi(`/companies/${companyId}/vendor-advances`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function applyVendorAdvanceToBill(
+  companyId: number,
+  purchaseBillId: number,
+  data: { vendorAdvanceId: number; amount: number; appliedDate?: string }
+): Promise<any> {
+  return fetchApi(`/companies/${companyId}/purchase-bills/${purchaseBillId}/apply-vendor-advance`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
 }
 
 export async function createVendorCredit(
@@ -568,7 +660,7 @@ export async function applyCustomerAdvanceToInvoice(
 
 export async function createVendor(
   companyId: number,
-  data: { name: string; email?: string; phone?: string }
+  data: { name: string; email?: string; phone?: string; currency?: string; openingBalance?: number }
 ): Promise<Vendor> {
   return fetchApi(`/companies/${companyId}/vendors`, {
     method: 'POST',
@@ -596,7 +688,7 @@ export async function getCustomer(companyId: number, customerId: number): Promis
 
 export async function createCustomer(
   companyId: number,
-  data: { name: string; email?: string; phone?: string; currency?: string }
+  data: { name: string; email?: string; phone?: string; currency?: string; openingBalance?: number }
 ): Promise<Customer> {
   return fetchApi(`/companies/${companyId}/customers`, {
     method: 'POST',
@@ -605,6 +697,7 @@ export async function createCustomer(
       email: data.email ?? null,
       phone: data.phone ?? null,
       currency: data.currency ?? null,
+      openingBalance: data.openingBalance === undefined ? undefined : data.openingBalance,
     }),
   });
 }
@@ -612,7 +705,7 @@ export async function createCustomer(
 export async function updateCustomer(
   companyId: number,
   customerId: number,
-  data: { name: string; email?: string; phone?: string; currency?: string }
+  data: { name: string; email?: string; phone?: string; currency?: string; openingBalance?: number }
 ): Promise<Customer> {
   return fetchApi(`/companies/${companyId}/customers/${customerId}`, {
     method: 'PUT',
@@ -621,6 +714,7 @@ export async function updateCustomer(
       email: data.email ?? null,
       phone: data.phone ?? null,
       currency: data.currency ?? null,
+      openingBalance: data.openingBalance === undefined ? undefined : data.openingBalance,
     }),
   });
 }

@@ -95,8 +95,10 @@ export default function VendorBalanceSummaryReportPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Vendor Name</TableHead>
+                  <TableHead className="text-right">Opening Balance</TableHead>
                   <TableHead className="text-right">Billed Amount</TableHead>
                   <TableHead className="text-right">Amount Paid</TableHead>
+                  <TableHead className="text-right">Credit</TableHead>
                   <TableHead className="text-right">Closing Balance</TableHead>
                 </TableRow>
               </TableHeader>
@@ -105,10 +107,16 @@ export default function VendorBalanceSummaryReportPage() {
                   <TableRow key={String(r.vendorId ?? r.vendorName)}>
                     <TableCell className="font-medium">{r.vendorName}</TableCell>
                     <TableCell className="text-right tabular-nums">
+                      {Number(r.openingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
                       {Number(r.billedAmount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {Number(r.amountPaid ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {Number(r.credit ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-medium tabular-nums">
                       {Number(r.closingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
@@ -117,7 +125,7 @@ export default function VendorBalanceSummaryReportPage() {
                 ))}
                 {(data?.rows ?? []).length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
                       No vendors found.
                     </TableCell>
                   </TableRow>
@@ -126,10 +134,16 @@ export default function VendorBalanceSummaryReportPage() {
                   <TableRow className="bg-muted/40">
                     <TableCell className="font-medium">Total</TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
+                      {Number((totals as any).openingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.billedAmount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.amountPaid ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right font-semibold tabular-nums">
+                      {Number(totals.credit ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.closingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
@@ -140,7 +154,7 @@ export default function VendorBalanceSummaryReportPage() {
             </Table>
           </div>
           <div className="mt-2 text-xs text-muted-foreground">
-            Notes: “Amount Paid” includes payments and POSTED vendor credits that reduce payables.
+            Notes: “Amount Paid” is cash payments. “Credit” includes POSTED vendor credits and applied vendor advances (prepayments).
           </div>
         </CardContent>
       </Card>

@@ -4,8 +4,10 @@ import type { DomainEventEnvelopeV1 } from './events/domainEvent.js';
 import { prisma } from './infrastructure/db.js';
 import { runIdempotent } from './infrastructure/idempotency.js';
 import { getRedis } from './infrastructure/redis.js';
+import { runWithTenantAsync } from './infrastructure/tenantContext.js';
 import { normalizeToDay } from './utils/date.js';
 import { Prisma } from '@prisma/client';
+import { rebuildProjectionsFromLedger, runInventoryRecalcForward } from './modules/inventory/recalc.service.js';
 
 const fastify = Fastify({ logger: true });
 const redis = getRedis();
@@ -122,6 +124,10 @@ fastify.post('/pubsub/push', { preHandler: verifyPubSubOidc }, async (request, r
       await handleJournalEntryCreated(envelope);
     }
 
+    if (envelope.eventType === 'inventory.recalc.requested') {
+      await handleInventoryRecalcRequested(envelope);
+    }
+
     reply.status(204); // No Content
     return;
   } catch (err) {
@@ -130,6 +136,90 @@ fastify.post('/pubsub/push', { preHandler: verifyPubSubOidc }, async (request, r
     return { error: 'Internal error' };
   }
 });
+
+async function handleInventoryRecalcRequested(event: DomainEventEnvelope) {
+  const { eventId, payload } = event;
+  const companyIdRaw = (event as any)?.companyId ?? (payload as any)?.companyId;
+  const companyId = Number(companyIdRaw);
+
+  if (typeof eventId !== 'string' || !eventId || !Number.isInteger(companyId) || companyId <= 0) {
+    fastify.log.error({ eventId, companyIdRaw }, 'Invalid inventory recalc event: missing/invalid eventId or companyId');
+    return;
+  }
+
+  const fromDateStr = (payload as any)?.fromDate as string | undefined;
+  const fromDate = fromDateStr ? normalizeToDay(new Date(`${fromDateStr}T00:00:00.000Z`)) : null;
+  if (!fromDate || isNaN(fromDate.getTime())) {
+    fastify.log.error({ eventId, fromDateStr }, 'Invalid inventory recalc payload: fromDate');
+    return;
+  }
+
+  await runWithTenantAsync(companyId, async () => {
+    await runIdempotent(
+      prisma,
+      companyId,
+      eventId,
+      async (tx: Prisma.TransactionClient) => {
+        const outbox = await tx.event.findFirst({
+          where: { eventId },
+          select: { companyId: true, eventType: true },
+        });
+        if (!outbox) {
+          fastify.log.error({ eventId }, 'Outbox event not found; refusing inventory recalc');
+          return;
+        }
+        if (!outbox.companyId || outbox.companyId !== companyId) {
+          fastify.log.error({ eventId, companyId, outboxCompanyId: outbox.companyId }, 'Tenant mismatch for inventory recalc');
+          return;
+        }
+        if (outbox.eventType !== 'inventory.recalc.requested') {
+          fastify.log.error({ eventId, outboxEventType: outbox.eventType }, 'Unexpected outbox eventType for inventory recalc');
+          return;
+        }
+
+        // Coalesce requested range (min date).
+        await (tx as any).$executeRaw`
+          INSERT INTO InventoryRecalcState (companyId, requestedFromDate, requestedAt, updatedAt, createdAt, attempts)
+          VALUES (${companyId}, ${fromDate}, NOW(), NOW(), NOW(), 0)
+          ON DUPLICATE KEY UPDATE
+            requestedFromDate = LEAST(COALESCE(requestedFromDate, ${fromDate}), ${fromDate}),
+            requestedAt = NOW(),
+            updatedAt = NOW()
+        `;
+
+        const rows = (await (tx as any).$queryRaw`
+          SELECT requestedFromDate
+          FROM InventoryRecalcState
+          WHERE companyId = ${companyId}
+          FOR UPDATE
+        `) as Array<{ requestedFromDate: Date | null }>;
+        const requestedFrom = rows?.[0]?.requestedFromDate ? normalizeToDay(new Date(rows[0].requestedFromDate)) : fromDate;
+
+        await (tx as any).$executeRaw`
+          UPDATE InventoryRecalcState
+          SET runningAt = NOW(), lockedAt = NOW(), lockId = ${eventId}, attempts = attempts + 1, lastError = NULL, updatedAt = NOW()
+          WHERE companyId = ${companyId}
+        `;
+
+        const recalc = await runInventoryRecalcForward(tx as any, { companyId, fromDate: requestedFrom });
+        await rebuildProjectionsFromLedger(tx as any, {
+          companyId,
+          fromDate: new Date(recalc.effectiveStartDate),
+          toDate: normalizeToDay(new Date()),
+        });
+
+        await (tx as any).$executeRaw`
+          UPDATE InventoryRecalcState
+          SET runningAt = NULL, lockedAt = NULL, lockId = NULL, updatedAt = NOW()
+          WHERE companyId = ${companyId}
+        `;
+
+        fastify.log.info({ companyId, recalc }, 'Inventory recalc completed');
+      },
+      redis
+    );
+  });
+}
 
 async function handleJournalEntryCreated(event: DomainEventEnvelope) {
   const { eventId, payload } = event;
@@ -159,168 +249,178 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
     return;
   }
 
-  await runIdempotent(prisma, companyId, eventId, async (tx: Prisma.TransactionClient) => {
-    // 1) Strong authenticity guard: only process events that exist in our outbox table.
-    // This prevents crafted Pub/Sub payloads from causing cross-tenant updates even if Pub/Sub
-    // push auth is misconfigured.
-    const outbox = await tx.event.findFirst({
-      where: { eventId },
-      select: { companyId: true, eventType: true, payload: true },
-    });
-    if (!outbox) {
-      fastify.log.error({ eventId }, 'Outbox event not found; refusing to process Pub/Sub message');
-      return;
-    }
-    if (!outbox.companyId || outbox.companyId !== companyId) {
-      fastify.log.error(
-        { eventId, eventCompanyId: companyId, outboxCompanyId: outbox.companyId },
-        'Tenant mismatch: Pub/Sub companyId does not match outbox.companyId'
-      );
-      return;
-    }
-    if (outbox.eventType !== 'journal.entry.created') {
-      fastify.log.error(
-        { eventId, outboxEventType: outbox.eventType },
-        'Unexpected outbox eventType for handler; refusing to process'
-      );
-      return;
-    }
-    const outboxJeId = Number((outbox.payload as any)?.journalEntryId);
-    if (!Number.isInteger(outboxJeId) || outboxJeId !== journalEntryId) {
-      fastify.log.error(
-        { eventId, journalEntryId, outboxJeId },
-        'Outbox payload mismatch; refusing to process'
-      );
-      return;
-    }
+  // IMPORTANT: Worker code runs outside Fastify request hooks, so AsyncLocalStorage tenant context is NOT set.
+  // We explicitly set it per message so Prisma's tenant isolation rails (auto-inject + fail-closed) apply here too.
+  await runWithTenantAsync(companyId, async () => {
+    await runIdempotent(
+      prisma,
+      companyId,
+      eventId,
+      async (tx: Prisma.TransactionClient) => {
+        // 1) Strong authenticity guard: only process events that exist in our outbox table.
+        // This prevents crafted Pub/Sub payloads from causing cross-tenant updates even if Pub/Sub
+        // push auth is misconfigured.
+        const outbox = await tx.event.findFirst({
+          where: { eventId },
+          select: { companyId: true, eventType: true, payload: true },
+        });
+        if (!outbox) {
+          fastify.log.error({ eventId }, 'Outbox event not found; refusing to process Pub/Sub message');
+          return;
+        }
+        if (!outbox.companyId || outbox.companyId !== companyId) {
+          fastify.log.error(
+            { eventId, eventCompanyId: companyId, outboxCompanyId: outbox.companyId },
+            'Tenant mismatch: Pub/Sub companyId does not match outbox.companyId'
+          );
+          return;
+        }
+        if (outbox.eventType !== 'journal.entry.created') {
+          fastify.log.error(
+            { eventId, outboxEventType: outbox.eventType },
+            'Unexpected outbox eventType for handler; refusing to process'
+          );
+          return;
+        }
+        const outboxJeId = Number((outbox.payload as any)?.journalEntryId);
+        if (!Number.isInteger(outboxJeId) || outboxJeId !== journalEntryId) {
+          fastify.log.error(
+            { eventId, journalEntryId, outboxJeId },
+            'Outbox payload mismatch; refusing to process'
+          );
+          return;
+        }
 
-    // 2) Load the journal entry with its lines and accounts, scoped to tenant
-    const entry = await tx.journalEntry.findFirst({
-      where: { id: journalEntryId, companyId },
-      include: {
-        lines: {
+        // 2) Load the journal entry with its lines and accounts, scoped to tenant
+        const entry = await tx.journalEntry.findFirst({
+          where: { id: journalEntryId, companyId },
           include: {
-            account: true,
+            lines: {
+              include: {
+                account: true,
+              },
+            },
           },
-        },
+        });
+
+        if (!entry) {
+          fastify.log.error({ journalEntryId }, 'Journal entry not found');
+          return;
+        }
+        if (entry.companyId !== companyId) {
+          fastify.log.error(
+            { eventCompanyId: companyId, entryCompanyId: entry.companyId, journalEntryId },
+            'Tenant mismatch: event.companyId does not match JournalEntry.companyId'
+          );
+          return;
+        }
+
+        // 3) Compute how much income and expense this entry represents (Decimal-safe)
+        let incomeDelta = new Prisma.Decimal(0);
+        let expenseDelta = new Prisma.Decimal(0);
+
+        for (const line of entry.lines) {
+          const acc = line.account;
+          const debit = new Prisma.Decimal(line.debit).toDecimalPlaces(2);
+          const credit = new Prisma.Decimal(line.credit).toDecimalPlaces(2);
+
+          if (acc.type === AccountType.INCOME) {
+            // Income increases with credit
+            incomeDelta = incomeDelta.add(credit.sub(debit));
+          }
+
+          if (acc.type === AccountType.EXPENSE) {
+            // Expense increases with debit
+            expenseDelta = expenseDelta.add(debit.sub(credit));
+          }
+        }
+
+        incomeDelta = incomeDelta.toDecimalPlaces(2);
+        expenseDelta = expenseDelta.toDecimalPlaces(2);
+
+        if (incomeDelta.equals(0) && expenseDelta.equals(0)) {
+          fastify.log.info(
+            { journalEntryId, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
+            'No income/expense impact, skipping summary update'
+          );
+        }
+
+        const day = normalizeToDay(entry.date);
+
+        // 4) Upsert into DailySummary (income/expense only)
+        if (!incomeDelta.equals(0) || !expenseDelta.equals(0)) {
+          fastify.log.info(
+            { companyId, day, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
+            'Updating DailySummary'
+          );
+
+          await tx.dailySummary.upsert({
+            where: {
+              companyId_date: {
+                companyId,
+                date: day,
+              },
+            },
+            update: {
+              totalIncome: {
+                increment: incomeDelta,
+              },
+              totalExpense: {
+                increment: expenseDelta,
+              },
+            },
+            create: {
+              companyId,
+              date: day,
+              totalIncome: incomeDelta,
+              totalExpense: expenseDelta,
+            },
+          });
+        }
+
+        // 5) Upsert AccountBalance per account (daily increments)
+        const byAccount = new Map<number, { debit: Prisma.Decimal; credit: Prisma.Decimal }>();
+        for (const line of entry.lines) {
+          const accountId = line.accountId;
+          const debit = new Prisma.Decimal(line.debit);
+          const credit = new Prisma.Decimal(line.credit);
+
+          const prev = byAccount.get(accountId) ?? {
+            debit: new Prisma.Decimal(0),
+            credit: new Prisma.Decimal(0),
+          };
+          byAccount.set(accountId, {
+            debit: prev.debit.add(debit),
+            credit: prev.credit.add(credit),
+          });
+        }
+
+        for (const [accountId, totals] of byAccount.entries()) {
+          await (tx as any).accountBalance.upsert({
+            where: {
+              companyId_accountId_date: {
+                companyId,
+                accountId,
+                date: day,
+              },
+            },
+            update: {
+              debitTotal: { increment: totals.debit.toDecimalPlaces(2) },
+              creditTotal: { increment: totals.credit.toDecimalPlaces(2) },
+            },
+            create: {
+              companyId,
+              accountId,
+              date: day,
+              debitTotal: totals.debit.toDecimalPlaces(2),
+              creditTotal: totals.credit.toDecimalPlaces(2),
+            },
+          });
+        }
       },
-    });
-
-    if (!entry) {
-      fastify.log.error({ journalEntryId }, 'Journal entry not found');
-      return;
-    }
-    if (entry.companyId !== companyId) {
-      fastify.log.error(
-        { eventCompanyId: companyId, entryCompanyId: entry.companyId, journalEntryId },
-        'Tenant mismatch: event.companyId does not match JournalEntry.companyId'
-      );
-      return;
-    }
-
-    // 3) Compute how much income and expense this entry represents (Decimal-safe)
-    let incomeDelta = new Prisma.Decimal(0);
-    let expenseDelta = new Prisma.Decimal(0);
-
-    for (const line of entry.lines) {
-      const acc = line.account;
-      const debit = new Prisma.Decimal(line.debit).toDecimalPlaces(2);
-      const credit = new Prisma.Decimal(line.credit).toDecimalPlaces(2);
-
-      if (acc.type === AccountType.INCOME) {
-        // Income increases with credit
-        incomeDelta = incomeDelta.add(credit.sub(debit));
-      }
-
-      if (acc.type === AccountType.EXPENSE) {
-        // Expense increases with debit
-        expenseDelta = expenseDelta.add(debit.sub(credit));
-      }
-    }
-
-    incomeDelta = incomeDelta.toDecimalPlaces(2);
-    expenseDelta = expenseDelta.toDecimalPlaces(2);
-
-    if (incomeDelta.equals(0) && expenseDelta.equals(0)) {
-      fastify.log.info(
-        { journalEntryId, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
-        'No income/expense impact, skipping summary update'
-      );
-    }
-
-    const day = normalizeToDay(entry.date);
-
-    // 4) Upsert into DailySummary (income/expense only)
-    if (!incomeDelta.equals(0) || !expenseDelta.equals(0)) {
-      fastify.log.info(
-        { companyId, day, incomeDelta: incomeDelta.toString(), expenseDelta: expenseDelta.toString() },
-        'Updating DailySummary'
-      );
-
-      await tx.dailySummary.upsert({
-        where: {
-          companyId_date: {
-            companyId,
-            date: day,
-          },
-        },
-        update: {
-          totalIncome: {
-            increment: incomeDelta,
-          },
-          totalExpense: {
-            increment: expenseDelta,
-          },
-        },
-        create: {
-          companyId,
-          date: day,
-          totalIncome: incomeDelta,
-          totalExpense: expenseDelta,
-        },
-      });
-    }
-
-    // 5) Upsert AccountBalance per account (daily increments)
-    const byAccount = new Map<number, { debit: Prisma.Decimal; credit: Prisma.Decimal }>();
-    for (const line of entry.lines) {
-      const accountId = line.accountId;
-      const debit = new Prisma.Decimal(line.debit);
-      const credit = new Prisma.Decimal(line.credit);
-
-      const prev = byAccount.get(accountId) ?? {
-        debit: new Prisma.Decimal(0),
-        credit: new Prisma.Decimal(0),
-      };
-      byAccount.set(accountId, {
-        debit: prev.debit.add(debit),
-        credit: prev.credit.add(credit),
-      });
-    }
-
-    for (const [accountId, totals] of byAccount.entries()) {
-      await (tx as any).accountBalance.upsert({
-        where: {
-          companyId_accountId_date: {
-            companyId,
-            accountId,
-            date: day,
-          },
-        },
-        update: {
-          debitTotal: { increment: totals.debit.toDecimalPlaces(2) },
-          creditTotal: { increment: totals.credit.toDecimalPlaces(2) },
-        },
-        create: {
-          companyId,
-          accountId,
-          date: day,
-          debitTotal: totals.debit.toDecimalPlaces(2),
-          creditTotal: totals.credit.toDecimalPlaces(2),
-        },
-      });
-    }
-  }, redis);
+      redis
+    );
+  });
 }
 
 const start = async () => {

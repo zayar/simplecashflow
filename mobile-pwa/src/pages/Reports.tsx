@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { useAuth } from '../lib/auth';
 import { getCustomers, getInvoices, type Customer, type InvoiceListRow } from '../lib/ar';
@@ -9,6 +9,8 @@ import { AppBar, GearIcon, IconButton } from '../components/AppBar';
 import { BottomNav } from '../components/BottomNav';
 import { Card } from '../components/ui/card';
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs';
+import { usePullToRefresh } from '../lib/usePullToRefresh';
+import { PullToRefreshIndicator } from '../components/PullToRefresh';
 
 type ReportTab = 'invoice' | 'client';
 type StatusTab = 'paid' | 'all';
@@ -30,6 +32,7 @@ export default function Reports() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const [tab, setTab] = useState<ReportTab>('invoice');
   const [statusTab, setStatusTab] = useState<StatusTab>('paid');
@@ -45,6 +48,17 @@ export default function Reports() {
     queryKey: ['customers', companyId],
     queryFn: async () => await getCustomers(companyId),
     enabled: companyId > 0
+  });
+
+  const handleRefresh = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['invoices', companyId] }),
+      queryClient.invalidateQueries({ queryKey: ['customers', companyId] })
+    ]);
+  }, [queryClient, companyId]);
+
+  const { isRefreshing, pullDistance, handlers, containerRef } = usePullToRefresh({
+    onRefresh: handleRefresh
   });
 
   const selectedYearInvoices = useMemo(() => {
@@ -89,7 +103,11 @@ export default function Reports() {
   const years = useMemo(() => yearChips(new Date().getFullYear()), []);
 
   return (
-    <div className="min-h-dvh bg-background">
+    <div
+      className="min-h-dvh bg-background"
+      ref={containerRef}
+      {...handlers}
+    >
       <AppBar
         title="Reports"
         left={
@@ -101,6 +119,8 @@ export default function Reports() {
       />
 
       <div className="mx-auto max-w-xl px-3 pb-24 pt-3">
+        <PullToRefreshIndicator isRefreshing={isRefreshing} pullDistance={pullDistance} />
+
         <Card className="rounded-2xl shadow-sm">
           <div className="p-3">
             <Tabs value={tab} onValueChange={(v) => setTab(v as ReportTab)} className="w-full">

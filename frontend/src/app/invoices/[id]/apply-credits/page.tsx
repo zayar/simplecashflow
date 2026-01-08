@@ -112,7 +112,7 @@ export default function ApplyCreditsToInvoicePage() {
         </Link>
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Apply Credits</h1>
-          <p className="text-sm text-muted-foreground">Apply customer advance (deposit) to this invoice.</p>
+          <p className="text-sm text-muted-foreground">Apply customer credits (credit notes) or customer advances to this invoice.</p>
         </div>
       </div>
 
@@ -153,7 +153,6 @@ export default function ApplyCreditsToInvoicePage() {
                   </SelectNative>
                   <div className="text-xs text-muted-foreground">
                     Only POSTED credit notes that are not yet applied to any invoice are shown.
-                    Credit notes created from this invoice will be applied automatically.
                   </div>
                 </div>
                 <Button type="submit" loading={submitting} loadingText="Applying..." disabled={remainingInvoice <= 0 || !cnId}>

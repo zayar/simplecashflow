@@ -41,7 +41,8 @@ export default function Warehouses() {
     await updateCompanySettings(companyId, { defaultLocationId: w.id });
     await qc.invalidateQueries({ queryKey: ['company-settings', companyId] });
     await qc.invalidateQueries({ queryKey: ['warehouses', companyId] });
-    navigate(`${returnTo}?picked=1`, { replace: true });
+    const sep = returnTo.includes('?') ? '&' : '?';
+    navigate(`${returnTo}${sep}picked=1`, { replace: true });
   }
 
   const selectedId = (settingsQuery.data as any)?.defaultLocationId ?? (settingsQuery.data as any)?.defaultWarehouseId ?? null;

@@ -95,8 +95,10 @@ export default function CustomerBalanceSummaryReportPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Customer Name</TableHead>
+                  <TableHead className="text-right">Opening Balance</TableHead>
                   <TableHead className="text-right">Invoiced Amount</TableHead>
                   <TableHead className="text-right">Amount Received</TableHead>
+                  <TableHead className="text-right">Credit</TableHead>
                   <TableHead className="text-right">Closing Balance</TableHead>
                 </TableRow>
               </TableHeader>
@@ -105,10 +107,16 @@ export default function CustomerBalanceSummaryReportPage() {
                   <TableRow key={String(r.customerId ?? r.customerName)}>
                     <TableCell className="font-medium">{r.customerName}</TableCell>
                     <TableCell className="text-right tabular-nums">
+                      {Number(r.openingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
                       {Number(r.invoicedAmount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {Number(r.amountReceived ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {Number(r.credit ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-medium tabular-nums">
                       {Number(r.closingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
@@ -117,7 +125,7 @@ export default function CustomerBalanceSummaryReportPage() {
                 ))}
                 {(data?.rows ?? []).length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} className="py-10 text-center text-muted-foreground">
+                    <TableCell colSpan={6} className="py-10 text-center text-muted-foreground">
                       No customers found.
                     </TableCell>
                   </TableRow>
@@ -126,10 +134,16 @@ export default function CustomerBalanceSummaryReportPage() {
                   <TableRow className="bg-muted/40">
                     <TableCell className="font-medium">Total</TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
+                      {Number((totals as any).openingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.invoicedAmount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.amountReceived ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </TableCell>
+                    <TableCell className="text-right font-semibold tabular-nums">
+                      {Number(totals.credit ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">
                       {Number(totals.closingBalance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
@@ -140,7 +154,7 @@ export default function CustomerBalanceSummaryReportPage() {
             </Table>
           </div>
           <div className="mt-2 text-xs text-muted-foreground">
-            Notes: “Amount Received” includes payments, applied customer advances, and posted credit notes that reduce receivables.
+            Notes: “Amount Received” is cash payments. “Credit” includes applied customer advances and POSTED credit notes (net of refunds).
           </div>
         </CardContent>
       </Card>

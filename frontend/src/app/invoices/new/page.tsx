@@ -623,7 +623,7 @@ export default function NewInvoicePage() {
                     <Input
                       type="number"
                               inputMode="decimal"
-                      step="1"
+                      step="any"
                       min="0"
                       className="text-right"
                       value={line.unitPrice}

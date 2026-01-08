@@ -13,6 +13,7 @@ import { nextVendorCreditNumber } from '../sequence/sequence.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry } from '../ledger/reversal.service.js';
+import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 export async function vendorCreditsRoutes(fastify) {
     fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
@@ -272,7 +273,7 @@ export async function vendorCreditsRoutes(fastify) {
         }
         const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
         try {
-            const { response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
                 SELECT id FROM VendorCredit
@@ -333,6 +334,8 @@ export async function vendorCreditsRoutes(fastify) {
                                 correlationId,
                                 createdByUserId: request.user?.userId ?? null,
                                 journalEntryId: null,
+                                // Allow backdating: WAC is recalculated by replaying the full move timeline.
+                                allowBackdated: true,
                             });
                         }
                         else {
@@ -388,10 +391,32 @@ export async function vendorCreditsRoutes(fastify) {
                         correlationId,
                         metadata: { creditNumber: vc.creditNumber, creditDate: vc.creditDate, total: total.toString(), journalEntryId: je.id, occurredAt },
                     });
-                    return { vendorCreditId: vc.id, status: 'POSTED', journalEntryId: je.id, total: total.toString() };
+                    // Emit journal.entry.created event so worker updates AccountBalance (Balance Sheet fix)
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            type: 'JournalEntryCreated',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(je.id),
+                            payload: { journalEntryId: je.id, companyId },
+                        },
+                    });
+                    return { vendorCreditId: vc.id, status: 'POSTED', journalEntryId: je.id, total: total.toString(), _jeEventId: jeEventId };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
             }, redis)));
+            // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+            if (!replay && result._jeEventId) {
+                publishEventsFastPath([result._jeEventId]);
+            }
             return { vendorCreditId: result.vendorCreditId, status: result.status, journalEntryId: result.journalEntryId };
         }
         catch (err) {
@@ -438,7 +463,7 @@ export async function vendorCreditsRoutes(fastify) {
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
-            const { response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { replay, response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
               SELECT id FROM VendorCredit
@@ -495,6 +520,7 @@ export async function vendorCreditsRoutes(fastify) {
                                 correlationId,
                                 createdByUserId: request.user?.userId ?? null,
                                 journalEntryId: reversal.id,
+                                allowBackdated: true,
                             });
                         }
                     }
@@ -520,10 +546,32 @@ export async function vendorCreditsRoutes(fastify) {
                         correlationId,
                         metadata: { reason: String(body.reason).trim(), voidDate, voidedAt, originalJournalEntryId: vc.journalEntryId, voidJournalEntryId: reversal.id, occurredAt },
                     });
-                    return { vendorCreditId: vc.id, status: 'VOID', voidJournalEntryId: reversal.id };
+                    // Emit journal.entry.created event for reversal JE so worker updates AccountBalance
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            type: 'JournalEntryCreated',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(reversal.id),
+                            payload: { journalEntryId: reversal.id, companyId },
+                        },
+                    });
+                    return { vendorCreditId: vc.id, status: 'VOID', voidJournalEntryId: reversal.id, _jeEventId: jeEventId };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
             }, redis));
+            // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
+            if (!replay && result._jeEventId) {
+                publishEventsFastPath([result._jeEventId]);
+            }
             return { vendorCreditId: result.vendorCreditId, status: result.status, voidJournalEntryId: result.voidJournalEntryId ?? null };
         }
         catch (err) {

@@ -7,10 +7,12 @@ import { getRedis } from '../../infrastructure/redis.js';
 import { withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
-import { isoNow, parseDateInput } from '../../utils/date.js';
+import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
 import { applyStockMoveWac, ensureInventoryCompanyDefaults, ensureInventoryItem, ensureLocation } from './stock.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
+import { assertOpenPeriodOrThrow } from '../../utils/periodClosePolicy.js';
+import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 
 function d2(n: number) {
   return new Prisma.Decimal(n).toDecimalPlaces(2);
@@ -139,6 +141,12 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
             await ensureLocation(tx as any, companyId, locationId);
 
+            await assertOpenPeriodOrThrow(tx as any, {
+              companyId,
+              transactionDate: date,
+              action: 'inventory.opening_balance',
+            });
+
             let totalValue = new Prisma.Decimal(0);
             const appliedLines: Array<{
               itemId: number;
@@ -178,6 +186,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                 correlationId,
                 createdByUserId: (request as any).user?.userId ?? null,
                 journalEntryId: null,
+                allowBackdated: true,
               });
 
               totalValue = totalValue.add(new Prisma.Decimal(applied.totalCostApplied));
@@ -341,12 +350,19 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
 
             await ensureLocation(tx as any, companyId, locationId);
 
+            await assertOpenPeriodOrThrow(tx as any, {
+              companyId,
+              transactionDate: date,
+              action: 'inventory.adjustment',
+            });
+
             // Validate offset account belongs to tenant
             const offsetAcc = await tx.account.findFirst({ where: { id: offsetAccountId, companyId } });
             if (!offsetAcc) throw Object.assign(new Error('offsetAccountId not found in this company'), { statusCode: 400 });
 
             let totalDebit = new Prisma.Decimal(0);
             let totalCredit = new Prisma.Decimal(0);
+            let inventoryRecalcFromDate: Date | null = null;
 
             for (const [idx, l] of (body.lines ?? []).entries()) {
               const itemId = Number(l.itemId);
@@ -381,7 +397,15 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                   correlationId,
                   createdByUserId: (request as any).user?.userId ?? null,
                   journalEntryId: null,
+                  allowBackdated: true,
                 });
+                const from = (applied as any)?.requiresInventoryRecalcFromDate as Date | null | undefined;
+                if (from && !isNaN(new Date(from).getTime())) {
+                  inventoryRecalcFromDate =
+                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                      ? new Date(from)
+                      : inventoryRecalcFromDate;
+                }
                 const value = new Prisma.Decimal(applied.totalCostApplied).toDecimalPlaces(2);
                 totalDebit = totalDebit.add(value);
                 totalCredit = totalCredit.add(value);
@@ -402,7 +426,15 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
                   correlationId,
                   createdByUserId: (request as any).user?.userId ?? null,
                   journalEntryId: null,
+                  allowBackdated: true,
                 });
+                const from = (applied as any)?.requiresInventoryRecalcFromDate as Date | null | undefined;
+                if (from && !isNaN(new Date(from).getTime())) {
+                  inventoryRecalcFromDate =
+                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                      ? new Date(from)
+                      : inventoryRecalcFromDate;
+                }
                 const value = new Prisma.Decimal(applied.totalCostApplied).toDecimalPlaces(2);
                 totalDebit = totalDebit.add(value);
                 totalCredit = totalCredit.add(value);
@@ -477,6 +509,34 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               },
             });
 
+            let inventoryRecalcEventId: string | null = null;
+            if (inventoryRecalcFromDate) {
+              inventoryRecalcEventId = randomUUID();
+              await tx.event.create({
+                data: {
+                  companyId,
+                  eventId: inventoryRecalcEventId,
+                  eventType: 'inventory.recalc.requested',
+                  schemaVersion: 'v1',
+                  occurredAt: new Date(occurredAt),
+                  source: 'cashflow-api',
+                  partitionKey: String(companyId),
+                  correlationId,
+                  causationId: jeEventId,
+                  aggregateType: 'Company',
+                  aggregateId: String(companyId),
+                  type: 'InventoryRecalcRequested',
+                  payload: {
+                    companyId,
+                    fromDate: normalizeToDay(new Date(inventoryRecalcFromDate)).toISOString().slice(0, 10),
+                    reason: 'backdated_stock_move_insert',
+                    source: 'InventoryAdjustment',
+                    journalEntryId: je.id,
+                  },
+                },
+              });
+            }
+
             await writeAuditLog(tx as any, {
               companyId,
               userId: (request as any).user?.userId ?? null,
@@ -495,7 +555,7 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
               },
             });
 
-            return { journalEntryId: je.id, netValue: net.toString(), locationId, _jeEventId: jeEventId };
+            return { journalEntryId: je.id, netValue: net.toString(), locationId, _jeEventId: jeEventId, _inventoryRecalcEventId: inventoryRecalcEventId };
           });
 
           return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
@@ -1082,6 +1142,95 @@ export async function inventoryRoutes(fastify: FastifyInstance) {
       journalEntryId: m.journalEntryId ?? null,
       createdAt: m.createdAt,
     }));
+  });
+
+  // --- Admin: request inventory recalc forward ---
+  // POST /companies/:companyId/admin/inventory/recalc?from=YYYY-MM-DD
+  // Requires Idempotency-Key header.
+  fastify.post('/companies/:companyId/admin/inventory/recalc', async (request, reply) => {
+    const companyId = requireCompanyIdParam(request, reply);
+    requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    if (!idempotencyKey) {
+      reply.status(400);
+      return { error: 'Idempotency-Key header is required' };
+    }
+
+    const fromStr = ((request.query as any)?.from ?? '') as string;
+    if (!fromStr || typeof fromStr !== 'string') {
+      reply.status(400);
+      return { error: 'from is required (YYYY-MM-DD)' };
+    }
+    const from = parseDateInput(fromStr);
+    if (!from || isNaN(from.getTime())) {
+      reply.status(400);
+      return { error: 'invalid from (YYYY-MM-DD)' };
+    }
+
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+    const lockKey = `lock:inventory:recalc:${companyId}:${fromStr}`;
+
+    const { replay, response: result } = await withLocksBestEffort(redis, [lockKey], 30_000, async () =>
+      runIdempotentRequest(
+        prisma,
+        companyId,
+        idempotencyKey,
+        async () => {
+          const txResult = await prisma.$transaction(async (tx) => {
+            const eventId = randomUUID();
+            await (tx as any).event.create({
+              data: {
+                companyId,
+                eventId,
+                eventType: 'inventory.recalc.requested',
+                schemaVersion: 'v1',
+                occurredAt: new Date(occurredAt),
+                source: 'cashflow-api',
+                partitionKey: String(companyId),
+                correlationId,
+                aggregateType: 'Company',
+                aggregateId: String(companyId),
+                type: 'InventoryRecalcRequested',
+                payload: {
+                  companyId,
+                  fromDate: normalizeToDay(from).toISOString().slice(0, 10),
+                  reason: 'manual_admin_request',
+                  source: 'Admin',
+                },
+              },
+            });
+
+            await writeAuditLog(tx as any, {
+              companyId,
+              userId: (request as any).user?.userId ?? null,
+              action: 'inventory.recalc.request',
+              entityType: 'Company',
+              entityId: companyId,
+              idempotencyKey,
+              correlationId,
+              metadata: { from: normalizeToDay(from).toISOString().slice(0, 10), occurredAt },
+            });
+
+            return { eventId };
+          });
+
+          return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+        },
+        redis
+      )
+    );
+
+    if (!replay && (result as any).eventId) {
+      publishEventsFastPath([(result as any).eventId]);
+    }
+
+    return {
+      companyId,
+      queued: true,
+      from: normalizeToDay(from).toISOString().slice(0, 10),
+      eventId: (result as any).eventId,
+    };
   });
 }
 

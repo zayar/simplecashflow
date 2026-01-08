@@ -49,6 +49,14 @@ export async function nextPurchaseBillNumber(tx, companyId) {
     const n = await nextCompanySequenceNumber(tx, companyId, 'PURCHASE_BILL');
     return `PB-${padNumber(n, 6)}`;
 }
+export async function nextPurchaseOrderNumber(tx, companyId) {
+    const n = await nextCompanySequenceNumber(tx, companyId, 'PURCHASE_ORDER');
+    return `PO-${padNumber(n, 6)}`;
+}
+export async function nextPurchaseReceiptNumber(tx, companyId) {
+    const n = await nextCompanySequenceNumber(tx, companyId, 'PURCHASE_RECEIPT');
+    return `PR-${padNumber(n, 6)}`;
+}
 export async function nextCreditNoteNumber(tx, companyId) {
     const n = await nextCompanySequenceNumber(tx, companyId, 'CREDIT_NOTE');
     return `CN-${padNumber(n, 5)}`;

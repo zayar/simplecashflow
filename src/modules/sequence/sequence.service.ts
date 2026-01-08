@@ -62,6 +62,16 @@ export async function nextPurchaseBillNumber(tx: PrismaTx, companyId: number): P
   return `PB-${padNumber(n, 6)}`;
 }
 
+export async function nextPurchaseOrderNumber(tx: PrismaTx, companyId: number): Promise<string> {
+  const n = await nextCompanySequenceNumber(tx, companyId, 'PURCHASE_ORDER');
+  return `PO-${padNumber(n, 6)}`;
+}
+
+export async function nextPurchaseReceiptNumber(tx: PrismaTx, companyId: number): Promise<string> {
+  const n = await nextCompanySequenceNumber(tx, companyId, 'PURCHASE_RECEIPT');
+  return `PR-${padNumber(n, 6)}`;
+}
+
 export async function nextCreditNoteNumber(tx: PrismaTx, companyId: number): Promise<string> {
   const n = await nextCompanySequenceNumber(tx, companyId, 'CREDIT_NOTE');
   return `CN-${padNumber(n, 5)}`;

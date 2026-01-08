@@ -1,16 +1,20 @@
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 import { createCustomer } from '../lib/ar';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
 import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Button } from '../components/ui/button';
+import { getInvoiceDraft, setInvoiceDraft } from '../lib/invoiceDraft';
 
 export default function CustomerNew() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const mode = params.get('mode'); // 'pick' or null
+  const returnTo = params.get('returnTo') ?? '/invoices/new';
 
   const [name, setName] = React.useState('');
   const [email, setEmail] = React.useState('');
@@ -25,12 +29,19 @@ export default function CustomerNew() {
     if (!name.trim()) return setError('Name is required');
     setSaving(true);
     try {
-      await createCustomer(companyId, {
+      const created = await createCustomer(companyId, {
         name: name.trim(),
         email: email.trim() ? email.trim() : null,
         phone: phone.trim() ? phone.trim() : null,
       });
-      navigate('/customers', { replace: true });
+      if (mode === 'pick') {
+        const draft = getInvoiceDraft();
+        setInvoiceDraft({ ...draft, customerId: created.id, customerName: created.name });
+        const sep = returnTo.includes('?') ? '&' : '?';
+        navigate(`${returnTo}${sep}picked=1`, { replace: true });
+      } else {
+        navigate('/customers', { replace: true });
+      }
     } catch (err: any) {
       setError(err?.message ?? 'Failed to create client');
     } finally {

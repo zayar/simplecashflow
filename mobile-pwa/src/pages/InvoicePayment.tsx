@@ -50,7 +50,7 @@ export default function InvoicePayment() {
   const [bankAccountId, setBankAccountId] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [selectedAttachmentUrl, setSelectedAttachmentUrl] = useState<string | null>(null);
+  const [selectedProof, setSelectedProof] = useState<{ id?: string | null; url: string } | null>(null);
 
   React.useEffect(() => {
     if (!inv) return;
@@ -89,7 +89,8 @@ export default function InvoicePayment() {
         paymentDate,
         amount: amt,
         bankAccountId: Number(bankAccountId),
-        attachmentUrl: selectedAttachmentUrl || undefined,
+        pendingProofId: selectedProof?.id ? String(selectedProof.id) : undefined,
+        attachmentUrl: selectedProof?.id ? undefined : selectedProof?.url || undefined,
       });
       
       // Invalidate queries so the invoice detail page shows updated data
@@ -163,11 +164,14 @@ export default function InvoicePayment() {
                   <button
                     key={idx}
                     type="button"
-                    onClick={() => setSelectedAttachmentUrl(
-                      selectedAttachmentUrl === proof.url ? null : proof.url
-                    )}
+                    onClick={() =>
+                      setSelectedProof((prev) => {
+                        const same = prev && prev.url === proof.url && String(prev.id ?? '') === String(proof?.id ?? '');
+                        return same ? null : { id: proof?.id ?? null, url: proof.url };
+                      })
+                    }
                     className={`relative aspect-square overflow-hidden rounded-lg border-2 ${
-                      selectedAttachmentUrl === proof.url
+                      selectedProof?.url === proof.url && String(selectedProof?.id ?? '') === String(proof?.id ?? '')
                         ? 'border-blue-500 ring-2 ring-blue-200'
                         : 'border-gray-200'
                     }`}
@@ -177,7 +181,7 @@ export default function InvoicePayment() {
                       alt={`Proof ${idx + 1}`}
                       className="h-full w-full object-cover"
                     />
-                    {selectedAttachmentUrl === proof.url && (
+                    {selectedProof?.url === proof.url && String(selectedProof?.id ?? '') === String(proof?.id ?? '') && (
                       <div className="absolute inset-0 flex items-center justify-center bg-blue-500/20">
                         <span className="rounded-full bg-blue-500 p-0.5 text-white text-xs">✓</span>
                       </div>
@@ -185,10 +189,10 @@ export default function InvoicePayment() {
                   </button>
                 ))}
               </div>
-              {selectedAttachmentUrl && (
+              {selectedProof && (
                 <div className="mt-2 flex items-center justify-between text-xs text-green-700">
                   <span>✓ Proof selected</span>
-                  <button type="button" onClick={() => setSelectedAttachmentUrl(null)} className="text-gray-500">
+                  <button type="button" onClick={() => setSelectedProof(null)} className="text-gray-500">
                     Clear
                   </button>
                 </div>

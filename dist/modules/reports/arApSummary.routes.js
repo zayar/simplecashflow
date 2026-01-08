@@ -43,7 +43,7 @@ export async function arApSummaryRoutes(fastify) {
         const { fromDate, toDate } = range;
         const vendors = (await prisma.vendor.findMany({
             where: { companyId },
-            select: { id: true, name: true },
+            select: { id: true, name: true, openingBalance: true },
             orderBy: { name: 'asc' },
         }));
         // Bills (PurchaseBill + Expense)
@@ -110,25 +110,37 @@ export async function arApSummaryRoutes(fastify) {
         AND ep.paymentDate <= ${toDate}
       GROUP BY e.vendorId
     `);
-        // Vendor credits applied reduce payables (treat like paid)
-        const vcAppliedInRange = (await prisma.$queryRaw `
-      SELECT vc.vendorId as vendorId, SUM(vca.amount) as amount
-      FROM VendorCreditApplication vca
-      JOIN VendorCredit vc ON vc.id = vca.vendorCreditId
-      WHERE vca.companyId = ${companyId}
-        AND vc.companyId = ${companyId}
-        AND vca.appliedDate >= ${fromDate}
-        AND vca.appliedDate <= ${toDate}
-      GROUP BY vc.vendorId
+        // Vendor credits reduce payables when they are POSTED (GL impact). Application is a sub-ledger link and
+        // should not be double-counted here. We treat POSTED vendor credits as non-cash settlement ("Credit").
+        const vcPostedInRange = (await prisma.vendorCredit.groupBy({
+            by: ['vendorId'],
+            where: { companyId, status: 'POSTED', creditDate: { gte: fromDate, lte: toDate } },
+            _sum: { total: true },
+        }));
+        const vcPostedToDate = (await prisma.vendorCredit.groupBy({
+            by: ['vendorId'],
+            where: { companyId, status: 'POSTED', creditDate: { lte: toDate } },
+            _sum: { total: true },
+        }));
+        // Vendor advances applied to bills reduce payables at application time. Treat as non-cash settlement ("Credit").
+        const vaAppliedInRange = (await prisma.$queryRaw `
+      SELECT va.vendorId as vendorId, SUM(vaa.amount) as amount
+      FROM VendorAdvanceApplication vaa
+      JOIN VendorAdvance va ON va.id = vaa.vendorAdvanceId
+      WHERE vaa.companyId = ${companyId}
+        AND va.companyId = ${companyId}
+        AND vaa.appliedDate >= ${fromDate}
+        AND vaa.appliedDate <= ${toDate}
+      GROUP BY va.vendorId
     `);
-        const vcAppliedToDate = (await prisma.$queryRaw `
-      SELECT vc.vendorId as vendorId, SUM(vca.amount) as amount
-      FROM VendorCreditApplication vca
-      JOIN VendorCredit vc ON vc.id = vca.vendorCreditId
-      WHERE vca.companyId = ${companyId}
-        AND vc.companyId = ${companyId}
-        AND vca.appliedDate <= ${toDate}
-      GROUP BY vc.vendorId
+        const vaAppliedToDate = (await prisma.$queryRaw `
+      SELECT va.vendorId as vendorId, SUM(vaa.amount) as amount
+      FROM VendorAdvanceApplication vaa
+      JOIN VendorAdvance va ON va.id = vaa.vendorAdvanceId
+      WHERE vaa.companyId = ${companyId}
+        AND va.companyId = ${companyId}
+        AND vaa.appliedDate <= ${toDate}
+      GROUP BY va.vendorId
     `);
         const mapSum = (rows, key, val) => {
             const m = new Map();
@@ -157,54 +169,85 @@ export async function arApSummaryRoutes(fastify) {
             const k = String(r.vendorId ?? 'null');
             billedToDateMap.set(k, d2((billedToDateMap.get(k) ?? d2(0)).add(d2(r._sum.amount ?? 0))));
         }
-        const paidInRangeMap = new Map();
-        for (const m of [pbPaidInRange, expPaidInRange, vcAppliedInRange]) {
+        const paidInRangeMap = new Map(); // cash payments only
+        for (const m of [pbPaidInRange, expPaidInRange]) {
             for (const r of m) {
                 const k = String(r.vendorId ?? 'null');
                 paidInRangeMap.set(k, d2((paidInRangeMap.get(k) ?? d2(0)).add(d2(r.amount ?? 0))));
             }
         }
-        const paidToDateMap = new Map();
-        for (const m of [pbPaidToDate, expPaidToDate, vcAppliedToDate]) {
+        const creditInRangeMap = new Map(); // vendor credits + applied advances (non-cash)
+        for (const r of vcPostedInRange) {
+            const k = String(r.vendorId ?? 'null');
+            creditInRangeMap.set(k, d2((creditInRangeMap.get(k) ?? d2(0)).add(d2(r._sum?.total ?? 0))));
+        }
+        for (const r of vaAppliedInRange) {
+            const k = String(r.vendorId ?? 'null');
+            creditInRangeMap.set(k, d2((creditInRangeMap.get(k) ?? d2(0)).add(d2(r.amount ?? 0))));
+        }
+        const paidToDateMap = new Map(); // cash payments only
+        for (const m of [pbPaidToDate, expPaidToDate]) {
             for (const r of m) {
                 const k = String(r.vendorId ?? 'null');
                 paidToDateMap.set(k, d2((paidToDateMap.get(k) ?? d2(0)).add(d2(r.amount ?? 0))));
             }
         }
+        const creditToDateMap = new Map(); // vendor credits + applied advances (non-cash)
+        for (const r of vcPostedToDate) {
+            const k = String(r.vendorId ?? 'null');
+            creditToDateMap.set(k, d2((creditToDateMap.get(k) ?? d2(0)).add(d2(r._sum?.total ?? 0))));
+        }
+        for (const r of vaAppliedToDate) {
+            const k = String(r.vendorId ?? 'null');
+            creditToDateMap.set(k, d2((creditToDateMap.get(k) ?? d2(0)).add(d2(r.amount ?? 0))));
+        }
         // Detect "No Vendor" rows if any doc exists with vendorId null
         const hasNullVendor = billedInRangeMap.has('null') ||
             billedToDateMap.has('null') ||
             paidInRangeMap.has('null') ||
-            paidToDateMap.has('null');
+            paidToDateMap.has('null') ||
+            creditInRangeMap.has('null') ||
+            creditToDateMap.has('null');
         const vendorRows = [
             ...(hasNullVendor ? [{ id: -1, name: 'No Vendor' }] : []),
             ...vendors,
         ].map((v) => {
             const key = v.id === -1 ? 'null' : String(v.id);
+            const opening = v.id === -1 ? d2(0) : d2(v.openingBalance ?? 0);
             const billedAmount = billedInRangeMap.get(key) ?? d2(0);
             const amountPaid = paidInRangeMap.get(key) ?? d2(0);
-            const closingBalance = d2((billedToDateMap.get(key) ?? d2(0)).sub(paidToDateMap.get(key) ?? d2(0)));
+            const credit = creditInRangeMap.get(key) ?? d2(0);
+            const billedToDate = billedToDateMap.get(key) ?? d2(0);
+            const paidToDate = paidToDateMap.get(key) ?? d2(0);
+            const creditToDate = creditToDateMap.get(key) ?? d2(0);
+            const closingBalance = d2(opening.add(billedToDate).sub(d2(paidToDate.add(creditToDate))));
             return {
                 vendorId: v.id === -1 ? null : v.id,
                 vendorName: v.name,
+                openingBalance: asMoneyString(opening),
                 billedAmount: asMoneyString(billedAmount),
                 amountPaid: asMoneyString(amountPaid),
+                credit: asMoneyString(credit),
                 closingBalance: asMoneyString(closingBalance),
             };
         });
         const totals = vendorRows.reduce((acc, r) => {
+            acc.opening = d2(acc.opening.add(d2(r.openingBalance)));
             acc.billed = d2(acc.billed.add(d2(r.billedAmount)));
             acc.paid = d2(acc.paid.add(d2(r.amountPaid)));
+            acc.credit = d2(acc.credit.add(d2(r.credit)));
             acc.closing = d2(acc.closing.add(d2(r.closingBalance)));
             return acc;
-        }, { billed: d2(0), paid: d2(0), closing: d2(0) });
+        }, { opening: d2(0), billed: d2(0), paid: d2(0), credit: d2(0), closing: d2(0) });
         return {
             companyId,
             from: fromDate.toISOString().slice(0, 10),
             to: toDate.toISOString().slice(0, 10),
             totals: {
+                openingBalance: asMoneyString(totals.opening),
                 billedAmount: asMoneyString(totals.billed),
                 amountPaid: asMoneyString(totals.paid),
+                credit: asMoneyString(totals.credit),
                 closingBalance: asMoneyString(totals.closing),
             },
             rows: vendorRows,
@@ -220,7 +263,7 @@ export async function arApSummaryRoutes(fastify) {
         const { fromDate, toDate } = range;
         const customers = (await prisma.customer.findMany({
             where: { companyId },
-            select: { id: true, name: true },
+            select: { id: true, name: true, openingBalance: true },
             orderBy: { name: 'asc' },
         }));
         const invoiceStatuses = ['POSTED', 'PARTIAL', 'PAID'];
@@ -281,12 +324,12 @@ export async function arApSummaryRoutes(fastify) {
         const cnInRange = (await prisma.creditNote.groupBy({
             by: ['customerId'],
             where: { companyId, status: { in: creditStatuses }, creditNoteDate: { gte: fromDate, lte: toDate } },
-            _sum: { total: true },
+            _sum: { total: true, amountRefunded: true },
         }));
         const cnToDate = (await prisma.creditNote.groupBy({
             by: ['customerId'],
             where: { companyId, status: { in: creditStatuses }, creditNoteDate: { lte: toDate } },
-            _sum: { total: true },
+            _sum: { total: true, amountRefunded: true },
         }));
         const invInRangeMap = new Map(invInRange.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
         const invToDateMap = new Map(invToDate.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
@@ -294,33 +337,46 @@ export async function arApSummaryRoutes(fastify) {
         const payToDateMap = new Map(payToDate.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
         const advInRangeMap = new Map(advAppliedInRange.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
         const advToDateMap = new Map(advAppliedToDate.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
-        const cnInRangeMap = new Map(cnInRange.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
-        const cnToDateMap = new Map(cnToDate.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
+        // Net credit note impact on AR = total - refunded (refund reverses the AR reduction).
+        const cnInRangeMap = new Map(cnInRange.map((r) => [Number(r.customerId), d2(d2(r._sum.total ?? 0).sub(d2(r._sum.amountRefunded ?? 0)))]));
+        const cnToDateMap = new Map(cnToDate.map((r) => [Number(r.customerId), d2(d2(r._sum.total ?? 0).sub(d2(r._sum.amountRefunded ?? 0)))]));
         const rows = customers.map((c) => {
+            const opening = d2(c.openingBalance ?? 0);
             const invoicedAmount = invInRangeMap.get(c.id) ?? d2(0);
-            const received = d2((payInRangeMap.get(c.id) ?? d2(0)).add(advInRangeMap.get(c.id) ?? d2(0)).add(cnInRangeMap.get(c.id) ?? d2(0)));
-            const closing = d2((invToDateMap.get(c.id) ?? d2(0)).sub(payToDateMap.get(c.id) ?? d2(0)).sub(advToDateMap.get(c.id) ?? d2(0)).sub(cnToDateMap.get(c.id) ?? d2(0)));
+            const amountReceived = d2(payInRangeMap.get(c.id) ?? d2(0)); // cash receipts only
+            const credit = d2((advInRangeMap.get(c.id) ?? d2(0)).add(cnInRangeMap.get(c.id) ?? d2(0))); // advances + credit notes
+            const closing = d2(opening
+                .add(invToDateMap.get(c.id) ?? d2(0))
+                .sub(payToDateMap.get(c.id) ?? d2(0))
+                .sub(advToDateMap.get(c.id) ?? d2(0))
+                .sub(cnToDateMap.get(c.id) ?? d2(0)));
             return {
                 customerId: c.id,
                 customerName: c.name,
+                openingBalance: asMoneyString(opening),
                 invoicedAmount: asMoneyString(invoicedAmount),
-                amountReceived: asMoneyString(received),
+                amountReceived: asMoneyString(amountReceived),
+                credit: asMoneyString(credit),
                 closingBalance: asMoneyString(closing),
             };
         });
         const totals = rows.reduce((acc, r) => {
+            acc.opening = d2(acc.opening.add(d2(r.openingBalance)));
             acc.invoiced = d2(acc.invoiced.add(d2(r.invoicedAmount)));
             acc.received = d2(acc.received.add(d2(r.amountReceived)));
+            acc.credit = d2(acc.credit.add(d2(r.credit)));
             acc.closing = d2(acc.closing.add(d2(r.closingBalance)));
             return acc;
-        }, { invoiced: d2(0), received: d2(0), closing: d2(0) });
+        }, { opening: d2(0), invoiced: d2(0), received: d2(0), credit: d2(0), closing: d2(0) });
         return {
             companyId,
             from: fromDate.toISOString().slice(0, 10),
             to: toDate.toISOString().slice(0, 10),
             totals: {
+                openingBalance: asMoneyString(totals.opening),
                 invoicedAmount: asMoneyString(totals.invoiced),
                 amountReceived: asMoneyString(totals.received),
+                credit: asMoneyString(totals.credit),
                 closingBalance: asMoneyString(totals.closing),
             },
             rows,

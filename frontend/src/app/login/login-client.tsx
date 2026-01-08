@@ -20,8 +20,12 @@ import { Label } from "@/components/ui/label"
 import { LogoMark } from "@/components/logo-mark"
 
 export function LoginClientPage() {
+  const [mode, setMode] = useState<"otp" | "password">("otp")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
+  const [phone, setPhone] = useState("")
+  const [otp, setOtp] = useState("")
+  const [otpSent, setOtpSent] = useState(false)
   const [error, setError] = useState("")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const { login, user, isLoading } = useAuth()
@@ -31,7 +35,7 @@ export function LoginClientPage() {
     if (!isLoading && user) router.push("/dashboard")
   }, [isLoading, user, router])
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError("")
     setIsSubmitting(true)
@@ -47,6 +51,40 @@ export function LoginClientPage() {
       setIsSubmitting(false)
     }
   };
+
+  const handleRequestOtp = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError("")
+    setIsSubmitting(true)
+    try {
+      await fetchApi('/login/otp/request', {
+        method: 'POST',
+        body: JSON.stringify({ phone }),
+      });
+      setOtpSent(true)
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError("")
+    setIsSubmitting(true)
+    try {
+      const res = await fetchApi('/login/otp/verify', {
+        method: 'POST',
+        body: JSON.stringify({ phone, code: otp }),
+      });
+      login(res.token, res.user);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
 
   return (
     <div className="min-h-screen px-4 py-10">
@@ -80,10 +118,100 @@ export function LoginClientPage() {
               <Card className="shadow-none border-muted/60">
         <CardHeader>
           <CardTitle className="text-lg">Sign in</CardTitle>
-                  <CardDescription>Use your email and password to continue.</CardDescription>
+                  <CardDescription>
+                    {mode === "otp" ? "Use phone OTP to continue." : "Use your email and password to continue."}
+                  </CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit} className="grid gap-4">
+          <div className="mb-4 flex gap-2">
+            <Button
+              type="button"
+              variant={mode === "otp" ? "default" : "outline"}
+              className="flex-1"
+              onClick={() => {
+                setMode("otp")
+                setError("")
+              }}
+            >
+              Phone OTP
+            </Button>
+            <Button
+              type="button"
+              variant={mode === "password" ? "default" : "outline"}
+              className="flex-1"
+              onClick={() => {
+                setMode("password")
+                setError("")
+              }}
+            >
+              Email + Password
+            </Button>
+          </div>
+
+          {mode === "otp" ? (
+            <form onSubmit={otpSent ? handleVerifyOtp : handleRequestOtp} className="grid gap-4">
+              <div className="grid gap-2">
+                <Label htmlFor="phone">Phone number</Label>
+                <Input
+                  id="phone"
+                  type="tel"
+                  placeholder="e.g. 09xxxxxxxxx"
+                  required
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  disabled={otpSent}
+                />
+              </div>
+
+              {otpSent ? (
+                <div className="grid gap-2">
+                  <Label htmlFor="otp">OTP code</Label>
+                  <Input
+                    id="otp"
+                    inputMode="numeric"
+                    placeholder="6-digit code"
+                    required
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value)}
+                  />
+                </div>
+              ) : null}
+
+              {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+              <Button className="w-full" type="submit" disabled={isSubmitting}>
+                {isSubmitting ? (otpSent ? "Verifying..." : "Sending code...") : otpSent ? "Verify & Log In" : "Send OTP"}
+              </Button>
+
+              {otpSent ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="w-full"
+                  disabled={isSubmitting}
+                  onClick={() => {
+                    setOtpSent(false)
+                    setOtp("")
+                    setError("")
+                  }}
+                >
+                  Change phone
+                </Button>
+              ) : null}
+
+              <div className="text-center text-sm text-muted-foreground">
+                Prefer password login?{" "}
+                <button
+                  type="button"
+                  className="font-medium text-foreground underline underline-offset-4"
+                  onClick={() => setMode("password")}
+                >
+                  Use email + password
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handlePasswordSubmit} className="grid gap-4">
             <div className="grid gap-2">
                       <Label htmlFor="email">Email address</Label>
               <Input
@@ -124,6 +252,7 @@ export function LoginClientPage() {
               </Link>
             </div>
           </form>
+          )}
         </CardContent>
         </Card>
 

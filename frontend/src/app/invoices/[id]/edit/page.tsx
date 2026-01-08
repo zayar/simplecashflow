@@ -680,7 +680,7 @@ export default function EditInvoicePage() {
                               <Input
                                 type="number"
                                 inputMode="decimal"
-                                step="1"
+                                step="any"
                                 min="0"
                                 className="text-right"
                                 value={(line as any).unitPrice}

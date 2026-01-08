@@ -51,9 +51,9 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
 
     const vendors = (await prisma.vendor.findMany({
       where: { companyId },
-      select: { id: true, name: true },
+      select: { id: true, name: true, openingBalance: true },
       orderBy: { name: 'asc' },
-    })) as IdName[];
+    })) as Array<IdName & { openingBalance?: Prisma.Decimal | null }>;
 
     // Bills (PurchaseBill + Expense)
     const pbBilledInRange = (await prisma.purchaseBill.groupBy({
@@ -134,7 +134,7 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
     `) as Array<{ vendorId: number | null; amount: any }>;
 
     // Vendor credits reduce payables when they are POSTED (GL impact). Application is a sub-ledger link and
-    // should not be double-counted here. We treat POSTED vendor credits like a payment/settlement.
+    // should not be double-counted here. We treat POSTED vendor credits as non-cash settlement ("Credit").
     const vcPostedInRange = (await prisma.vendorCredit.groupBy({
       by: ['vendorId'],
       where: { companyId, status: 'POSTED' as any, creditDate: { gte: fromDate, lte: toDate } },
@@ -146,6 +146,32 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       where: { companyId, status: 'POSTED' as any, creditDate: { lte: toDate } },
       _sum: { total: true },
     })) as any[];
+
+    // Vendor advances applied to bills reduce payables at application time. Treat as non-cash settlement ("Credit").
+    const vaAppliedInRange = (await prisma.$queryRaw<
+      Array<{ vendorId: number | null; amount: any }>
+    >`
+      SELECT va.vendorId as vendorId, SUM(vaa.amount) as amount
+      FROM VendorAdvanceApplication vaa
+      JOIN VendorAdvance va ON va.id = vaa.vendorAdvanceId
+      WHERE vaa.companyId = ${companyId}
+        AND va.companyId = ${companyId}
+        AND vaa.appliedDate >= ${fromDate}
+        AND vaa.appliedDate <= ${toDate}
+      GROUP BY va.vendorId
+    `) as Array<{ vendorId: number | null; amount: any }>;
+
+    const vaAppliedToDate = (await prisma.$queryRaw<
+      Array<{ vendorId: number | null; amount: any }>
+    >`
+      SELECT va.vendorId as vendorId, SUM(vaa.amount) as amount
+      FROM VendorAdvanceApplication vaa
+      JOIN VendorAdvance va ON va.id = vaa.vendorAdvanceId
+      WHERE vaa.companyId = ${companyId}
+        AND va.companyId = ${companyId}
+        AND vaa.appliedDate <= ${toDate}
+      GROUP BY va.vendorId
+    `) as Array<{ vendorId: number | null; amount: any }>;
 
     const mapSum = <T extends { [k: string]: any }>(rows: T[], key: keyof T, val: keyof T) => {
       const m = new Map<string, Prisma.Decimal>();
@@ -177,29 +203,38 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       billedToDateMap.set(k, d2((billedToDateMap.get(k) ?? d2(0)).add(d2(r._sum.amount ?? 0))));
     }
 
-    const paidInRangeMap = new Map<string, Prisma.Decimal>();
+    const paidInRangeMap = new Map<string, Prisma.Decimal>(); // cash payments only
     for (const m of [pbPaidInRange, expPaidInRange]) {
       for (const r of m) {
         const k = String((r as any).vendorId ?? 'null');
         paidInRangeMap.set(k, d2((paidInRangeMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
       }
     }
-    // Add POSTED vendor credits as settlement (reduce payable)
+    const creditInRangeMap = new Map<string, Prisma.Decimal>(); // vendor credits + applied advances (non-cash)
     for (const r of vcPostedInRange as any[]) {
       const k = String((r as any).vendorId ?? 'null');
-      paidInRangeMap.set(k, d2((paidInRangeMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
+      creditInRangeMap.set(k, d2((creditInRangeMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
+    }
+    for (const r of vaAppliedInRange as any[]) {
+      const k = String((r as any).vendorId ?? 'null');
+      creditInRangeMap.set(k, d2((creditInRangeMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
     }
 
-    const paidToDateMap = new Map<string, Prisma.Decimal>();
+    const paidToDateMap = new Map<string, Prisma.Decimal>(); // cash payments only
     for (const m of [pbPaidToDate, expPaidToDate]) {
       for (const r of m) {
         const k = String((r as any).vendorId ?? 'null');
         paidToDateMap.set(k, d2((paidToDateMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
       }
     }
+    const creditToDateMap = new Map<string, Prisma.Decimal>(); // vendor credits + applied advances (non-cash)
     for (const r of vcPostedToDate as any[]) {
       const k = String((r as any).vendorId ?? 'null');
-      paidToDateMap.set(k, d2((paidToDateMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
+      creditToDateMap.set(k, d2((creditToDateMap.get(k) ?? d2(0)).add(d2((r as any)._sum?.total ?? 0))));
+    }
+    for (const r of vaAppliedToDate as any[]) {
+      const k = String((r as any).vendorId ?? 'null');
+      creditToDateMap.set(k, d2((creditToDateMap.get(k) ?? d2(0)).add(d2((r as any).amount ?? 0))));
     }
 
     // Detect "No Vendor" rows if any doc exists with vendorId null
@@ -207,34 +242,53 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       billedInRangeMap.has('null') ||
       billedToDateMap.has('null') ||
       paidInRangeMap.has('null') ||
-      paidToDateMap.has('null');
+      paidToDateMap.has('null') ||
+      creditInRangeMap.has('null') ||
+      creditToDateMap.has('null');
 
-    const vendorRows: Array<{ vendorId: number | null; vendorName: string; billedAmount: string; amountPaid: string; closingBalance: string }> =
+    const vendorRows: Array<{
+      vendorId: number | null;
+      vendorName: string;
+      openingBalance: string;
+      billedAmount: string;
+      amountPaid: string;
+      credit: string;
+      closingBalance: string;
+    }> =
       [
         ...(hasNullVendor ? [{ id: -1, name: 'No Vendor' }] : []),
         ...vendors,
       ].map((v) => {
         const key = v.id === -1 ? 'null' : String(v.id);
+        const opening = v.id === -1 ? d2(0) : d2((v as any).openingBalance ?? 0);
         const billedAmount = billedInRangeMap.get(key) ?? d2(0);
         const amountPaid = paidInRangeMap.get(key) ?? d2(0);
-        const closingBalance = d2((billedToDateMap.get(key) ?? d2(0)).sub(paidToDateMap.get(key) ?? d2(0)));
+        const credit = creditInRangeMap.get(key) ?? d2(0);
+        const billedToDate = billedToDateMap.get(key) ?? d2(0);
+        const paidToDate = paidToDateMap.get(key) ?? d2(0);
+        const creditToDate = creditToDateMap.get(key) ?? d2(0);
+        const closingBalance = d2(opening.add(billedToDate).sub(d2(paidToDate.add(creditToDate))));
         return {
           vendorId: v.id === -1 ? null : v.id,
           vendorName: v.name,
+          openingBalance: asMoneyString(opening),
           billedAmount: asMoneyString(billedAmount),
           amountPaid: asMoneyString(amountPaid),
+          credit: asMoneyString(credit),
           closingBalance: asMoneyString(closingBalance),
         };
       });
 
     const totals = vendorRows.reduce(
       (acc, r) => {
+        acc.opening = d2(acc.opening.add(d2((r as any).openingBalance)));
         acc.billed = d2(acc.billed.add(d2(r.billedAmount)));
         acc.paid = d2(acc.paid.add(d2(r.amountPaid)));
+        acc.credit = d2(acc.credit.add(d2((r as any).credit)));
         acc.closing = d2(acc.closing.add(d2(r.closingBalance)));
         return acc;
       },
-      { billed: d2(0), paid: d2(0), closing: d2(0) }
+      { opening: d2(0), billed: d2(0), paid: d2(0), credit: d2(0), closing: d2(0) }
     );
 
     return {
@@ -242,8 +296,10 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       from: fromDate.toISOString().slice(0, 10),
       to: toDate.toISOString().slice(0, 10),
       totals: {
+        openingBalance: asMoneyString((totals as any).opening),
         billedAmount: asMoneyString(totals.billed),
         amountPaid: asMoneyString(totals.paid),
+        credit: asMoneyString((totals as any).credit),
         closingBalance: asMoneyString(totals.closing),
       },
       rows: vendorRows,
@@ -260,9 +316,9 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
 
     const customers = (await prisma.customer.findMany({
       where: { companyId },
-      select: { id: true, name: true },
+      select: { id: true, name: true, openingBalance: true },
       orderBy: { name: 'asc' },
-    })) as IdName[];
+    })) as Array<IdName & { openingBalance?: Prisma.Decimal | null }>;
 
     const invoiceStatuses = ['POSTED', 'PARTIAL', 'PAID'] as any;
     const creditStatuses = ['POSTED'] as any;
@@ -337,13 +393,13 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
     const cnInRange = (await prisma.creditNote.groupBy({
       by: ['customerId'],
       where: { companyId, status: { in: creditStatuses }, creditNoteDate: { gte: fromDate, lte: toDate } },
-      _sum: { total: true },
+      _sum: { total: true, amountRefunded: true },
     })) as any[];
 
     const cnToDate = (await prisma.creditNote.groupBy({
       by: ['customerId'],
       where: { companyId, status: { in: creditStatuses }, creditNoteDate: { lte: toDate } },
-      _sum: { total: true },
+      _sum: { total: true, amountRefunded: true },
     })) as any[];
 
     const invInRangeMap = new Map<number, Prisma.Decimal>(invInRange.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
@@ -352,30 +408,47 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
     const payToDateMap = new Map<number, Prisma.Decimal>(payToDate.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
     const advInRangeMap = new Map<number, Prisma.Decimal>(advAppliedInRange.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
     const advToDateMap = new Map<number, Prisma.Decimal>(advAppliedToDate.map((r) => [Number(r.customerId), d2(r.amount ?? 0)]));
-    const cnInRangeMap = new Map<number, Prisma.Decimal>(cnInRange.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
-    const cnToDateMap = new Map<number, Prisma.Decimal>(cnToDate.map((r) => [Number(r.customerId), d2(r._sum.total ?? 0)]));
+    // Net credit note impact on AR = total - refunded (refund reverses the AR reduction).
+    const cnInRangeMap = new Map<number, Prisma.Decimal>(
+      cnInRange.map((r) => [Number(r.customerId), d2(d2(r._sum.total ?? 0).sub(d2(r._sum.amountRefunded ?? 0)))])
+    );
+    const cnToDateMap = new Map<number, Prisma.Decimal>(
+      cnToDate.map((r) => [Number(r.customerId), d2(d2(r._sum.total ?? 0).sub(d2(r._sum.amountRefunded ?? 0)))])
+    );
 
     const rows = customers.map((c) => {
+      const opening = d2((c as any).openingBalance ?? 0);
       const invoicedAmount = invInRangeMap.get(c.id) ?? d2(0);
-      const received = d2((payInRangeMap.get(c.id) ?? d2(0)).add(advInRangeMap.get(c.id) ?? d2(0)).add(cnInRangeMap.get(c.id) ?? d2(0)));
-      const closing = d2((invToDateMap.get(c.id) ?? d2(0)).sub(payToDateMap.get(c.id) ?? d2(0)).sub(advToDateMap.get(c.id) ?? d2(0)).sub(cnToDateMap.get(c.id) ?? d2(0)));
+      const amountReceived = d2(payInRangeMap.get(c.id) ?? d2(0)); // cash receipts only
+      const credit = d2((advInRangeMap.get(c.id) ?? d2(0)).add(cnInRangeMap.get(c.id) ?? d2(0))); // advances + credit notes
+      const closing = d2(
+        opening
+          .add(invToDateMap.get(c.id) ?? d2(0))
+          .sub(payToDateMap.get(c.id) ?? d2(0))
+          .sub(advToDateMap.get(c.id) ?? d2(0))
+          .sub(cnToDateMap.get(c.id) ?? d2(0))
+      );
       return {
         customerId: c.id,
         customerName: c.name,
+        openingBalance: asMoneyString(opening),
         invoicedAmount: asMoneyString(invoicedAmount),
-        amountReceived: asMoneyString(received),
+        amountReceived: asMoneyString(amountReceived),
+        credit: asMoneyString(credit),
         closingBalance: asMoneyString(closing),
       };
     });
 
     const totals = rows.reduce(
       (acc, r) => {
+        acc.opening = d2(acc.opening.add(d2((r as any).openingBalance)));
         acc.invoiced = d2(acc.invoiced.add(d2(r.invoicedAmount)));
         acc.received = d2(acc.received.add(d2(r.amountReceived)));
+        acc.credit = d2(acc.credit.add(d2((r as any).credit)));
         acc.closing = d2(acc.closing.add(d2(r.closingBalance)));
         return acc;
       },
-      { invoiced: d2(0), received: d2(0), closing: d2(0) }
+      { opening: d2(0), invoiced: d2(0), received: d2(0), credit: d2(0), closing: d2(0) }
     );
 
     return {
@@ -383,8 +456,10 @@ export async function arApSummaryRoutes(fastify: FastifyInstance) {
       from: fromDate.toISOString().slice(0, 10),
       to: toDate.toISOString().slice(0, 10),
       totals: {
+        openingBalance: asMoneyString((totals as any).opening),
         invoicedAmount: asMoneyString(totals.invoiced),
         amountReceived: asMoneyString(totals.received),
+        credit: asMoneyString((totals as any).credit),
         closingBalance: asMoneyString(totals.closing),
       },
       rows,

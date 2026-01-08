@@ -1,1 +1,1 @@
-{"version":3,"file":"invoicePublic.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/books/invoicePublic.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AA+E/C,wBAAsB,mBAAmB,CAAC,OAAO,EAAE,eAAe,iBAqSjE"}
+{"version":3,"file":"invoicePublic.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/books/invoicePublic.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AAgK/C,wBAAsB,mBAAmB,CAAC,OAAO,EAAE,eAAe,iBA2cjE"}

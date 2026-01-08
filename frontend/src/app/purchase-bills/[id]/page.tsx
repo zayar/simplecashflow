@@ -4,13 +4,21 @@ import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from '@/lib/api';
 import { formatDateInTimeZone } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { ArrowLeft, Pencil } from 'lucide-react';
+import { ArrowLeft, ChevronDown, Pencil } from 'lucide-react';
+import { InvoicePaper } from '@/components/invoice/InvoicePaper';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 function statusBadge(status: string) {
   switch (status) {
@@ -32,11 +40,13 @@ export default function PurchaseBillDetailPage() {
   const params = useParams<{ id: string }>();
   const id = Number(params?.id);
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const companyName = companySettings?.name ?? 'Company';
 
   const [bill, setBill] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [hasEligibleCredits, setHasEligibleCredits] = useState(false);
+  const [template, setTemplate] = useState<InvoiceTemplate | null>(null);
 
   const makeIdempotencyKey = () => {
     return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -60,6 +70,13 @@ export default function PurchaseBillDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.companyId, id]);
 
+  useEffect(() => {
+    if (!user?.companyId) return;
+    getInvoiceTemplate(user.companyId)
+      .then((t) => setTemplate(t))
+      .catch(() => setTemplate(null));
+  }, [user?.companyId]);
+
   // Determine whether to show "Apply credits" based on eligible credits for this bill's vendor.
   useEffect(() => {
     if (!user?.companyId) return;
@@ -71,10 +88,15 @@ export default function PurchaseBillDetailPage() {
       return;
     }
     let cancelled = false;
-    fetchApi(`/companies/${user.companyId}/vendor-credits?vendorId=${vendorId}&eligibleOnly=true`)
-      .then((rows: any[]) => {
+    Promise.all([
+      fetchApi(`/companies/${user.companyId}/vendor-credits?vendorId=${vendorId}&eligibleOnly=true`).catch(() => []),
+      fetchApi(`/companies/${user.companyId}/vendors/${vendorId}/vendor-advances?onlyOpen=1`).catch(() => []),
+    ])
+      .then(([credits, advances]: any[]) => {
         if (cancelled) return;
-        setHasEligibleCredits(Array.isArray(rows) && rows.length > 0);
+        const hasCredits = Array.isArray(credits) && credits.length > 0;
+        const hasAdvances = Array.isArray(advances) && advances.length > 0;
+        setHasEligibleCredits(hasCredits || hasAdvances);
       })
       .catch(() => {
         if (cancelled) return;
@@ -100,7 +122,8 @@ export default function PurchaseBillDetailPage() {
   const missingAccountLines = useMemo(() => {
     const lines = (bill?.lines ?? []) as any[];
     const missing: number[] = [];
-    for (const [idx, l] of lines.entries()) {
+    for (let idx = 0; idx < lines.length; idx++) {
+      const l = lines[idx];
       const it = l.item;
       const isTracked = it?.type === 'GOODS' && !!it?.trackInventory;
       // Tracked items should be Inventory Asset (configured); if account is missing, posting will fail.
@@ -116,6 +139,9 @@ export default function PurchaseBillDetailPage() {
     if (bill.status !== 'DRAFT') return false;
     return missingAccountLines.length === 0;
   }, [bill, missingAccountLines]);
+
+  const canReceivePayment = bill?.status === 'POSTED' || bill?.status === 'PARTIAL';
+  const canApplyCredits = canReceivePayment && remaining > 0 && hasEligibleCredits;
 
   const postBill = async () => {
     if (!user?.companyId) return;
@@ -149,33 +175,79 @@ export default function PurchaseBillDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-4">
+      {/* Print styles: show the paper only */}
+      <style jsx global>{`
+        @media print {
+          body * {
+            visibility: hidden !important;
+          }
+          .print-area,
+          .print-area * {
+            visibility: visible !important;
+          }
+          .print-area {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100% !important;
+          }
+          .no-print {
+            display: none !important;
+            visibility: hidden !important;
+          }
+          .print-paper {
+            box-shadow: none !important;
+            border: none !important;
+          }
+          body {
+            background: white !important;
+          }
+        }
+      `}</style>
+
+      {/* Top actions */}
+      <div className="no-print flex items-start justify-between gap-4">
+        <div className="flex items-start gap-4">
           <Link href="/purchase-bills">
             <Button variant="ghost" size="icon">
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
           <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">
-              {bill?.billNumber ?? (loading ? 'Loading...' : 'Purchase Bill')}
-            </h1>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              {bill?.status ? statusBadge(bill.status) : null}
-              {bill?.status === 'PAID' && paidByCredits > 0 ? (
-                <Badge variant="outline">Paid by Credits</Badge>
-              ) : paidByCredits > 0 ? (
-                <Badge variant="outline">Credits applied</Badge>
-              ) : null}
-              <span>•</span>
-              <span>{bill?.warehouse?.name ?? '—'}</span>
-              <span>•</span>
-              <span>{bill?.vendor?.name ?? '—'}</span>
-            </div>
+            <h1 className="text-2xl font-semibold tracking-tight">Purchase Bill</h1>
+            {loading && !bill ? (
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                <Skeleton className="h-4 w-36" />
+                <Skeleton className="h-4 w-28" />
+                <Skeleton className="h-4 w-28" />
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                <span className="font-medium text-foreground">{bill?.billNumber ?? `PB-${id}`}</span>
+                <span>•</span>
+                <span>{bill?.vendor?.name ?? '—'}</span>
+                <span>•</span>
+                {bill?.status ? statusBadge(bill.status) : null}
+                {bill?.status === 'PAID' && paidByCredits > 0 ? (
+                  <>
+                    <span>•</span>
+                    <Badge variant="outline">Paid by credits</Badge>
+                  </>
+                ) : paidByCredits > 0 ? (
+                  <>
+                    <span>•</span>
+                    <Badge variant="outline">Credits applied</Badge>
+                  </>
+                ) : null}
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button variant="outline" onClick={() => window.print()}>
+            Print
+          </Button>
           {bill?.status === 'DRAFT' ? (
             <Link href={`/purchase-bills/${id}/edit`} className={buttonVariants({ variant: 'outline' })}>
               <span className="inline-flex items-center gap-2">
@@ -199,17 +271,15 @@ export default function PurchaseBillDetailPage() {
               Post
             </Button>
           ) : null}
-          {(bill?.status === 'POSTED' || bill?.status === 'PARTIAL') && remaining > 0 ? (
-            <>
-              <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
-                Record payment
-              </Link>
-              {hasEligibleCredits ? (
-                <Link href={`/purchase-bills/${id}/apply-credits`} className={buttonVariants({ variant: 'outline' })}>
-                  Apply credits
-                </Link>
-              ) : null}
-            </>
+          {canReceivePayment && remaining > 0 ? (
+            <Link href={`/purchase-bills/${id}/payment`} className={buttonVariants({ variant: 'default' })}>
+              Record payment
+            </Link>
+          ) : null}
+          {canApplyCredits ? (
+            <Link href={`/purchase-bills/${id}/apply-credits`} className={buttonVariants({ variant: 'outline' })}>
+              Apply credits
+            </Link>
           ) : null}
           {bill?.journalEntryId ? (
             <Link
@@ -219,18 +289,121 @@ export default function PurchaseBillDetailPage() {
               View Journal Entry
             </Link>
           ) : null}
+
+          {bill && bill.status !== 'VOID' ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="secondary" className="gap-2">
+                  Actions <ChevronDown className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  disabled={!bill?.vendor?.id}
+                  onClick={() => {
+                    const vendorId = Number(bill?.vendor?.id ?? 0);
+                    if (!vendorId) return;
+                    if (typeof window !== 'undefined') {
+                      window.location.assign(
+                        `/vendor-advances/new?vendorId=${encodeURIComponent(String(vendorId))}&returnTo=${encodeURIComponent(
+                          `/purchase-bills/${id}`
+                        )}`
+                      );
+                    }
+                  }}
+                >
+                  Record Vendor Advance (Prepayment)
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={bill.status === 'DRAFT'}
+                  onClick={() => {
+                    // Create vendor credit (return) from this purchase bill
+                    if (typeof window !== 'undefined') {
+                      window.location.assign(`/vendor-credits/new?purchaseBillId=${id}`);
+                    }
+                  }}
+                >
+                  Create Vendor Credit (Return)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        {bill?.status === 'DRAFT' && missingAccountLines.length > 0 ? (
-          <div className="md:col-span-3 rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm">
-            <div className="font-medium">Account mapping required to post</div>
-            <div className="text-muted-foreground">
-              Please select an account for line(s): <b>{missingAccountLines.join(', ')}</b>. You can still keep this as a draft.
+      {/* Warnings / helper banners */}
+      {bill?.status === 'DRAFT' && missingAccountLines.length > 0 ? (
+        <div className="no-print rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm">
+          <div className="font-medium">Account mapping required to post</div>
+          <div className="text-muted-foreground">
+            Please select an account for line(s): <b>{missingAccountLines.join(', ')}</b>. You can still keep this as a draft.
+          </div>
+        </div>
+      ) : null}
+
+      {canApplyCredits ? (
+        <div className="no-print rounded-lg border bg-background px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm">
+              <span className="font-medium">Credits available for this vendor</span>
+              <span className="text-muted-foreground"> (credit notes / advances)</span>
+            </div>
+            <Link href={`/purchase-bills/${id}/apply-credits`} className="text-sm text-primary hover:underline">
+              Apply Now
+            </Link>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Bill paper preview (uses the same invoice template renderer) */}
+      {bill ? (
+        <div className="print-area rounded-lg border bg-muted/20 p-4 sm:p-6">
+          <div className="print-paper mx-auto max-w-4xl rounded-lg border bg-white shadow-sm">
+            <div className="p-0">
+              <InvoicePaper
+                invoice={{
+                  invoiceNumber: bill.billNumber ?? `PB-${bill.id}`,
+                  status: bill.status,
+                  invoiceDate: bill.billDate,
+                  dueDate: bill.dueDate ?? null,
+                  currency: bill.currency ?? null,
+                  total: bill.total ?? 0,
+                  totalPaid: bill.totalPaid ?? 0,
+                  remainingBalance: bill.remainingBalance ?? 0,
+                  customer: { name: bill.vendor?.name ?? null },
+                  location: { name: bill.warehouse?.name ?? bill.location?.name ?? null },
+                  warehouse: { name: bill.warehouse?.name ?? null },
+                  customerNotes: bill.notes ?? null,
+                  termsAndConditions: bill.termsAndConditions ?? null,
+                  taxAmount: bill.taxAmount ?? 0,
+                  lines: (bill.lines ?? []).map((l: any) => ({
+                    id: l.id,
+                    quantity: l.quantity,
+                    unitPrice: l.unitCost,
+                    discountAmount: l.discountAmount ?? 0,
+                    description: l.description ?? null,
+                    item: l.item ?? null,
+                  })),
+                  ...(Array.isArray(bill.payments) ? { payments: bill.payments } : {}),
+                  ...(Array.isArray(bill.creditsApplied) ? { creditsApplied: bill.creditsApplied } : {}),
+                } as any}
+                companyName={companyName}
+                tz={tz}
+                template={template}
+                documentTitle="Bill"
+                partyLabel="Vendor"
+                dateLabel="Bill Date"
+                dueDateLabel="Due Date"
+                locationLabel="Location"
+                rateLabel="Unit cost"
+                balanceLabel="Balance Due"
+              />
             </div>
           </div>
-        ) : null}
+        </div>
+      ) : null}
+
+      <div className="no-print grid gap-4 md:grid-cols-3">
         <Card className="shadow-sm md:col-span-2">
           <CardHeader>
             <CardTitle className="text-lg">Lines</CardTitle>
@@ -315,7 +488,7 @@ export default function PurchaseBillDetailPage() {
         </Card>
       </div>
 
-      <Card className="shadow-sm">
+      <Card className="no-print shadow-sm">
         <CardHeader>
           <CardTitle className="text-lg">Payments</CardTitle>
         </CardHeader>
@@ -364,7 +537,8 @@ export default function PurchaseBillDetailPage() {
                   <TableHeader>
                     <TableRow className="bg-muted/40">
                       <TableHead className="w-[160px]">Date</TableHead>
-                      <TableHead>Vendor Credit</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Reference</TableHead>
                       <TableHead className="text-right">Amount</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -373,10 +547,15 @@ export default function PurchaseBillDetailPage() {
                       <TableRow key={c.id}>
                         <TableCell className="text-muted-foreground">{String(c.appliedDate ?? '').slice(0, 10)}</TableCell>
                         <TableCell className="font-medium">
-                          {c.vendorCredit?.id ? (
+                          {c.kind === 'VENDOR_ADVANCE' ? 'Vendor Advance' : 'Vendor Credit'}
+                        </TableCell>
+                        <TableCell className="font-medium">
+                          {c.kind === 'VENDOR_CREDIT' && c.vendorCredit?.id ? (
                             <Link href={`/vendor-credits/${c.vendorCredit.id}`} className="text-primary hover:underline">
                               {c.vendorCredit.creditNumber}
                             </Link>
+                          ) : c.kind === 'VENDOR_ADVANCE' && c.vendorAdvance?.id ? (
+                            <span>Advance #{c.vendorAdvance.id}</span>
                           ) : (
                             '—'
                           )}

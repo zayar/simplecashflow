@@ -14,6 +14,7 @@ import {
   Calculator,
   ReceiptText,
   Truck,
+  ClipboardList,
   Settings,
   Percent,
   CreditCard,
@@ -55,6 +56,8 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     label: "Purchases",
     items: [
       { href: "/vendors", label: "Vendors", icon: Truck },
+      { href: "/purchase-orders", label: "Purchase Orders", icon: ClipboardList },
+      { href: "/purchase-receipts", label: "Purchase Receipts", icon: ReceiptText },
       { href: "/expenses", label: "Expenses", icon: ReceiptText },
       { href: "/purchase-bills", label: "Purchase Bills", icon: ReceiptText },
       { href: "/vendor-credits", label: "Vendor Credits", icon: ReceiptText },

@@ -1,10 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { useAuth } from '../lib/auth';
 import { getBankingAccounts, type BankingAccountRow } from '../lib/ar';
-import { createExpense, getAccounts, getVendors, postExpense } from '../lib/expenses';
+import { createExpense, getAccounts, getVendors, postExpense, uploadExpenseAttachment } from '../lib/expenses';
 import { yyyyMmDd, toNumber } from '../lib/format';
 import { AppBar, BackIcon, IconButton } from '../components/AppBar';
 import { Fab, SaveIcon } from '../components/Fab';
@@ -24,8 +24,11 @@ export default function ExpenseNew() {
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [attachmentPreview, setAttachmentPreview] = useState<string | null>(null);
   const [form, setForm] = useState(() => ({
     expenseDate: yyyyMmDd(new Date()),
     vendorId: '',
@@ -33,7 +36,8 @@ export default function ExpenseNew() {
     amount: '',
     reference: '',
     notes: '',
-    paidThroughAccountId: ''
+    paidThroughAccountId: '',
+    attachmentUrl: ''
   }));
 
   const vendorsQuery = useQuery({
@@ -76,6 +80,36 @@ export default function ExpenseNew() {
     });
   }, [bankingQuery.data]);
 
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !companyId) return;
+
+    // Show preview immediately
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      setAttachmentPreview(ev.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+
+    setUploading(true);
+    try {
+      const { url } = await uploadExpenseAttachment(companyId, file);
+      setForm((p) => ({ ...p, attachmentUrl: url }));
+      setAttachmentPreview(url);
+    } catch (err: any) {
+      setError(err?.message ?? 'Failed to upload attachment');
+      setAttachmentPreview(null);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const removeAttachment = () => {
+    setForm((p) => ({ ...p, attachmentUrl: '' }));
+    setAttachmentPreview(null);
+  };
+
   const createMutation = useMutation({
     mutationFn: async () => {
       setError(null);
@@ -99,7 +133,8 @@ export default function ExpenseNew() {
         // Paid now => due date irrelevant, but keep simple (unset).
         description,
         amount,
-        expenseAccountId: Number(form.categoryAccountId)
+        expenseAccountId: Number(form.categoryAccountId),
+        attachmentUrl: form.attachmentUrl || null
       });
 
       const id = expense && typeof expense === 'object' && 'id' in expense ? Number((expense as any).id) : 0;
@@ -232,6 +267,78 @@ export default function ExpenseNew() {
           </div>
         </Card>
 
+        {/* Attachment Section */}
+        <Card className="mt-3 rounded-2xl shadow-sm">
+          <div className="space-y-4 p-4">
+            <div className="grid gap-2">
+              <Label>Receipt / Attachment</Label>
+              
+              {attachmentPreview ? (
+                <div className="relative">
+                  <img
+                    src={attachmentPreview}
+                    alt="Attachment"
+                    className="h-48 w-full rounded-xl border border-border object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={removeAttachment}
+                    className="absolute right-2 top-2 rounded-full bg-destructive p-2 text-white shadow-lg"
+                    aria-label="Remove attachment"
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                  {uploading && (
+                    <div className="absolute inset-0 flex items-center justify-center rounded-xl bg-black/40">
+                      <svg className="h-8 w-8 animate-spin text-white" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    id="expense-attachment"
+                  />
+                  <label
+                    htmlFor="expense-attachment"
+                    className={`flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-border p-8 transition-colors hover:border-primary hover:bg-primary/5 ${
+                      uploading ? 'pointer-events-none opacity-50' : ''
+                    }`}
+                  >
+                    {uploading ? (
+                      <svg className="h-8 w-8 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                    ) : (
+                      <>
+                        <svg className="h-8 w-8 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6.827 6.175A2.31 2.31 0 015.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 00-1.134-.175 2.31 2.31 0 01-1.64-1.055l-.822-1.316a2.192 2.192 0 00-1.736-1.039 48.774 48.774 0 00-5.232 0 2.192 2.192 0 00-1.736 1.039l-.821 1.316z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM18.75 10.5h.008v.008h-.008V10.5z" />
+                        </svg>
+                        <span className="text-sm text-muted-foreground">Tap to add receipt photo</span>
+                      </>
+                    )}
+                  </label>
+                </div>
+              )}
+              <div className="text-xs text-muted-foreground">
+                Attach a photo of the receipt or invoice.
+              </div>
+            </div>
+          </div>
+        </Card>
+
         <Card className="mt-3 rounded-2xl shadow-sm">
           <div className="space-y-4 p-4">
             <div className="grid gap-2">
@@ -262,7 +369,7 @@ export default function ExpenseNew() {
         ariaLabel="Save expense"
         icon={<SaveIcon />}
         label={createMutation.isPending ? 'Saving…' : 'Save'}
-        disabled={createMutation.isPending || companyId <= 0}
+        disabled={createMutation.isPending || companyId <= 0 || uploading}
         onClick={() => createMutation.mutate()}
       />
     </div>

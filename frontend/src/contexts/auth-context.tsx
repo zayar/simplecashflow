@@ -11,6 +11,9 @@ interface User {
   email: string;
   name: string | null;
   companyId: number;
+  role?: string;
+  phone?: string | null;
+  phoneVerifiedAt?: string | null;
 }
 
 export type CompanySettings = {

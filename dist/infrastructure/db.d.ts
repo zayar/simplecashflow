@@ -1,3 +1,5 @@
+import { PrismaClient } from '@prisma/client';
+export declare const rawPrisma: PrismaClient<import(".prisma/client").Prisma.PrismaClientOptions, never, import("@prisma/client/runtime/library").DefaultArgs>;
 export declare const prisma: import("@prisma/client/runtime/library").DynamicClientExtensionThis<import(".prisma/client").Prisma.TypeMap<import("@prisma/client/runtime/library").InternalArgs & {
     result: {};
     model: {};

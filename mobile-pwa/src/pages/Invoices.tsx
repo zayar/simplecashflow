@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../lib/auth';
 import { getInvoices, type InvoiceListRow } from '../lib/ar';
 import { formatMMDDYYYY, formatMoneyK, toNumber, yearOf } from '../lib/format';
@@ -10,6 +10,8 @@ import { Fab, PlusIcon } from '../components/Fab';
 import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs';
+import { usePullToRefresh } from '../lib/usePullToRefresh';
+import { PullToRefreshIndicator } from '../components/PullToRefresh';
 
 type TabKey = 'all' | 'outstanding' | 'paid';
 
@@ -23,6 +25,7 @@ export default function Invoices() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [tab, setTab] = useState<TabKey>('all');
   const [searchOpen, setSearchOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -31,6 +34,14 @@ export default function Invoices() {
     queryKey: ['invoices', companyId],
     queryFn: async () => await getInvoices(companyId),
     enabled: companyId > 0
+  });
+
+  const handleRefresh = useCallback(async () => {
+    await queryClient.invalidateQueries({ queryKey: ['invoices', companyId] });
+  }, [queryClient, companyId]);
+
+  const { isRefreshing, pullDistance, handlers, containerRef } = usePullToRefresh({
+    onRefresh: handleRefresh
   });
 
   const filtered = useMemo(() => {
@@ -61,7 +72,11 @@ export default function Invoices() {
   }, [filtered]);
 
   return (
-    <div className="min-h-dvh bg-background">
+    <div
+      className="min-h-dvh bg-background"
+      ref={containerRef}
+      {...handlers}
+    >
       <AppBar
         title="Invoices"
         left={
@@ -77,6 +92,7 @@ export default function Invoices() {
       />
 
       <div className="mx-auto max-w-xl px-3 pb-24 pt-3">
+        <PullToRefreshIndicator isRefreshing={isRefreshing} pullDistance={pullDistance} />
         <Card className="rounded-2xl shadow-sm">
           <div className="p-3">
             <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)} className="w-full">

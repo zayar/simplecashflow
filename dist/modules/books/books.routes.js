@@ -1,11 +1,13 @@
 import { prisma } from '../../infrastructure/db.js';
 import { toMoneyDecimal } from '../../utils/money.js';
-import { isoNow, parseDateInput } from '../../utils/date.js';
+import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
 import { isFutureBusinessDate } from '../../utils/docDatePolicy.js';
+import { assertOpenPeriodOrThrow } from '../../utils/periodClosePolicy.js';
 import { assertTotalsMatchStored, buildInvoicePostingJournalLines, computeInvoiceTotalsAndIncomeBuckets } from './invoiceAccounting.js';
 import { ensureTaxPayableAccountIfNeeded } from '../../utils/tax.js';
 import { randomUUID } from 'node:crypto';
 import { AccountReportGroup, AccountType, CashflowActivity, ItemType, Prisma } from '@prisma/client';
+import { Storage } from '@google-cloud/storage';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
@@ -34,6 +36,166 @@ export async function booksRoutes(fastify) {
     // All Books endpoints are tenant-scoped and must be authenticated.
     fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
+    async function getOpeningBalancePostingAccounts(tx, companyId) {
+        const company = await tx.company.findUnique({
+            where: { id: companyId },
+            select: {
+                accountsReceivableAccountId: true,
+                accountsPayableAccountId: true,
+                openingBalanceEquityAccountId: true,
+            },
+        });
+        const arId = Number(company?.accountsReceivableAccountId ?? 0) || null;
+        const apId = Number(company?.accountsPayableAccountId ?? 0) || null;
+        const eqId = Number(company?.openingBalanceEquityAccountId ?? 0) || null;
+        if (!eqId) {
+            throw Object.assign(new Error('company.openingBalanceEquityAccountId is not set'), { statusCode: 400 });
+        }
+        if (!arId) {
+            throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+        }
+        if (!apId) {
+            throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
+        }
+        const [ar, ap, eq] = await Promise.all([
+            tx.account.findFirst({ where: { id: arId, companyId }, select: { id: true, type: true } }),
+            tx.account.findFirst({ where: { id: apId, companyId }, select: { id: true, type: true } }),
+            tx.account.findFirst({ where: { id: eqId, companyId }, select: { id: true, type: true } }),
+        ]);
+        if (!ar || ar.type !== AccountType.ASSET) {
+            throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
+                statusCode: 400,
+            });
+        }
+        if (!ap || ap.type !== AccountType.LIABILITY) {
+            throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), {
+                statusCode: 400,
+            });
+        }
+        if (!eq || eq.type !== AccountType.EQUITY) {
+            throw Object.assign(new Error('openingBalanceEquityAccountId must be an EQUITY account in this company'), {
+                statusCode: 400,
+            });
+        }
+        return { arId, apId, eqId };
+    }
+    async function postCustomerOpeningBalanceDelta(tx, args) {
+        const { companyId, customerName, delta, userId, kind } = args;
+        const amt = new Prisma.Decimal(delta ?? 0).toDecimalPlaces(2);
+        if (amt.equals(0))
+            return null;
+        const { arId, eqId } = await getOpeningBalancePostingAccounts(tx, companyId);
+        const abs = amt.abs().toDecimalPlaces(2);
+        // Convention:
+        // - Positive amount means customer owes us (AR Dr)
+        // - Negative amount means we owe customer (AR Cr)
+        const lines = amt.greaterThan(0)
+            ? [
+                { accountId: arId, debit: abs, credit: new Prisma.Decimal(0) },
+                { accountId: eqId, debit: new Prisma.Decimal(0), credit: abs },
+            ]
+            : [
+                { accountId: eqId, debit: abs, credit: new Prisma.Decimal(0) },
+                { accountId: arId, debit: new Prisma.Decimal(0), credit: abs },
+            ];
+        const descPrefix = kind === 'create' ? 'Opening balance' : 'Opening balance adjustment';
+        return await postJournalEntry(tx, {
+            companyId,
+            date: normalizeToDay(new Date()),
+            description: `${descPrefix} • Customer: ${String(customerName ?? '').trim() || '—'}`,
+            createdByUserId: userId,
+            lines,
+        });
+    }
+    async function postVendorOpeningBalanceDelta(tx, args) {
+        const { companyId, vendorName, delta, userId, kind } = args;
+        const amt = new Prisma.Decimal(delta ?? 0).toDecimalPlaces(2);
+        if (amt.equals(0))
+            return null;
+        const { apId, eqId } = await getOpeningBalancePostingAccounts(tx, companyId);
+        const abs = amt.abs().toDecimalPlaces(2);
+        // Convention:
+        // - Positive amount means we owe vendor (AP Cr)
+        // - Negative amount means vendor owes us (AP Dr) (rare, but supported)
+        const lines = amt.greaterThan(0)
+            ? [
+                { accountId: eqId, debit: abs, credit: new Prisma.Decimal(0) },
+                { accountId: apId, debit: new Prisma.Decimal(0), credit: abs },
+            ]
+            : [
+                { accountId: apId, debit: abs, credit: new Prisma.Decimal(0) },
+                { accountId: eqId, debit: new Prisma.Decimal(0), credit: abs },
+            ];
+        const descPrefix = kind === 'create' ? 'Opening balance' : 'Opening balance adjustment';
+        return await postJournalEntry(tx, {
+            companyId,
+            date: normalizeToDay(new Date()),
+            description: `${descPrefix} • Vendor: ${String(vendorName ?? '').trim() || '—'}`,
+            createdByUserId: userId,
+            lines,
+        });
+    }
+    function parseGcsUri(input) {
+        const s = String(input ?? '').trim();
+        if (!s.startsWith('gs://'))
+            return null;
+        const rest = s.slice('gs://'.length);
+        const idx = rest.indexOf('/');
+        if (idx <= 0)
+            return null;
+        const bucket = rest.slice(0, idx);
+        const objectName = rest.slice(idx + 1);
+        if (!bucket || !objectName)
+            return null;
+        return { bucket, objectName };
+    }
+    async function signedUrlIfGcsUri(storage, input, ttlMs = 15 * 60 * 1000) {
+        if (!input)
+            return null;
+        const parsed = parseGcsUri(input);
+        if (!parsed)
+            return input;
+        try {
+            const [url] = await storage.bucket(parsed.bucket).file(parsed.objectName).getSignedUrl({
+                version: 'v4',
+                action: 'read',
+                expires: Date.now() + ttlMs,
+            });
+            return url;
+        }
+        catch {
+            return null;
+        }
+    }
+    async function presentPendingPaymentProofs(storage, proofs, ctx) {
+        if (!Array.isArray(proofs))
+            return [];
+        const out = [];
+        for (const p of proofs) {
+            const submittedAt = typeof p?.submittedAt === 'string' ? p.submittedAt : null;
+            const note = typeof p?.note === 'string' ? p.note : p?.note === null ? null : null;
+            // New format: { id, gcsUri, ... } => signed URL
+            if (typeof p?.id === 'string' && typeof p?.gcsUri === 'string') {
+                // Prefer a short-lived internal token URL (works even when GCS signed URL IAM is restricted).
+                const proofToken = fastify.jwt.sign({ typ: 'invoice_payment_proof', companyId: ctx.companyId, invoiceId: ctx.invoiceId, proofId: String(p.id) }, { expiresIn: process.env.PAYMENT_PROOF_LINK_EXPIRES_IN ?? '30m' });
+                const req = ctx.request;
+                const protoRaw = String(req?.headers?.['x-forwarded-proto'] ?? 'https');
+                const proto = (protoRaw.split(',')[0] || 'https').trim();
+                const hostRaw = String(req?.headers?.['x-forwarded-host'] ?? req?.headers?.host ?? '');
+                const host = (hostRaw.split(',')[0] || '').trim();
+                const origin = host ? `${proto}://${host}` : '';
+                const url = origin ? `${origin}/private/invoice-payment-proofs/${encodeURIComponent(proofToken)}` : null;
+                if (url)
+                    out.push({ id: p.id, url, submittedAt, note });
+                continue;
+            }
+            // Legacy format: { url, ... } already public
+            if (typeof p?.url === 'string' && String(p.url).trim()) {
+                out.push({ url: String(p.url).trim(), submittedAt, note });
+            }
+        }
+        return out;
+    }
     function normalizeCurrencyOrNull(input) {
         if (input === undefined || input === null)
             return null;
@@ -122,15 +284,30 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'name is required' };
         }
-        const customer = await prisma.customer.create({
-            data: {
-                companyId,
-                name: body.name,
-                email: body.email ?? null,
-                phone: body.phone ?? null,
-                currency: body.currency ?? null,
-                openingBalance: body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance),
-            },
+        const userId = request.user?.userId ?? null;
+        const currency = normalizeCurrencyOrNull(body.currency ?? null);
+        const opening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
+        const customer = await prisma.$transaction(async (tx) => {
+            const created = await tx.customer.create({
+                data: {
+                    companyId,
+                    name: body.name,
+                    email: body.email ?? null,
+                    phone: body.phone ?? null,
+                    currency,
+                    openingBalance: opening,
+                },
+            });
+            if (opening && !opening.equals(0)) {
+                await postCustomerOpeningBalanceDelta(tx, {
+                    companyId,
+                    customerName: created.name,
+                    delta: opening,
+                    userId,
+                    kind: 'create',
+                });
+            }
+            return created;
         });
         return customer;
     });
@@ -151,14 +328,32 @@ export async function booksRoutes(fastify) {
             reply.status(404);
             return { error: 'customer not found' };
         }
-        const updated = await prisma.customer.update({
-            where: { id: customerId },
-            data: {
-                name: body.name,
-                email: body.email ?? null,
-                phone: body.phone ?? null,
-                currency: body.currency ?? null,
-            },
+        const userId = request.user?.userId ?? null;
+        const currency = normalizeCurrencyOrNull(body.currency ?? null);
+        const oldOpening = new Prisma.Decimal(existing.openingBalance ?? 0).toDecimalPlaces(2);
+        const newOpening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
+        const delta = newOpening === null ? new Prisma.Decimal(0) : new Prisma.Decimal(newOpening).sub(oldOpening).toDecimalPlaces(2);
+        const updated = await prisma.$transaction(async (tx) => {
+            const u = await tx.customer.update({
+                where: { id: customerId },
+                data: {
+                    name: body.name,
+                    email: body.email ?? null,
+                    phone: body.phone ?? null,
+                    currency,
+                    ...(body.openingBalance === undefined ? {} : { openingBalance: newOpening }),
+                },
+            });
+            if (!delta.equals(0)) {
+                await postCustomerOpeningBalanceDelta(tx, {
+                    companyId,
+                    customerName: u.name,
+                    delta,
+                    userId,
+                    kind: 'adjust',
+                });
+            }
+            return u;
         });
         return updated;
     });
@@ -194,13 +389,30 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'name is required' };
         }
-        return await prisma.vendor.create({
-            data: {
-                companyId,
-                name: body.name,
-                email: body.email ?? null,
-                phone: body.phone ?? null,
-            },
+        const userId = request.user?.userId ?? null;
+        const currency = normalizeCurrencyOrNull(body.currency ?? null);
+        const opening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
+        return await prisma.$transaction(async (tx) => {
+            const created = await tx.vendor.create({
+                data: {
+                    companyId,
+                    name: body.name,
+                    email: body.email ?? null,
+                    phone: body.phone ?? null,
+                    currency,
+                    openingBalance: opening,
+                },
+            });
+            if (opening && !opening.equals(0)) {
+                await postVendorOpeningBalanceDelta(tx, {
+                    companyId,
+                    vendorName: created.name,
+                    delta: opening,
+                    userId,
+                    kind: 'create',
+                });
+            }
+            return created;
         });
     });
     fastify.put('/companies/:companyId/vendors/:vendorId', async (request, reply) => {
@@ -220,13 +432,32 @@ export async function booksRoutes(fastify) {
             reply.status(404);
             return { error: 'vendor not found' };
         }
-        const updated = await prisma.vendor.update({
-            where: { id: vendorId },
-            data: {
-                name: body.name,
-                email: body.email ?? null,
-                phone: body.phone ?? null,
-            },
+        const userId = request.user?.userId ?? null;
+        const currency = normalizeCurrencyOrNull(body.currency ?? null);
+        const oldOpening = new Prisma.Decimal(existing.openingBalance ?? 0).toDecimalPlaces(2);
+        const newOpening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
+        const delta = newOpening === null ? new Prisma.Decimal(0) : new Prisma.Decimal(newOpening).sub(oldOpening).toDecimalPlaces(2);
+        const updated = await prisma.$transaction(async (tx) => {
+            const u = await tx.vendor.update({
+                where: { id: vendorId },
+                data: {
+                    name: body.name,
+                    email: body.email ?? null,
+                    phone: body.phone ?? null,
+                    currency,
+                    ...(body.openingBalance === undefined ? {} : { openingBalance: newOpening }),
+                },
+            });
+            if (!delta.equals(0)) {
+                await postVendorOpeningBalanceDelta(tx, {
+                    companyId,
+                    vendorName: u.name,
+                    delta,
+                    userId,
+                    kind: 'adjust',
+                });
+            }
+            return u;
         });
         return updated;
     });
@@ -439,14 +670,50 @@ export async function booksRoutes(fastify) {
             .filter((p) => !p.reversedAt)
             .reduce((sum, p) => sum + Number(p.amount), 0);
         const totalCredits = (invoice.customerAdvanceApplications ?? []).reduce((sum, a) => sum + Number(a.amount), 0);
-        const totalPaid = totalPayments + totalCredits;
+        // Credit notes applied to this invoice reduce the invoice balance due.
+        const creditNotes = await prisma.creditNote.findMany({
+            where: { companyId, appliedInvoiceId: invoice.id, status: 'POSTED' },
+            select: { id: true, creditNoteNumber: true, creditNoteDate: true, total: true },
+            orderBy: [{ creditNoteDate: 'desc' }, { id: 'desc' }],
+        });
+        const totalCreditNotes = (creditNotes ?? []).reduce((sum, cn) => sum + Number(cn.total ?? 0), 0);
+        const totalPaid = totalPayments + totalCredits + totalCreditNotes;
         const creditsAgg = await prisma.customerAdvance.aggregate({
             where: { companyId, customerId: invoice.customerId },
             _sum: { amount: true, amountApplied: true },
         });
         const totalAdv = new Prisma.Decimal(creditsAgg._sum.amount ?? 0).toDecimalPlaces(2);
         const totalApplied = new Prisma.Decimal(creditsAgg._sum.amountApplied ?? 0).toDecimalPlaces(2);
-        const creditsAvailable = totalAdv.sub(totalApplied).toDecimalPlaces(2);
+        // Credits available to apply on this invoice:
+        // - Customer Advances remaining balance
+        // - Unapplied (open) Customer Credit Notes remaining balance
+        // Credit notes created from an invoice (invoiceId) are NOT applied until user applies them (appliedInvoiceId).
+        const openCnAgg = await prisma.creditNote.aggregate({
+            where: {
+                companyId,
+                customerId: invoice.customerId,
+                status: 'POSTED',
+                appliedInvoiceId: null,
+                // For now: exclude refunded credits from "available to apply" (refund means cash-out, not credit against invoice)
+                amountRefunded: 0,
+            },
+            _sum: { total: true },
+        });
+        const openCreditNotes = new Prisma.Decimal(openCnAgg._sum.total ?? 0).toDecimalPlaces(2);
+        const creditsAvailable = totalAdv.sub(totalApplied).add(openCreditNotes).toDecimalPlaces(2);
+        // Compute a display status based on actual settlements (payments + applied advances + applied credit notes).
+        // This avoids showing PARTIAL just because a credit note was POSTED (not applied yet).
+        const invTotalDec = new Prisma.Decimal(invoice.total ?? 0).toDecimalPlaces(2);
+        const totalPaidDec = new Prisma.Decimal(totalPaid ?? 0).toDecimalPlaces(2);
+        const remainingBalanceDec = invTotalDec.sub(totalPaidDec).toDecimalPlaces(2);
+        const remainingBalance = Math.max(0, Number(remainingBalanceDec));
+        const computedStatus = invoice.status === 'VOID' || invoice.status === 'DRAFT' || invoice.status === 'APPROVED'
+            ? invoice.status
+            : remainingBalance <= 0
+                ? 'PAID'
+                : totalPaidDec.greaterThan(0)
+                    ? 'PARTIAL'
+                    : 'POSTED';
         const journalEntries = [];
         if (invoice.status !== 'DRAFT' && invoice.journalEntry) {
             journalEntries.push({
@@ -479,6 +746,22 @@ export async function booksRoutes(fastify) {
         }
         // Note: customer advance applications have their own journal entries, but we don't
         // include them in `journalEntries` UI yet (to keep the invoice JE list focused).
+        const storage = new Storage();
+        const payments = await Promise.all(invoice.payments.map(async (p) => ({
+            id: p.id,
+            paymentDate: p.paymentDate,
+            amount: p.amount,
+            bankAccount: {
+                id: p.bankAccount.id,
+                code: p.bankAccount.code,
+                name: p.bankAccount.name,
+            },
+            attachmentUrl: await signedUrlIfGcsUri(storage, p.attachmentUrl ?? null),
+            journalEntryId: p.journalEntry?.id ?? null,
+            reversedAt: p.reversedAt ?? null,
+            reversalReason: p.reversalReason ?? null,
+            reversalJournalEntryId: p.reversalJournalEntryId ?? null,
+        })));
         return {
             id: invoice.id,
             invoiceNumber: invoice.invoiceNumber,
@@ -486,7 +769,7 @@ export async function booksRoutes(fastify) {
             location: invoice.location ? { id: invoice.location.id, name: invoice.location.name } : null,
             // Backward compatibility (deprecated)
             warehouse: invoice.location ? { id: invoice.location.id, name: invoice.location.name } : null,
-            status: invoice.status,
+            status: computedStatus,
             invoiceDate: invoice.invoiceDate,
             dueDate: invoice.dueDate,
             subtotal: invoice.subtotal ?? null,
@@ -496,33 +779,33 @@ export async function booksRoutes(fastify) {
             customerNotes: invoice.customerNotes ?? null,
             termsAndConditions: invoice.termsAndConditions ?? null,
             lines: invoice.lines,
-            payments: invoice.payments.map((p) => ({
-                id: p.id,
-                paymentDate: p.paymentDate,
-                amount: p.amount,
-                bankAccount: {
-                    id: p.bankAccount.id,
-                    code: p.bankAccount.code,
-                    name: p.bankAccount.name,
-                },
-                attachmentUrl: p.attachmentUrl ?? null,
-                journalEntryId: p.journalEntry?.id ?? null,
-                reversedAt: p.reversedAt ?? null,
-                reversalReason: p.reversalReason ?? null,
-                reversalJournalEntryId: p.reversalJournalEntryId ?? null,
-            })),
-            pendingPaymentProofs: Array.isArray(invoice.pendingPaymentProofs)
-                ? invoice.pendingPaymentProofs
-                : [],
-            creditsApplied: (invoice.customerAdvanceApplications ?? []).map((a) => ({
-                id: a.id,
-                appliedDate: a.appliedDate,
-                amount: a.amount,
-                customerAdvanceId: a.customerAdvanceId,
-            })),
+            payments,
+            pendingPaymentProofs: await presentPendingPaymentProofs(storage, invoice.pendingPaymentProofs, {
+                request,
+                companyId,
+                invoiceId: invoice.id,
+            }),
+            creditsApplied: [
+                ...(invoice.customerAdvanceApplications ?? []).map((a) => ({
+                    id: a.id,
+                    appliedDate: a.appliedDate,
+                    amount: a.amount,
+                    customerAdvanceId: a.customerAdvanceId,
+                    creditNoteId: null,
+                    creditNoteNumber: null,
+                })),
+                ...(creditNotes ?? []).map((cn) => ({
+                    id: cn.id,
+                    appliedDate: cn.creditNoteDate,
+                    amount: cn.total,
+                    customerAdvanceId: null,
+                    creditNoteId: cn.id,
+                    creditNoteNumber: cn.creditNoteNumber,
+                })),
+            ],
             creditsAvailable: creditsAvailable.toString(),
             totalPaid: totalPaid,
-            remainingBalance: Number(invoice.total) - totalPaid,
+            remainingBalance,
             journalEntries,
         };
     });
@@ -1382,6 +1665,7 @@ export async function booksRoutes(fastify) {
                     if (!inv.journalEntryId || !inv.journalEntry) {
                         throw Object.assign(new Error('invoice is POSTED but missing journal entry link'), { statusCode: 500 });
                     }
+                    await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: voidDate, action: 'invoice.void' });
                     const payCount = await tx.payment.count({ where: { companyId, invoiceId: inv.id, reversedAt: null } });
                     if (payCount > 0) {
                         throw Object.assign(new Error('cannot void an invoice that has payments (reverse payments first)'), { statusCode: 400 });
@@ -1472,8 +1756,9 @@ export async function booksRoutes(fastify) {
                     });
                     // Apply stock returns at the SAME unit cost applied on the original sale issue moves (audit-friendly).
                     if ((origIssueMoves ?? []).length > 0) {
+                        let inventoryRecalcFromDate = null;
                         for (const m of origIssueMoves) {
-                            await applyStockMoveWac(tx, {
+                            const applied = await applyStockMoveWac(tx, {
                                 companyId,
                                 locationId: m.locationId,
                                 itemId: m.itemId,
@@ -1487,12 +1772,45 @@ export async function booksRoutes(fastify) {
                                 correlationId,
                                 createdByUserId: request.user?.userId ?? null,
                                 journalEntryId: null,
+                                allowBackdated: true,
                             });
+                            const from = applied?.requiresInventoryRecalcFromDate;
+                            if (from && !isNaN(new Date(from).getTime())) {
+                                inventoryRecalcFromDate =
+                                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                        ? new Date(from)
+                                        : inventoryRecalcFromDate;
+                            }
                         }
                         await tx.stockMove.updateMany({
                             where: { companyId, correlationId, journalEntryId: null, referenceType: 'InvoiceVoid', referenceId: String(inv.id) },
                             data: { journalEntryId: reversal.id },
                         });
+                        if (inventoryRecalcFromDate) {
+                            await tx.event.create({
+                                data: {
+                                    companyId,
+                                    eventId: randomUUID(),
+                                    eventType: 'inventory.recalc.requested',
+                                    schemaVersion: 'v1',
+                                    occurredAt: new Date(occurredAt),
+                                    source: 'cashflow-api',
+                                    partitionKey: String(companyId),
+                                    correlationId,
+                                    causationId: String(inv.journalEntryId),
+                                    aggregateType: 'Company',
+                                    aggregateId: String(companyId),
+                                    type: 'InventoryRecalcRequested',
+                                    payload: {
+                                        companyId,
+                                        fromDate: normalizeToDay(new Date(inventoryRecalcFromDate)).toISOString().slice(0, 10),
+                                        reason: 'backdated_stock_move_insert',
+                                        source: 'InvoiceVoid',
+                                        invoiceId: inv.id,
+                                    },
+                                },
+                            });
+                        }
                     }
                     // Outbox events (created + reversed semantic)
                     const createdEventId = randomUUID();
@@ -1685,6 +2003,12 @@ export async function booksRoutes(fastify) {
                 if (invoice.status !== 'DRAFT' && invoice.status !== 'APPROVED') {
                     throw Object.assign(new Error('only DRAFT/APPROVED invoices can be posted'), { statusCode: 400 });
                 }
+                // Period-close guard: block posting into closed periods (backdating rule).
+                await assertOpenPeriodOrThrow(tx, {
+                    companyId,
+                    transactionDate: new Date(invoice.invoiceDate),
+                    action: 'invoice.post',
+                });
                 // Currency policy: if company has baseCurrency, invoice currency must match it.
                 const baseCurrency = normalizeCurrencyOrNull(invoice.company.baseCurrency ?? null);
                 const invCurrency = normalizeCurrencyOrNull(invoice.currency ?? null);
@@ -1751,6 +2075,7 @@ export async function booksRoutes(fastify) {
                 };
                 const tracked = invoice.lines.filter(isTrackedInvoiceLine);
                 let totalCogs = new Prisma.Decimal(0);
+                let inventoryRecalcFromDate = null;
                 // Resolve default location for this invoice (location tagging).
                 // Preference: invoice.locationId -> company.defaultLocationId -> company default Location row.
                 const invoiceLocationId = invoice.locationId ?? null;
@@ -1797,6 +2122,13 @@ export async function booksRoutes(fastify) {
                             journalEntryId: null,
                         });
                         totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
+                        const from = applied?.requiresInventoryRecalcFromDate;
+                        if (from && !isNaN(new Date(from).getTime())) {
+                            inventoryRecalcFromDate =
+                                !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                    ? new Date(from)
+                                    : inventoryRecalcFromDate;
+                        }
                     }
                     totalCogs = totalCogs.toDecimalPlaces(2);
                 }
@@ -1912,7 +2244,35 @@ export async function booksRoutes(fastify) {
                         },
                     },
                 });
-                return { updatedInvoice, journalEntry, jeEventId, invoiceEventId };
+                // If we inserted a truly backdated stock move, schedule an inventory recalc forward from that date.
+                let inventoryRecalcEventId = null;
+                if (inventoryRecalcFromDate) {
+                    inventoryRecalcEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: inventoryRecalcEventId,
+                            eventType: 'inventory.recalc.requested',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            causationId: jeEventId,
+                            aggregateType: 'Company',
+                            aggregateId: String(companyId),
+                            type: 'InventoryRecalcRequested',
+                            payload: {
+                                companyId,
+                                fromDate: normalizeToDay(new Date(inventoryRecalcFromDate)).toISOString().slice(0, 10),
+                                reason: 'backdated_stock_move_insert',
+                                source: 'InvoicePost',
+                                invoiceId: invoice.id,
+                            },
+                        },
+                    });
+                }
+                return { updatedInvoice, journalEntry, jeEventId, invoiceEventId, inventoryRecalcEventId };
             }, { timeout: 10_000 });
             return {
                 invoiceId: txResult.updatedInvoice.id,
@@ -1922,6 +2282,7 @@ export async function booksRoutes(fastify) {
                 // keep event ids for first execution publish step only
                 _jeEventId: txResult.jeEventId,
                 _invoiceEventId: txResult.invoiceEventId,
+                _inventoryRecalcEventId: txResult.inventoryRecalcEventId ?? null,
                 _correlationId: correlationId,
                 _occurredAt: occurredAt,
             };
@@ -1932,6 +2293,8 @@ export async function booksRoutes(fastify) {
             const eventIds = [result._jeEventId];
             if (result._invoiceEventId)
                 eventIds.push(result._invoiceEventId);
+            if (result._inventoryRecalcEventId)
+                eventIds.push(result._inventoryRecalcEventId);
             publishEventsFastPath(eventIds);
         }
         // Always return stable business response
@@ -2046,6 +2409,14 @@ export async function booksRoutes(fastify) {
                         }
                     }
                     const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
+                    if (body.paymentDate && isNaN(paymentDate.getTime())) {
+                        throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
+                    }
+                    await assertOpenPeriodOrThrow(tx, {
+                        companyId,
+                        transactionDate: paymentDate,
+                        action: 'invoice.payment.create',
+                    });
                     const amount = toMoneyDecimal(amountNumber);
                     // Prevent overpayment based on source-of-truth payments sum (non-reversed).
                     const sumBefore = await tx.payment.aggregate({
@@ -2071,10 +2442,24 @@ export async function booksRoutes(fastify) {
                             { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
                         ],
                     });
-                    // Validate attachment URL if provided (must be from our GCS bucket)
-                    const attachmentUrl = (typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim())
+                    // Payment attachment (optional). Prefer selecting from pending proofs by id.
+                    const pendingProofId = typeof body.pendingProofId === 'string' && String(body.pendingProofId).trim()
+                        ? String(body.pendingProofId).trim()
+                        : null;
+                    let attachmentUrl = typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim()
                         ? body.attachmentUrl.trim()
                         : null;
+                    if (pendingProofId && Array.isArray(invoice.pendingPaymentProofs)) {
+                        const hit = invoice.pendingPaymentProofs.find((p) => String(p?.id ?? '') === pendingProofId);
+                        if (hit && typeof hit?.gcsUri === 'string' && String(hit.gcsUri).startsWith('gs://')) {
+                            // Store stable reference; presentation layer returns signed URL.
+                            attachmentUrl = String(hit.gcsUri);
+                        }
+                        else if (hit && typeof hit?.url === 'string') {
+                            // Legacy fallback
+                            attachmentUrl = String(hit.url);
+                        }
+                    }
                     const payment = await tx.payment.create({
                         data: {
                             companyId,
@@ -2086,12 +2471,26 @@ export async function booksRoutes(fastify) {
                             attachmentUrl,
                         },
                     });
-                    // If attachmentUrl was from pendingPaymentProofs, remove it from the list
+                    // If attachmentUrl was selected from pendingPaymentProofs, DO NOT delete it.
+                    // Keep it visible to the customer for reference, but lock edits once payment is recorded
+                    // (public endpoints enforce that by status/amountPaid).
                     if (attachmentUrl && Array.isArray(invoice.pendingPaymentProofs)) {
-                        const remainingProofs = invoice.pendingPaymentProofs.filter((p) => p?.url !== attachmentUrl);
+                        const usedAt = new Date().toISOString();
+                        const next = invoice.pendingPaymentProofs.map((p) => {
+                            const id = String(p?.id ?? '');
+                            const url = typeof p?.url === 'string' ? String(p.url) : '';
+                            const matches = (pendingProofId && id && id === String(pendingProofId)) || (!pendingProofId && url && url === String(attachmentUrl));
+                            if (!matches)
+                                return p;
+                            return {
+                                ...p,
+                                usedAt,
+                                usedByPaymentId: payment.id,
+                            };
+                        });
                         await tx.invoice.updateMany({
                             where: { id: invoice.id, companyId },
-                            data: { pendingPaymentProofs: remainingProofs.length > 0 ? remainingProofs : Prisma.DbNull },
+                            data: { pendingPaymentProofs: next.length > 0 ? next : Prisma.DbNull },
                         });
                     }
                     // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
@@ -2631,7 +3030,7 @@ export async function booksRoutes(fastify) {
             return { error: 'customerId not found in this company' };
         }
         // Validate items and compute totals using Decimal
-        const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId)).filter(Boolean)));
+        const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId ?? 0)).filter((x) => x > 0)));
         const items = await prisma.item.findMany({
             where: { companyId, id: { in: itemIds } },
             select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
@@ -2656,22 +3055,30 @@ export async function booksRoutes(fastify) {
         let total = new Prisma.Decimal(0);
         const computedLines = [];
         for (const [idx, l] of (body.lines ?? []).entries()) {
-            const itemId = Number(l.itemId);
-            if (!itemId || Number.isNaN(itemId)) {
+            const itemIdRaw = l.itemId;
+            const itemId = itemIdRaw === null || itemIdRaw === undefined || itemIdRaw === '' ? null : Number(itemIdRaw);
+            if (itemId !== null && (!Number.isInteger(itemId) || itemId <= 0)) {
                 reply.status(400);
-                return { error: `lines[${idx}].itemId is required` };
+                return { error: `lines[${idx}].itemId must be a positive integer or null` };
             }
-            const item = itemById.get(itemId);
-            if (!item) {
+            const item = itemId ? itemById.get(itemId) : null;
+            if (itemId && !item) {
                 reply.status(400);
                 return { error: `lines[${idx}].itemId not found in this company` };
+            }
+            if (!itemId) {
+                const desc = String(l.description ?? '').trim();
+                if (!desc) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].description is required when itemId is not set` };
+                }
             }
             const qty = toMoneyDecimal(l.quantity ?? 0);
             if (qty.lessThanOrEqualTo(0)) {
                 reply.status(400);
                 return { error: `lines[${idx}].quantity must be > 0` };
             }
-            const unit = toMoneyDecimal(l.unitPrice ?? Number(item.sellingPrice ?? 0));
+            const unit = toMoneyDecimal(l.unitPrice ?? Number(item?.sellingPrice ?? 0));
             if (unit.lessThanOrEqualTo(0)) {
                 reply.status(400);
                 return { error: `lines[${idx}].unitPrice must be > 0` };
@@ -2695,8 +3102,8 @@ export async function booksRoutes(fastify) {
             total = total.add(lineTotal);
             computedLines.push({
                 companyId,
-                itemId: item.id,
-                description: l.description ?? item.name ?? null,
+                itemId: itemId ?? null,
+                description: l.description ?? item?.name ?? null,
                 quantity: qty,
                 unitPrice: unit,
                 discountAmount: discount,
@@ -2770,7 +3177,7 @@ export async function booksRoutes(fastify) {
             return { error: 'customerId not found in this company' };
         }
         // Validate items and compute totals using Decimal (same as create).
-        const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId)).filter(Boolean)));
+        const itemIds = Array.from(new Set((body.lines ?? []).map((l) => Number(l.itemId ?? 0)).filter((x) => x > 0)));
         const items = await prisma.item.findMany({
             where: { companyId, id: { in: itemIds } },
             select: { id: true, name: true, incomeAccountId: true, sellingPrice: true },
@@ -2795,22 +3202,30 @@ export async function booksRoutes(fastify) {
         let total = new Prisma.Decimal(0);
         const computedLines = [];
         for (const [idx, l] of (body.lines ?? []).entries()) {
-            const itemId = Number(l.itemId);
-            if (!itemId || Number.isNaN(itemId)) {
+            const itemIdRaw = l.itemId;
+            const itemId = itemIdRaw === null || itemIdRaw === undefined || itemIdRaw === '' ? null : Number(itemIdRaw);
+            if (itemId !== null && (!Number.isInteger(itemId) || itemId <= 0)) {
                 reply.status(400);
-                return { error: `lines[${idx}].itemId is required` };
+                return { error: `lines[${idx}].itemId must be a positive integer or null` };
             }
-            const item = itemById.get(itemId);
-            if (!item) {
+            const item = itemId ? itemById.get(itemId) : null;
+            if (itemId && !item) {
                 reply.status(400);
                 return { error: `lines[${idx}].itemId not found in this company` };
+            }
+            if (!itemId) {
+                const desc = String(l.description ?? '').trim();
+                if (!desc) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].description is required when itemId is not set` };
+                }
             }
             const qty = toMoneyDecimal(l.quantity ?? 0);
             if (qty.lessThanOrEqualTo(0)) {
                 reply.status(400);
                 return { error: `lines[${idx}].quantity must be > 0` };
             }
-            const unit = toMoneyDecimal(l.unitPrice ?? Number(item.sellingPrice ?? 0));
+            const unit = toMoneyDecimal(l.unitPrice ?? Number(item?.sellingPrice ?? 0));
             if (unit.lessThanOrEqualTo(0)) {
                 reply.status(400);
                 return { error: `lines[${idx}].unitPrice must be > 0` };
@@ -2834,8 +3249,8 @@ export async function booksRoutes(fastify) {
             total = total.add(lineTotal);
             computedLines.push({
                 companyId,
-                itemId: item.id,
-                description: l.description ?? item.name ?? null,
+                itemId: itemId ?? null,
+                description: l.description ?? item?.name ?? null,
                 quantity: qty,
                 unitPrice: unit,
                 discountAmount: discount,
@@ -3643,7 +4058,7 @@ export async function booksRoutes(fastify) {
             computedLines.push({
                 companyId,
                 invoiceLineId: r.invoiceLineId,
-                itemId: r.invoiceLine.itemId,
+                itemId: r.invoiceLine.itemId ?? null,
                 description: r.invoiceLine.description ?? r.invoiceLine.item?.name ?? null,
                 quantity: r.qty,
                 unitPrice: unit,
@@ -3696,7 +4111,12 @@ export async function booksRoutes(fastify) {
             where: { id: creditNoteId, companyId },
             include: {
                 customer: true,
+                appliedInvoice: { select: { id: true, invoiceNumber: true, invoiceDate: true, total: true } },
                 lines: creditNoteLinesIncludeWithIncomeAccount,
+                refunds: {
+                    orderBy: [{ refundDate: 'desc' }, { id: 'desc' }],
+                    include: { bankAccount: { select: { id: true, code: true, name: true, type: true } } },
+                },
                 journalEntry: { include: { lines: { include: { account: { select: { id: true, code: true, name: true, type: true } } } } } },
             },
         });
@@ -3704,7 +4124,177 @@ export async function booksRoutes(fastify) {
             reply.status(404);
             return { error: 'credit note not found' };
         }
-        return cn;
+        const total = new Prisma.Decimal(cn.total ?? 0).toDecimalPlaces(2);
+        const refunded = new Prisma.Decimal(cn.amountRefunded ?? 0).toDecimalPlaces(2);
+        const applied = cn.appliedInvoiceId ? total : new Prisma.Decimal(0);
+        const creditsRemaining = total.sub(refunded).sub(applied).toDecimalPlaces(2);
+        return { ...cn, creditsRemaining: creditsRemaining.toString() };
+    });
+    // Refund an open credit note (cash/bank outflow).
+    // POST /companies/:companyId/credit-notes/:creditNoteId/refunds
+    fastify.post('/companies/:companyId/credit-notes/:creditNoteId/refunds', async (request, reply) => {
+        const companyId = requireCompanyIdParam(request, reply);
+        requireAnyRole(request, reply, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
+        const creditNoteId = Number(request.params?.creditNoteId);
+        if (!creditNoteId || Number.isNaN(creditNoteId)) {
+            reply.status(400);
+            return { error: 'invalid creditNoteId' };
+        }
+        const idempotencyKey = request.headers?.['idempotency-key'];
+        if (!idempotencyKey) {
+            reply.status(400);
+            return { error: 'Idempotency-Key header is required' };
+        }
+        const body = (request.body ?? {});
+        const bankAccountId = Number(body.bankAccountId);
+        if (!bankAccountId || Number.isNaN(bankAccountId)) {
+            reply.status(400);
+            return { error: 'bankAccountId is required' };
+        }
+        if (body.amount == null) {
+            reply.status(400);
+            return { error: 'amount is required' };
+        }
+        const amount = toMoneyDecimal(body.amount);
+        if (amount.lessThanOrEqualTo(0)) {
+            reply.status(400);
+            return { error: 'amount must be > 0' };
+        }
+        const refundDate = parseDateInput(body.refundDate) ?? new Date();
+        if (body.refundDate && isNaN(refundDate.getTime())) {
+            reply.status(400);
+            return { error: 'invalid refundDate' };
+        }
+        const correlationId = randomUUID();
+        const occurredAt = isoNow();
+        const lockKey = `lock:credit-note:refund:${companyId}:${creditNoteId}`;
+        async function ensureAccountsReceivableAccount(tx) {
+            const company = await tx.company.findFirst({
+                where: { id: companyId },
+                select: { accountsReceivableAccountId: true },
+            });
+            if (company?.accountsReceivableAccountId)
+                return Number(company.accountsReceivableAccountId);
+            const byName = await tx.account.findFirst({ where: { companyId, type: 'ASSET', name: 'Accounts Receivable' }, select: { id: true } });
+            if (byName?.id)
+                return byName.id;
+            const byCode = await tx.account.findFirst({ where: { companyId, type: 'ASSET', code: '1200' }, select: { id: true } });
+            if (byCode?.id)
+                return byCode.id;
+            throw Object.assign(new Error('Accounts Receivable account is not configured'), { statusCode: 400 });
+        }
+        try {
+            const { response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+                const txResult = await prisma.$transaction(async (tx) => {
+                    await tx.$queryRaw `
+              SELECT id FROM CreditNote
+              WHERE id = ${creditNoteId} AND companyId = ${companyId}
+              FOR UPDATE
+            `;
+                    const cn = await tx.creditNote.findFirst({
+                        where: { id: creditNoteId, companyId },
+                        select: { id: true, status: true, total: true, amountRefunded: true, appliedInvoiceId: true, creditNoteNumber: true, customerId: true },
+                    });
+                    if (!cn)
+                        throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
+                    if (cn.status !== 'POSTED')
+                        throw Object.assign(new Error('only POSTED credit notes can be refunded'), { statusCode: 400 });
+                    if (cn.appliedInvoiceId) {
+                        throw Object.assign(new Error('credit note is applied to an invoice (unapply it before refunding)'), { statusCode: 400 });
+                    }
+                    const total = new Prisma.Decimal(cn.total ?? 0).toDecimalPlaces(2);
+                    const refunded = new Prisma.Decimal(cn.amountRefunded ?? 0).toDecimalPlaces(2);
+                    const remaining = total.sub(refunded).toDecimalPlaces(2);
+                    if (amount.greaterThan(remaining)) {
+                        throw Object.assign(new Error(`amount cannot exceed remaining credit of ${remaining.toString()}`), { statusCode: 400 });
+                    }
+                    const bankAcc = await tx.account.findFirst({ where: { id: bankAccountId, companyId }, select: { id: true, type: true } });
+                    if (!bankAcc)
+                        throw Object.assign(new Error('bankAccountId not found in this company'), { statusCode: 400 });
+                    if (bankAcc.type !== AccountType.ASSET) {
+                        throw Object.assign(new Error('bankAccountId must be an ASSET account'), { statusCode: 400 });
+                    }
+                    const arAccountId = await ensureAccountsReceivableAccount(tx);
+                    const je = await postJournalEntry(tx, {
+                        companyId,
+                        date: refundDate,
+                        description: `Refund credit note • ${cn.creditNoteNumber}`,
+                        locationId: null,
+                        createdByUserId: request.user?.userId ?? null,
+                        lines: [
+                            { accountId: arAccountId, debit: amount, credit: new Prisma.Decimal(0) },
+                            { accountId: bankAccountId, debit: new Prisma.Decimal(0), credit: amount },
+                        ],
+                        skipAccountValidation: true,
+                    });
+                    const refund = await tx.creditNoteRefund.create({
+                        data: {
+                            companyId,
+                            creditNoteId: cn.id,
+                            refundDate,
+                            amount,
+                            bankAccountId,
+                            journalEntryId: je.id,
+                            reference: body.reference ? String(body.reference).trim() : null,
+                            description: body.description ? String(body.description).trim() : null,
+                            createdByUserId: request.user?.userId ?? null,
+                        },
+                    });
+                    const newRefunded = refunded.add(amount).toDecimalPlaces(2);
+                    await tx.creditNote.updateMany({
+                        where: { id: cn.id, companyId },
+                        data: { amountRefunded: newRefunded },
+                    });
+                    const jeEventId = randomUUID();
+                    await tx.event.create({
+                        data: {
+                            companyId,
+                            eventId: jeEventId,
+                            eventType: 'journal.entry.created',
+                            type: 'JournalEntryCreated',
+                            schemaVersion: 'v1',
+                            occurredAt: new Date(occurredAt),
+                            source: 'cashflow-api',
+                            partitionKey: String(companyId),
+                            correlationId,
+                            aggregateType: 'JournalEntry',
+                            aggregateId: String(je.id),
+                            payload: { journalEntryId: je.id, companyId, source: 'CreditNoteRefund', creditNoteRefundId: refund.id },
+                        },
+                    });
+                    await writeAuditLog(tx, {
+                        companyId,
+                        userId: request.user?.userId ?? null,
+                        action: 'credit_note.refund',
+                        entityType: 'CreditNoteRefund',
+                        entityId: String(refund.id),
+                        idempotencyKey,
+                        correlationId,
+                        metadata: {
+                            creditNoteId: cn.id,
+                            creditNoteNumber: cn.creditNoteNumber,
+                            amount: amount.toString(),
+                            refundDate,
+                            journalEntryId: je.id,
+                            occurredAt,
+                        },
+                    });
+                    return { creditNoteRefundId: refund.id, journalEntryId: je.id, amountRefunded: newRefunded.toString(), jeEventId };
+                });
+                return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
+            }, redis));
+            if (result.jeEventId) {
+                publishEventsFastPath([result.jeEventId]);
+            }
+            return { creditNoteRefundId: result.creditNoteRefundId, journalEntryId: result.journalEntryId };
+        }
+        catch (err) {
+            if (err?.statusCode) {
+                reply.status(err.statusCode);
+                return { error: err.message };
+            }
+            throw err;
+        }
     });
     // Post credit note: DRAFT -> POSTED (creates JE Dr INCOME / Cr AR)
     fastify.post('/companies/:companyId/credit-notes/:creditNoteId/post', async (request, reply) => {
@@ -3747,7 +4337,7 @@ export async function booksRoutes(fastify) {
                 const loc = await prisma.location.findFirst({ where: { companyId, isDefault: true }, select: { id: true } });
                 fallbackLocationId = loc?.id ?? null;
             }
-            const trackedLines = (pre.lines ?? []).filter((l) => l.item.type === 'GOODS' && l.item.trackInventory);
+            const trackedLines = (pre.lines ?? []).filter((l) => l.itemId && l.item && l.item.type === 'GOODS' && l.item.trackInventory);
             if (trackedLines.length > 0) {
                 const missingWh = trackedLines.some((l) => !(l.item.defaultLocationId ?? fallbackLocationId));
                 if (missingWh) {
@@ -3990,6 +4580,10 @@ export async function booksRoutes(fastify) {
                         throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
                     }
                     const updated = { id: cn.id, status: 'POSTED' };
+                    // IMPORTANT:
+                    // Do NOT update the source invoice settlement status here.
+                    // Posting a credit note creates an open customer credit balance; it becomes a "payment-like" settlement
+                    // ONLY when user applies it to an invoice (CreditNote.appliedInvoiceId) via Apply Credits flow.
                     const jeEventId = randomUUID();
                     await tx.event.create({
                         data: {
@@ -4072,12 +4666,14 @@ export async function booksRoutes(fastify) {
         return bills.map((b) => ({
             id: b.id,
             expenseNumber: b.expenseNumber,
+            vendorId: b.vendorId ?? null,
             vendorName: b.vendor?.name ?? null,
             status: b.status,
             amount: b.amount,
             amountPaid: b.amountPaid ?? 0,
             expenseDate: b.expenseDate,
             dueDate: b.dueDate ?? null,
+            attachmentUrl: b.attachmentUrl ?? null,
             createdAt: b.createdAt,
         }));
     });
@@ -4164,6 +4760,8 @@ export async function booksRoutes(fastify) {
         return {
             id: expense.id,
             expenseNumber: expense.expenseNumber,
+            vendorId: expense.vendorId ?? null,
+            vendorName: expense.vendor?.name ?? null,
             vendor: expense.vendor,
             status: expense.status,
             expenseDate: expense.expenseDate,
@@ -4171,6 +4769,7 @@ export async function booksRoutes(fastify) {
             amount: expense.amount,
             currency: expense.currency,
             description: expense.description,
+            attachmentUrl: expense.attachmentUrl ?? null,
             expenseAccount: expense.expenseAccount
                 ? {
                     id: expense.expenseAccount.id,
@@ -4279,17 +4878,27 @@ export async function booksRoutes(fastify) {
                 if (existing.journalEntryId) {
                     throw Object.assign(new Error('cannot edit an expense that already has a journal entry'), { statusCode: 400 });
                 }
+                const nextAttachment = body.attachmentUrl === undefined
+                    ? undefined
+                    : body.attachmentUrl === null || String(body.attachmentUrl).trim() === ''
+                        ? null
+                        : String(body.attachmentUrl).trim();
+                const data = {
+                    expenseDate,
+                    dueDate: dueDate === undefined ? null : dueDate,
+                    description: body.description.trim(),
+                    amount: toMoneyDecimal(Number(body.amount)),
+                    currency: body.currency === undefined ? null : docCurrency,
+                };
+                if (body.vendorId !== undefined)
+                    data.vendorId = body.vendorId ?? null;
+                if (body.expenseAccountId !== undefined)
+                    data.expenseAccountId = body.expenseAccountId ?? null;
+                if (nextAttachment !== undefined)
+                    data.attachmentUrl = nextAttachment;
                 const upd = await tx.expense.updateMany({
                     where: { id: expenseId, companyId, status: 'DRAFT' },
-                    data: {
-                        vendorId: body.vendorId ?? null,
-                        expenseDate,
-                        dueDate: dueDate === undefined ? null : dueDate,
-                        description: body.description.trim(),
-                        amount: toMoneyDecimal(Number(body.amount)),
-                        currency: body.currency === undefined ? null : docCurrency,
-                        expenseAccountId: body.expenseAccountId ?? null,
-                    },
+                    data,
                 });
                 if (upd.count !== 1) {
                     throw Object.assign(new Error('expense not found'), { statusCode: 404 });
@@ -4325,12 +4934,15 @@ export async function booksRoutes(fastify) {
                 id: updated.id,
                 expenseNumber: updated.expenseNumber,
                 status: updated.status,
+                vendorId: updated.vendorId ?? null,
+                vendorName: updated.vendor?.name ?? null,
                 vendor: updated.vendor ?? null,
                 expenseDate: updated.expenseDate,
                 dueDate: updated.dueDate ?? null,
                 amount: updated.amount,
                 currency: updated.currency,
                 description: updated.description,
+                attachmentUrl: updated.attachmentUrl ?? null,
                 expenseAccount: updated.expenseAccount
                     ? {
                         id: updated.expenseAccount.id,
@@ -4923,6 +5535,11 @@ export async function booksRoutes(fastify) {
             reply.status(400);
             return { error: 'invalid dueDate' };
         }
+        const attachmentUrl = body.attachmentUrl === null || body.attachmentUrl === undefined
+            ? null
+            : typeof body.attachmentUrl === 'string' && body.attachmentUrl.trim()
+                ? body.attachmentUrl.trim()
+                : null;
         const bill = await prisma.expense.create({
             data: {
                 companyId,
@@ -4932,6 +5549,7 @@ export async function booksRoutes(fastify) {
                 expenseDate,
                 dueDate: dueDate ?? null,
                 description: body.description,
+                attachmentUrl,
                 amount: toMoneyDecimal(body.amount),
                 amountPaid: new Prisma.Decimal(0),
                 currency: body.currency ?? null,

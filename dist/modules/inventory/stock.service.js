@@ -66,9 +66,18 @@ export function _test_replayStockMovesWithBackdatedInsert(args) {
     };
     const computeInsertCost = () => {
         if (insert.direction === 'IN') {
-            const unit = d2(new Prisma.Decimal(insert.unitCostApplied));
-            const inValue = d2(insertQty.mul(unit));
-            return { unitCostApplied: unit, totalCostApplied: inValue };
+            // Default IN: qty * unitCostApplied.
+            // Optional override: allow caller to specify totalCostApplied for exact receipt flows
+            // (e.g., purchase bills with an absolute discount that must preserve the discounted line total).
+            const overrideInValue = insert.totalCostApplied !== undefined && insert.totalCostApplied !== null;
+            const inValue = overrideInValue
+                ? d2(new Prisma.Decimal(insert.totalCostApplied))
+                : d2(insertQty.mul(d2(new Prisma.Decimal(insert.unitCostApplied))));
+            if (inValue.lessThan(0)) {
+                throw Object.assign(new Error('totalCostApplied cannot be negative'), { statusCode: 400 });
+            }
+            const unitCost = insertQty.greaterThan(0) ? d2(inValue.div(insertQty)) : d2(new Prisma.Decimal(insert.unitCostApplied));
+            return { unitCostApplied: unitCost, totalCostApplied: inValue };
         }
         // OUT: compute using current average cost unless caller overrides totalCostApplied.
         if (Q.lessThan(insertQty)) {
@@ -120,6 +129,213 @@ export function _test_replayStockMovesWithBackdatedInsert(args) {
         computedInsert,
         finalBalance: { qtyOnHand: d2(Q), avgUnitCost: d2(A), inventoryValue: d2(V) },
     };
+}
+/**
+ * Replay helper for value-only inserts (e.g., landed cost capitalization).
+ * Inserts an IN move with quantity = 0 and totalCostApplied = valueDelta.
+ *
+ * Invariant: stock on hand at insert point must be > 0 (otherwise avg cost is undefined).
+ */
+export function _test_replayStockMovesWithBackdatedValueInsert(args) {
+    const moves = (args.existingMoves ?? []).slice().sort((a, b) => {
+        const da = new Date(a.date).getTime();
+        const db = new Date(b.date).getTime();
+        if (da !== db)
+            return da - db;
+        return (a.id ?? 0) - (b.id ?? 0);
+    });
+    const insertTime = args.insert.date.getTime();
+    const valueDelta = d2(new Prisma.Decimal(args.insert.valueDelta));
+    if (valueDelta.equals(0)) {
+        throw Object.assign(new Error('valueDelta must be non-zero'), { statusCode: 400 });
+    }
+    let Q = d0();
+    let A = d0();
+    let V = d0();
+    const applyIn = (qty, unitCostApplied, totalCostApplied) => {
+        const q = d2(qty);
+        const value = d2(totalCostApplied);
+        const newQ = d2(Q.add(q));
+        const newV = d2(V.add(value));
+        const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : d2(unitCostApplied);
+        Q = newQ;
+        V = newV;
+        A = newA;
+    };
+    const applyValueOnly = (value) => {
+        if (Q.lessThanOrEqualTo(0)) {
+            throw Object.assign(new Error('cannot apply value adjustment when qtyOnHand is zero at that date'), {
+                statusCode: 400,
+            });
+        }
+        const newV = d2(V.add(d2(value)));
+        const newA = d2(newV.div(Q));
+        V = newV;
+        A = newA;
+    };
+    const applyOut = (qty, totalCostApplied, meta) => {
+        const q = d2(qty);
+        if (Q.lessThan(q)) {
+            throw Object.assign(new Error('insufficient stock (timeline replay)'), {
+                statusCode: 400,
+                atDate: meta?.date ? new Date(meta.date).toISOString() : null,
+                qtyOnHand: Q.toString(),
+                qtyRequested: q.toString(),
+                causedByMove: meta ?? null,
+            });
+        }
+        const outValue = d2(totalCostApplied);
+        const newQ = d2(Q.sub(q));
+        const newV = d2(V.sub(outValue));
+        const newA = newQ.greaterThan(0) ? d2(newV.div(newQ)) : d2(A);
+        Q = newQ;
+        V = newV;
+        A = newA;
+    };
+    let inserted = false;
+    for (const m of moves) {
+        const mt = new Date(m.date).getTime();
+        if (!inserted && mt > insertTime) {
+            applyValueOnly(valueDelta);
+            inserted = true;
+        }
+        if (m.type === 'VALUE_ADJUSTMENT' && m.direction === 'IN' && d2(m.quantity).equals(0)) {
+            applyValueOnly(d2(m.totalCostApplied));
+            continue;
+        }
+        if (m.direction === 'IN')
+            applyIn(m.quantity, m.unitCostApplied, m.totalCostApplied);
+        else
+            applyOut(m.quantity, m.totalCostApplied, { id: m.id, type: m.type, date: m.date, referenceType: m.referenceType, referenceId: m.referenceId });
+    }
+    if (!inserted) {
+        applyValueOnly(valueDelta);
+    }
+    return { finalBalance: { qtyOnHand: d2(Q), avgUnitCost: d2(A), inventoryValue: d2(V) } };
+}
+export async function applyStockValueAdjustmentWac(tx, input) {
+    const valueDelta = d2(new Prisma.Decimal(input.valueDelta));
+    const zero = new Prisma.Decimal(0);
+    if (valueDelta.equals(0))
+        throw Object.assign(new Error('valueDelta must be non-zero'), { statusCode: 400 });
+    const existing = await lockAndGetStockBalanceRowForUpdate(tx, {
+        companyId: input.companyId,
+        locationId: input.locationId,
+        itemId: input.itemId,
+    });
+    const Q = existing ? d2(existing.qtyOnHand) : d0();
+    const V = existing ? d2(existing.inventoryValue) : d0();
+    if (Q.lessThanOrEqualTo(0)) {
+        throw Object.assign(new Error('cannot apply value adjustment when qtyOnHand is zero'), { statusCode: 400 });
+    }
+    if (input.allowBackdated) {
+        const lastMove = await tx.stockMove.findFirst({
+            where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
+            orderBy: [{ date: 'desc' }, { id: 'desc' }],
+            select: { date: true },
+        });
+        const isTrulyBackdated = lastMove?.date && input.date.getTime() < new Date(lastMove.date).getTime();
+        if (isTrulyBackdated) {
+            const existingMoves = (await tx.stockMove.findMany({
+                where: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId },
+                orderBy: [{ date: 'asc' }, { id: 'asc' }],
+                select: {
+                    id: true,
+                    date: true,
+                    type: true,
+                    direction: true,
+                    quantity: true,
+                    unitCostApplied: true,
+                    totalCostApplied: true,
+                    referenceType: true,
+                    referenceId: true,
+                },
+            }));
+            const simulated = _test_replayStockMovesWithBackdatedValueInsert({
+                existingMoves,
+                insert: { date: input.date, valueDelta, referenceType: input.referenceType ?? null, referenceId: input.referenceId ?? null },
+            });
+            const move = await tx.stockMove.create({
+                data: {
+                    companyId: input.companyId,
+                    locationId: input.locationId,
+                    itemId: input.itemId,
+                    date: input.date,
+                    type: 'VALUE_ADJUSTMENT',
+                    direction: 'IN',
+                    quantity: d2(zero),
+                    unitCostApplied: d2(zero),
+                    totalCostApplied: valueDelta,
+                    referenceType: input.referenceType ?? null,
+                    referenceId: input.referenceId ?? null,
+                    correlationId: input.correlationId ?? null,
+                    createdByUserId: input.createdByUserId ?? null,
+                    journalEntryId: input.journalEntryId ?? null,
+                },
+            });
+            const balance = await tx.stockBalance.upsert({
+                where: {
+                    companyId_locationId_itemId: {
+                        companyId: input.companyId,
+                        locationId: input.locationId,
+                        itemId: input.itemId,
+                    },
+                },
+                update: {
+                    qtyOnHand: simulated.finalBalance.qtyOnHand,
+                    avgUnitCost: simulated.finalBalance.avgUnitCost,
+                    inventoryValue: simulated.finalBalance.inventoryValue,
+                },
+                create: {
+                    companyId: input.companyId,
+                    locationId: input.locationId,
+                    itemId: input.itemId,
+                    qtyOnHand: simulated.finalBalance.qtyOnHand,
+                    avgUnitCost: simulated.finalBalance.avgUnitCost,
+                    inventoryValue: simulated.finalBalance.inventoryValue,
+                },
+            });
+            return {
+                balance,
+                move,
+                requiresInventoryRecalcFromDate: input.date,
+            };
+        }
+    }
+    const newV = d2(V.add(valueDelta));
+    if (newV.lessThan(0))
+        throw Object.assign(new Error('inventory value cannot be negative'), { statusCode: 400 });
+    const newA = d2(newV.div(Q));
+    const balance = await tx.stockBalance.upsert({
+        where: {
+            companyId_locationId_itemId: {
+                companyId: input.companyId,
+                locationId: input.locationId,
+                itemId: input.itemId,
+            },
+        },
+        update: { qtyOnHand: Q, avgUnitCost: newA, inventoryValue: newV },
+        create: { companyId: input.companyId, locationId: input.locationId, itemId: input.itemId, qtyOnHand: Q, avgUnitCost: newA, inventoryValue: newV },
+    });
+    const move = await tx.stockMove.create({
+        data: {
+            companyId: input.companyId,
+            locationId: input.locationId,
+            itemId: input.itemId,
+            date: input.date,
+            type: 'VALUE_ADJUSTMENT',
+            direction: 'IN',
+            quantity: d2(zero),
+            unitCostApplied: d2(zero),
+            totalCostApplied: valueDelta,
+            referenceType: input.referenceType ?? null,
+            referenceId: input.referenceId ?? null,
+            correlationId: input.correlationId ?? null,
+            createdByUserId: input.createdByUserId ?? null,
+            journalEntryId: input.journalEntryId ?? null,
+        },
+    });
+    return { balance, move, requiresInventoryRecalcFromDate: null };
 }
 export async function getCompanyInventoryConfig(tx, companyId) {
     const company = await tx.company.findUnique({
@@ -375,6 +591,9 @@ export async function applyStockMoveWac(tx, input) {
                 move,
                 unitCostApplied: simulated.computedInsert.unitCostApplied,
                 totalCostApplied: simulated.computedInsert.totalCostApplied,
+                // Caller should enqueue an inventory revaluation from this date forward,
+                // because existing later StockMove costs were NOT rewritten.
+                requiresInventoryRecalcFromDate: input.date,
             };
         }
     }
@@ -464,6 +683,7 @@ export async function applyStockMoveWac(tx, input) {
             move,
             unitCostApplied: unitCost,
             totalCostApplied: outValue,
+            requiresInventoryRecalcFromDate: null,
         };
     }
     // IN
@@ -524,6 +744,7 @@ export async function applyStockMoveWac(tx, input) {
         move,
         unitCostApplied: unitCost,
         totalCostApplied: inValue,
+        requiresInventoryRecalcFromDate: null,
     };
 }
 async function lockAndGetStockBalanceRowForUpdate(tx, input) {

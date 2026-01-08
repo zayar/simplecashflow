@@ -13,9 +13,13 @@ export default function Login() {
   const location = useLocation() as any;
   const [search] = useSearchParams();
 
+  const [mode, setMode] = useState<'otp' | 'password'>('otp');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [phone, setPhone] = useState('');
+  const [otp, setOtp] = useState('');
+  const [otpSent, setOtpSent] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -25,7 +29,7 @@ export default function Login() {
     return null;
   }, [search]);
 
-  async function onSubmit(e: React.FormEvent) {
+  async function onPasswordSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setIsSubmitting(true);
@@ -39,6 +43,41 @@ export default function Login() {
       navigate(location?.state?.from ?? '/', { replace: true });
     } catch (err: any) {
       setError(err?.message ?? 'Login failed');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function onRequestOtp(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setIsSubmitting(true);
+    try {
+      await fetchApi('/login/otp/request', {
+        method: 'POST',
+        body: JSON.stringify({ phone })
+      });
+      setOtpSent(true);
+    } catch (err: any) {
+      setError(err?.message ?? 'Failed to send code');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function onVerifyOtp(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setIsSubmitting(true);
+    try {
+      const res = (await fetchApi('/login/otp/verify', {
+        method: 'POST',
+        body: JSON.stringify({ phone, code: otp })
+      })) as AuthResponse;
+      login(res.token, res.user);
+      navigate(location?.state?.from ?? '/', { replace: true });
+    } catch (err: any) {
+      setError(err?.message ?? 'Invalid code');
     } finally {
       setIsSubmitting(false);
     }
@@ -62,7 +101,86 @@ export default function Login() {
         ) : null}
 
         <Card className="rounded-2xl p-4 shadow-sm">
-          <form onSubmit={onSubmit} className="space-y-4">
+          <div className="mb-4 grid grid-cols-2 gap-2">
+            <Button
+              type="button"
+              variant={mode === 'otp' ? 'default' : 'outline'}
+              onClick={() => {
+                setMode('otp');
+                setError(null);
+              }}
+            >
+              Phone OTP
+            </Button>
+            <Button
+              type="button"
+              variant={mode === 'password' ? 'default' : 'outline'}
+              onClick={() => {
+                setMode('password');
+                setError(null);
+              }}
+            >
+              Password
+            </Button>
+          </div>
+
+          {mode === 'otp' ? (
+            <form onSubmit={otpSent ? onVerifyOtp : onRequestOtp} className="space-y-4">
+              <div>
+                <label className="mb-1 block text-sm font-medium text-foreground">Phone</label>
+                <Input
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  type="tel"
+                  required
+                  placeholder="09xxxxxxxxx"
+                  inputMode="tel"
+                  disabled={otpSent}
+                />
+              </div>
+
+              {otpSent ? (
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-foreground">OTP code</label>
+                  <Input
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value)}
+                    type="text"
+                    required
+                    placeholder="6-digit code"
+                    inputMode="numeric"
+                  />
+                </div>
+              ) : null}
+
+              {error ? (
+                <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  {error}
+                </div>
+              ) : null}
+
+              <Button disabled={isSubmitting} className="w-full" type="submit">
+                {isSubmitting ? (otpSent ? 'Verifying…' : 'Sending…') : otpSent ? 'Verify & Sign in' : 'Send code'}
+              </Button>
+
+              {otpSent ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="w-full"
+                  disabled={isSubmitting}
+                  onClick={() => {
+                    setOtpSent(false);
+                    setOtp('');
+                    setError(null);
+                  }}
+                >
+                  Change phone
+                </Button>
+              ) : null}
+            </form>
+          ) : (
+            <form onSubmit={onPasswordSubmit} className="space-y-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-foreground">Email</label>
               <Input
@@ -117,6 +235,7 @@ export default function Login() {
               </Link>
             </div>
           </form>
+          )}
         </Card>
 
         <div className="mt-6 text-center text-xs text-muted-foreground">

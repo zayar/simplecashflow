@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { useAuth } from '../lib/auth';
 import { getExpenses, type ExpenseListRow } from '../lib/expenses';
@@ -10,6 +10,8 @@ import { BottomNav } from '../components/BottomNav';
 import { Fab, PlusIcon } from '../components/Fab';
 import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
+import { usePullToRefresh } from '../lib/usePullToRefresh';
+import { PullToRefreshIndicator } from '../components/PullToRefresh';
 
 function statusLabel(status: string): { text: string; cls: string } {
   const s = String(status || '').toUpperCase();
@@ -24,6 +26,7 @@ export default function Expenses() {
   const { user } = useAuth();
   const companyId = user?.companyId ?? 0;
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchOpen, setSearchOpen] = useState(false);
   const [q, setQ] = useState('');
 
@@ -31,6 +34,14 @@ export default function Expenses() {
     queryKey: ['expenses', companyId],
     queryFn: async () => await getExpenses(companyId),
     enabled: companyId > 0
+  });
+
+  const handleRefresh = useCallback(async () => {
+    await queryClient.invalidateQueries({ queryKey: ['expenses', companyId] });
+  }, [queryClient, companyId]);
+
+  const { isRefreshing, pullDistance, handlers, containerRef } = usePullToRefresh({
+    onRefresh: handleRefresh
   });
 
   const filtered = useMemo(() => {
@@ -61,7 +72,11 @@ export default function Expenses() {
   }, [filtered]);
 
   return (
-    <div className="min-h-dvh bg-background">
+    <div
+      className="min-h-dvh bg-background"
+      ref={containerRef}
+      {...handlers}
+    >
       <AppBar
         title="Expenses"
         left={
@@ -77,6 +92,8 @@ export default function Expenses() {
       />
 
       <div className="mx-auto max-w-xl px-3 pb-24 pt-3">
+        <PullToRefreshIndicator isRefreshing={isRefreshing} pullDistance={pullDistance} />
+
         <Card className="rounded-2xl shadow-sm">
           {searchOpen ? (
             <div className="p-3">
@@ -107,21 +124,34 @@ export default function Expenses() {
                       const vendor = e.vendorName ? String(e.vendorName) : 'No Vendor';
                       const meta = `${e.expenseNumber} • ${formatMMDDYYYY(e.expenseDate)}`;
                       const st = statusLabel(e.status);
+                      const canEdit = e.status === 'DRAFT';
 
                       return (
-                        <div
+                        <button
                           key={e.id}
-                          className="flex w-full items-start justify-between gap-3 border-t border-border px-4 py-3"
+                          type="button"
+                          onClick={() => {
+                            navigate(`/expenses/${e.id}`);
+                          }}
+                          className={`flex w-full items-start justify-between gap-3 border-t border-border px-4 py-3 text-left ${
+                            'active:bg-muted/50'
+                          }`}
                         >
                           <div className="min-w-0">
                             <div className="truncate text-base text-foreground">{vendor}</div>
-                            <div className="text-sm text-muted-foreground">{meta}</div>
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                              <span>{meta}</span>
+                              {e.attachmentUrl && (
+                                <span className="text-primary" title="Has attachment">📎</span>
+                              )}
+                            </div>
                           </div>
                           <div className="shrink-0 text-right">
                             <div className="text-base font-medium text-foreground">{formatMoneyK(toNumber(e.amount))}</div>
                             <div className={`text-sm ${st.cls}`}>{st.text}</div>
+                            {canEdit ? <div className="mt-1 text-xs text-muted-foreground">Tap to view / edit</div> : null}
                           </div>
-                        </div>
+                        </button>
                       );
                     })}
                   </div>
