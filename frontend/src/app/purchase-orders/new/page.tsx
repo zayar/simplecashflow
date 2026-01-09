@@ -13,11 +13,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SelectNative } from '@/components/ui/select-native';
+import { ItemCombobox } from '@/components/item-combobox';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
 
 type Line = {
   itemId: string;
+  itemText: string;
   quantity: string;
   unitCost: string;
   discountAmount: string;
@@ -33,6 +35,7 @@ export default function NewPurchaseOrderPage() {
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [locations, setLocations] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
 
   const [form, setForm] = useState({
     vendorId: '',
@@ -44,7 +47,7 @@ export default function NewPurchaseOrderPage() {
   });
 
   const [lines, setLines] = useState<Line[]>([
-    { itemId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
+    { itemId: '', itemText: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
   ]);
 
   useEffect(() => {
@@ -61,12 +64,74 @@ export default function NewPurchaseOrderPage() {
 
   const activeItems = useMemo(() => items.filter((i) => i.isActive !== false), [items]);
 
+  const selectedLocationLabel = useMemo(() => {
+    const id = Number(form.locationId || 0) || null;
+    if (!id) return null;
+    const loc = (locations ?? []).find((l: any) => Number(l?.id) === Number(id));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [locations, form.locationId]);
+
+  useEffect(() => {
+    if (!user?.companyId) return;
+    const id = Number(form.locationId || 0) || null;
+    if (!id) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(id))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, form.locationId]);
+
   function updateLine(idx: number, patch: Partial<Line>) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
 
+  function applyPickedItem(idx: number, picked: any | null) {
+    const itemId = picked?.id ? String(picked.id) : '';
+    const baseCost = Number(picked?.costPrice ?? 0);
+    updateLine(idx, {
+      itemId,
+      itemText: picked?.name ? String(picked.name) : '',
+      unitCost:
+        String(lines[idx]?.unitCost ?? '').trim() || !Number.isFinite(baseCost) || baseCost <= 0
+          ? String(lines[idx]?.unitCost ?? '')
+          : String(baseCost),
+      description: picked?.name ? String(picked.name) : '',
+    });
+  }
+
+  function handleItemTextChange(idx: number, text: string) {
+    const normalized = String(text ?? '').trim();
+    const picked = activeItems.find((i: any) => String(i.name ?? '').trim().toLowerCase() === normalized.toLowerCase());
+    if (picked) {
+      applyPickedItem(idx, picked);
+      return;
+    }
+    updateLine(idx, { itemText: text, itemId: '' });
+  }
+
   function addLine() {
-    setLines((prev) => [...prev, { itemId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' }]);
+    setLines((prev) => [...prev, { itemId: '', itemText: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' }]);
   }
 
   function removeLine(idx: number) {
@@ -211,14 +276,28 @@ export default function NewPurchaseOrderPage() {
                 {lines.map((l, idx) => (
                   <TableRow key={idx}>
                     <TableCell>
-                      <SelectNative value={l.itemId} onChange={(e) => updateLine(idx, { itemId: e.target.value })}>
-                        <option value="">Select item…</option>
-                        {activeItems.map((it: any) => (
-                          <option key={it.id} value={String(it.id)}>
-                            {it.sku ? `${it.sku} - ` : ''}{it.name}
-                          </option>
-                        ))}
-                      </SelectNative>
+                      <Input className="hidden" />
+                      <ItemCombobox
+                        items={(activeItems ?? []).map((i: any) => ({
+                          id: Number(i.id),
+                          name: String(i.name ?? ''),
+                          sku: i.sku ?? null,
+                          sellingPrice: i.sellingPrice,
+                          costPrice: i.costPrice,
+                          trackInventory: !!i.trackInventory,
+                        }))}
+                        valueText={(l as any).itemText ?? (l.itemId ? (activeItems.find((x: any) => String(x.id) === String(l.itemId))?.name ?? '') : '')}
+                        placeholder="Type or click to select an item…"
+                        onChangeText={(t) => handleItemTextChange(idx, t)}
+                        onSelectItem={(it) => applyPickedItem(idx, { ...it, ...activeItems.find((x: any) => Number(x.id) === Number(it.id)) })}
+                        stockByItemId={stockByItemId}
+                        selectedLocationLabel={selectedLocationLabel}
+                        currencyLabel={form.currency || null}
+                        priceLabel="Cost"
+                        getPrice={(it) => Number(it.costPrice ?? 0)}
+                        addNewHref="/items/new"
+                        disabled={!activeItems.length}
+                      />
                     </TableCell>
                     <TableCell>
                       <Input value={l.quantity} onChange={(e) => updateLine(idx, { quantity: e.target.value })} inputMode="decimal" />

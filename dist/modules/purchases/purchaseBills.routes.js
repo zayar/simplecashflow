@@ -3,7 +3,7 @@ import { AccountType, BankingAccountKind, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
@@ -18,6 +18,7 @@ import { createReversalJournalEntry, computeNetByAccount, diffNets, buildAdjustm
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 import { ensureGrniAccount } from './grni.service.js';
 import { ensurePurchasePriceVarianceAccount } from './ppv.service.js';
+import { ensureTaxReceivableAccountIfNeeded } from '../../utils/tax.js';
 function generatePurchaseBillNumber() {
     // legacy fallback (should not be used in new code paths)
     return `PBILL-${Date.now()}`;
@@ -28,8 +29,20 @@ export async function purchaseBillsRoutes(fastify) {
     // List purchase bills
     fastify.get('/companies/:companyId/purchase-bills', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);
+        const purchaseOrderIdRaw = request.query?.purchaseOrderId;
+        const purchaseReceiptIdRaw = request.query?.purchaseReceiptId;
+        const purchaseOrderId = purchaseOrderIdRaw !== undefined && purchaseOrderIdRaw !== null && purchaseOrderIdRaw !== '' ? Number(purchaseOrderIdRaw) : null;
+        const purchaseReceiptId = purchaseReceiptIdRaw !== undefined && purchaseReceiptIdRaw !== null && purchaseReceiptIdRaw !== '' ? Number(purchaseReceiptIdRaw) : null;
+        if (purchaseOrderId !== null && (!Number.isInteger(purchaseOrderId) || purchaseOrderId <= 0)) {
+            reply.status(400);
+            return { error: 'invalid purchaseOrderId' };
+        }
+        if (purchaseReceiptId !== null && (!Number.isInteger(purchaseReceiptId) || purchaseReceiptId <= 0)) {
+            reply.status(400);
+            return { error: 'invalid purchaseReceiptId' };
+        }
         const rows = await prisma.purchaseBill.findMany({
-            where: { companyId },
+            where: { companyId, ...(purchaseOrderId ? { purchaseOrderId } : {}), ...(purchaseReceiptId ? { purchaseReceiptId } : {}) },
             orderBy: [{ billDate: 'desc' }, { id: 'desc' }],
             include: { vendor: true, location: true },
         });
@@ -78,8 +91,23 @@ export async function purchaseBillsRoutes(fastify) {
                 return { error: 'vendorId not found in this company' };
             }
         }
+        let purchaseOrderId = body.purchaseOrderId ?? null;
+        if (purchaseOrderId) {
+            const po = await prisma.purchaseOrder.findFirst({ where: { id: purchaseOrderId, companyId }, select: { id: true, status: true } });
+            if (!po) {
+                reply.status(400);
+                return { error: 'purchaseOrderId not found in this company' };
+            }
+            if (po.status === 'CANCELLED') {
+                reply.status(400);
+                return { error: 'cannot create a bill linked to a CANCELLED purchase order' };
+            }
+        }
         if (body.purchaseReceiptId) {
-            const pr = await prisma.purchaseReceipt.findFirst({ where: { id: body.purchaseReceiptId, companyId }, select: { id: true, status: true, locationId: true } });
+            const pr = await prisma.purchaseReceipt.findFirst({
+                where: { id: body.purchaseReceiptId, companyId },
+                select: { id: true, status: true, locationId: true, purchaseOrderId: true },
+            });
             if (!pr) {
                 reply.status(400);
                 return { error: 'purchaseReceiptId not found in this company' };
@@ -93,6 +121,13 @@ export async function purchaseBillsRoutes(fastify) {
                 reply.status(400);
                 return { error: 'purchaseReceipt location must match bill location (v1)' };
             }
+            // If this receipt came from a PO, default the bill's PO link too.
+            if (!purchaseOrderId && pr.purchaseOrderId)
+                purchaseOrderId = pr.purchaseOrderId;
+            if (purchaseOrderId && pr.purchaseOrderId && Number(purchaseOrderId) !== Number(pr.purchaseOrderId)) {
+                reply.status(400);
+                return { error: 'purchaseReceiptId must belong to the same purchaseOrderId' };
+            }
         }
         const loc = await prisma.location.findFirst({ where: { id: locationId, companyId } });
         if (!loc) {
@@ -100,7 +135,8 @@ export async function purchaseBillsRoutes(fastify) {
             return { error: 'locationId not found in this company' };
         }
         // Compute lines + totals
-        let total = new Prisma.Decimal(0);
+        let subtotal = new Prisma.Decimal(0);
+        let taxAmount = new Prisma.Decimal(0);
         const computedLines = [];
         for (const [idx, l] of (body.lines ?? []).entries()) {
             const itemId = Number(l.itemId);
@@ -162,27 +198,73 @@ export async function purchaseBillsRoutes(fastify) {
                 reply.status(400);
                 return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
             }
-            const lineTotal = gross.sub(disc).toDecimalPlaces(2);
-            total = total.add(lineTotal);
+            const lineTotal = gross.sub(disc).toDecimalPlaces(2); // net subtotal (tax-exclusive)
+            const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+            if (rate.lessThan(0) || rate.greaterThan(1)) {
+                reply.status(400);
+                return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+            }
+            const lineTax = lineTotal.mul(rate).toDecimalPlaces(2);
+            subtotal = subtotal.add(lineTotal);
+            taxAmount = taxAmount.add(lineTax);
+            const purchaseOrderLineId = l.purchaseOrderLineId ? Number(l.purchaseOrderLineId) : null;
+            if (purchaseOrderLineId) {
+                const pol = await prisma.purchaseOrderLine.findFirst({
+                    where: { id: purchaseOrderLineId, companyId },
+                    select: { id: true, purchaseOrderId: true },
+                });
+                if (!pol) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].purchaseOrderLineId not found in this company` };
+                }
+                if (purchaseOrderId && Number(pol.purchaseOrderId) !== Number(purchaseOrderId)) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].purchaseOrderLineId must belong to purchaseOrderId` };
+                }
+                if (!purchaseOrderId)
+                    purchaseOrderId = pol.purchaseOrderId;
+            }
+            const purchaseReceiptLineId = l.purchaseReceiptLineId ? Number(l.purchaseReceiptLineId) : null;
+            if (purchaseReceiptLineId) {
+                const prl = await prisma.purchaseReceiptLine.findFirst({
+                    where: { id: purchaseReceiptLineId, companyId },
+                    select: { id: true, purchaseReceiptId: true },
+                });
+                if (!prl) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].purchaseReceiptLineId not found in this company` };
+                }
+                if (body.purchaseReceiptId && Number(prl.purchaseReceiptId) !== Number(body.purchaseReceiptId)) {
+                    reply.status(400);
+                    return { error: `lines[${idx}].purchaseReceiptLineId must belong to purchaseReceiptId` };
+                }
+            }
             computedLines.push({
                 companyId,
                 locationId,
                 itemId,
                 accountId,
+                purchaseOrderLineId: purchaseOrderLineId ?? undefined,
+                purchaseReceiptLineId: purchaseReceiptLineId ?? undefined,
                 description: l.description ?? null,
                 quantity: qtyDec,
                 unitCost: unitDec,
                 discountAmount: disc,
-                lineTotal,
+                lineTotal, // net subtotal
+                taxRate: rate,
+                taxAmount: lineTax,
             });
         }
-        total = total.toDecimalPlaces(2);
+        subtotal = subtotal.toDecimalPlaces(2);
+        taxAmount = taxAmount.toDecimalPlaces(2);
+        const total = subtotal.add(taxAmount).toDecimalPlaces(2);
         const bill = await prisma.$transaction(async (tx) => {
             const billNumber = await nextPurchaseBillNumber(tx, companyId);
             return await tx.purchaseBill.create({
                 data: {
                     companyId,
                     vendorId: body.vendorId ?? null,
+                    purchaseOrderId: purchaseOrderId ?? null,
                     purchaseReceiptId: body.purchaseReceiptId ?? null,
                     locationId,
                     billNumber,
@@ -190,6 +272,8 @@ export async function purchaseBillsRoutes(fastify) {
                     billDate,
                     dueDate: dueDate ?? null,
                     currency: body.currency ?? null,
+                    subtotal,
+                    taxAmount,
                     total,
                     amountPaid: new Prisma.Decimal(0),
                     lines: { create: computedLines },
@@ -380,7 +464,8 @@ export async function purchaseBillsRoutes(fastify) {
             return { error: 'locationId not found in this company' };
         }
         // Compute lines + totals (same rules as create)
-        let total = new Prisma.Decimal(0);
+        let subtotal = new Prisma.Decimal(0);
+        let taxAmount = new Prisma.Decimal(0);
         const computedLines = [];
         for (const [idx, l] of (body.lines ?? []).entries()) {
             const itemId = Number(l.itemId);
@@ -435,8 +520,15 @@ export async function purchaseBillsRoutes(fastify) {
                 reply.status(400);
                 return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
             }
-            const lineTotal = gross.sub(disc).toDecimalPlaces(2);
-            total = total.add(lineTotal);
+            const lineTotal = gross.sub(disc).toDecimalPlaces(2); // net subtotal (tax-exclusive)
+            const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+            if (rate.lessThan(0) || rate.greaterThan(1)) {
+                reply.status(400);
+                return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+            }
+            const lineTax = lineTotal.mul(rate).toDecimalPlaces(2);
+            subtotal = subtotal.add(lineTotal);
+            taxAmount = taxAmount.add(lineTax);
             computedLines.push({
                 companyId,
                 locationId,
@@ -446,10 +538,14 @@ export async function purchaseBillsRoutes(fastify) {
                 quantity: qtyDec,
                 unitCost: unitDec,
                 discountAmount: disc,
-                lineTotal,
+                lineTotal, // net subtotal
+                taxRate: rate,
+                taxAmount: lineTax,
             });
         }
-        total = total.toDecimalPlaces(2);
+        subtotal = subtotal.toDecimalPlaces(2);
+        taxAmount = taxAmount.toDecimalPlaces(2);
+        const total = subtotal.add(taxAmount).toDecimalPlaces(2);
         const updated = await prisma.$transaction(async (tx) => {
             await tx.$queryRaw `
         SELECT id FROM PurchaseBill
@@ -475,6 +571,8 @@ export async function purchaseBillsRoutes(fastify) {
                     billDate,
                     dueDate: dueDate ?? null,
                     currency: body.currency ?? null,
+                    subtotal,
+                    taxAmount,
                     total,
                     lines: {
                         deleteMany: {},
@@ -630,14 +728,23 @@ export async function purchaseBillsRoutes(fastify) {
         const lockKey = `lock:purchase-bill:post:${companyId}:${purchaseBillId}`;
         const pre = await prisma.purchaseBill.findFirst({
             where: { id: purchaseBillId, companyId },
-            select: { id: true, locationId: true, lines: { select: { itemId: true } } },
+            select: {
+                id: true,
+                locationId: true,
+                lines: { select: { itemId: true, item: { select: { type: true, trackInventory: true } } } },
+            },
         });
         if (!pre) {
             reply.status(404);
             return { error: 'purchase bill not found' };
         }
-        const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
-        const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        // Only lock stock for tracked inventory items (avoid unnecessary conflicts for services/non-inventory).
+        const trackedItemIds = Array.from(new Set((pre.lines ?? [])
+            .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
+            .map((l) => Number(l.itemId))
+            .filter((n) => Number.isFinite(n) && n > 0)));
+        const stockLocks = trackedItemIds.map((itemId) => `lock:stock:${companyId}:${pre.locationId}:${itemId}`);
+        const { replay, response: result } = await runWithResourceLockRetry(() => withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 // DB-level serialization safety: lock the purchase bill row so concurrent posts
                 // (with different idempotency keys) cannot double-post.
@@ -658,28 +765,33 @@ export async function purchaseBillsRoutes(fastify) {
                 if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
                     throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be posted'), { statusCode: 400 });
                 }
-                // Period-close guard: block posting into closed periods (backdating rule).
-                await assertOpenPeriodOrThrow(tx, {
-                    companyId,
-                    transactionDate: new Date(bill.billDate),
-                    action: 'purchase_bill.post',
-                });
-                const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
-                if (!cfg.inventoryAssetAccountId) {
-                    throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
-                }
+                // OPTIMIZED: Batch period check + inventory config + AP account validation in parallel
                 const apId = bill.company.accountsPayableAccountId;
                 if (!apId) {
                     throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
                 }
-                const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: 'LIABILITY' } });
+                const [periodCheck, cfg, apAcc] = await Promise.all([
+                    assertOpenPeriodOrThrow(tx, {
+                        companyId,
+                        transactionDate: new Date(bill.billDate),
+                        action: 'purchase_bill.post',
+                    }).then(() => true),
+                    ensureInventoryCompanyDefaults(tx, companyId),
+                    tx.account.findFirst({ where: { id: apId, companyId, type: 'LIABILITY' } }),
+                ]);
+                void periodCheck;
+                if (!cfg.inventoryAssetAccountId) {
+                    throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                }
                 if (!apAcc) {
                     throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), {
                         statusCode: 400,
                     });
                 }
                 // Apply stock moves for tracked items, and compute per-account debits.
-                let total = new Prisma.Decimal(0);
+                // lineTotal is stored as net subtotal (tax-exclusive); tax is stored separately.
+                let subtotal = new Prisma.Decimal(0);
+                let taxAmount = new Prisma.Decimal(0);
                 const debitByAccount = new Map();
                 let inventoryRecalcFromDate = null;
                 const linkedReceiptId = Number(bill.purchaseReceiptId ?? 0) || null;
@@ -708,7 +820,9 @@ export async function purchaseBillsRoutes(fastify) {
                         throw Object.assign(new Error(`invalid line[${idx}] quantity/unitCost`), { statusCode: 400 });
                     }
                     const lineTotal = new Prisma.Decimal(l.lineTotal).toDecimalPlaces(2);
-                    total = total.add(lineTotal);
+                    const lineTax = new Prisma.Decimal(l.taxAmount ?? 0).toDecimalPlaces(2);
+                    subtotal = subtotal.add(lineTotal);
+                    taxAmount = taxAmount.add(lineTax);
                     const item = l.item;
                     const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
                     let debitAccountId = l.accountId ?? null;
@@ -772,12 +886,14 @@ export async function purchaseBillsRoutes(fastify) {
                     const prev = debitByAccount.get(debitAccountId) ?? new Prisma.Decimal(0);
                     debitByAccount.set(debitAccountId, prev.add(lineTotal));
                 }
-                total = total.toDecimalPlaces(2);
+                subtotal = subtotal.toDecimalPlaces(2);
+                taxAmount = taxAmount.toDecimalPlaces(2);
                 inventoryLinesTotal = inventoryLinesTotal.toDecimalPlaces(2);
                 landedCostTotal = landedCostTotal.toDecimalPlaces(2);
                 // CRITICAL FIX #3: Rounding validation - ensure recomputed total matches stored total.
                 // This prevents debit != credit if line-level rounding drifted from sum-then-round.
                 const storedTotal = new Prisma.Decimal(bill.total).toDecimalPlaces(2);
+                const total = subtotal.add(taxAmount).toDecimalPlaces(2);
                 if (!total.equals(storedTotal)) {
                     throw Object.assign(new Error(`rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}. Purchase bill may have been corrupted.`), { statusCode: 400, recomputedTotal: total.toString(), storedTotal: storedTotal.toString() });
                 }
@@ -786,6 +902,7 @@ export async function purchaseBillsRoutes(fastify) {
                     debit: amt.toDecimalPlaces(2),
                     credit: new Prisma.Decimal(0),
                 }));
+                const taxReceivableId = await ensureTaxReceivableAccountIfNeeded(tx, companyId, taxAmount);
                 // If linked to a receipt, override debits to clear GRNI + post PPV variance.
                 let finalDebitLines = debitLines;
                 if (linkedReceipt) {
@@ -799,6 +916,12 @@ export async function purchaseBillsRoutes(fastify) {
                     finalDebitLines = [];
                     // Dr GRNI (reduce liability) up to receipt total
                     finalDebitLines.push({ accountId: grniId, debit: receiptTotal, credit: new Prisma.Decimal(0) });
+                    // Dr Tax Receivable (recoverable input tax)
+                    if (taxAmount.greaterThan(0)) {
+                        if (!taxReceivableId)
+                            throw Object.assign(new Error('tax receivable account required when taxAmount > 0'), { statusCode: 400 });
+                        finalDebitLines.push({ accountId: taxReceivableId, debit: taxAmount, credit: new Prisma.Decimal(0) });
+                    }
                     // Capitalize landed cost into inventory (value-only moves) and also debit Inventory in the bill JE.
                     if (landedCostTotal.greaterThan(0)) {
                         // IMPORTANT: these value moves are dated at the receipt date (so they revalue subsequent issues),
@@ -876,12 +999,22 @@ export async function purchaseBillsRoutes(fastify) {
                         }
                     }
                 }
+                else {
+                    // Non-receipt bills: add recoverable input tax as a separate debit line.
+                    if (taxAmount.greaterThan(0)) {
+                        if (!taxReceivableId)
+                            throw Object.assign(new Error('tax receivable account required when taxAmount > 0'), { statusCode: 400 });
+                        finalDebitLines = [...finalDebitLines, { accountId: taxReceivableId, debit: taxAmount, credit: new Prisma.Decimal(0) }];
+                    }
+                }
                 const je = await postJournalEntry(tx, {
                     companyId,
                     date: bill.billDate,
                     description: `Purchase Bill ${bill.billNumber}${bill.vendor ? ` for ${bill.vendor.name}` : ''}`,
                     createdByUserId: request.user?.userId ?? null,
-                    skipAccountValidation: true,
+                    skipAccountValidation: true, // OPTIMIZED: accounts validated above
+                    skipPeriodCheck: true, // OPTIMIZED: already checked above
+                    skipLocationValidation: true, // OPTIMIZED: not using locationId in this JE
                     lines: [
                         ...finalDebitLines,
                         { accountId: apAcc.id, debit: new Prisma.Decimal(0), credit: total },
@@ -976,7 +1109,7 @@ export async function purchaseBillsRoutes(fastify) {
                 };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-        }, redis)));
+        }, redis))));
         // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
         if (!replay && result._jeEventId) {
             const ids = [result._jeEventId];
@@ -1624,7 +1757,9 @@ export async function purchaseBillsRoutes(fastify) {
                         date: paymentDate,
                         description: `Payment for Purchase Bill ${bill.billNumber}`,
                         createdByUserId: request.user?.userId ?? null,
-                        skipAccountValidation: true,
+                        skipAccountValidation: true, // OPTIMIZED: accounts validated above
+                        skipPeriodCheck: true, // OPTIMIZED: already checked above
+                        skipLocationValidation: true, // OPTIMIZED: not using locationId in this JE
                         lines: [
                             { accountId: apAcc.id, debit: amount, credit: new Prisma.Decimal(0) },
                             { accountId: bankAccount.id, debit: new Prisma.Decimal(0), credit: amount },

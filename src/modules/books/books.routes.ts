@@ -333,7 +333,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const currency = normalizeCurrencyOrNull(body.currency ?? null);
     const opening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
 
-    const customer = await prisma.$transaction(async (tx) => {
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+
+    const result = await prisma.$transaction(async (tx) => {
       const created = await tx.customer.create({
         data: {
           companyId,
@@ -345,20 +348,43 @@ export async function booksRoutes(fastify: FastifyInstance) {
         },
       });
 
+      let jeEventId: string | null = null;
       if (opening && !opening.equals(0)) {
-        await postCustomerOpeningBalanceDelta(tx, {
+        const je = await postCustomerOpeningBalanceDelta(tx, {
           companyId,
           customerName: created.name,
           delta: opening,
           userId,
           kind: 'create',
         });
+        if (je?.id) {
+          jeEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: jeEventId,
+              eventType: 'journal.entry.created',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(je.id),
+              type: 'JournalEntryCreated',
+              payload: { journalEntryId: je.id, companyId },
+            },
+          });
+        }
       }
 
-      return created;
+      return { customer: created, jeEventId };
     });
 
-    return customer;
+    if ((result as any)?.jeEventId) {
+      publishEventsFastPath([(result as any).jeEventId]);
+    }
+    return (result as any).customer;
   });
 
   fastify.put('/companies/:companyId/customers/:customerId', async (request, reply) => {
@@ -394,7 +420,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const newOpening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
     const delta = newOpening === null ? new Prisma.Decimal(0) : new Prisma.Decimal(newOpening).sub(oldOpening).toDecimalPlaces(2);
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+
+    const result = await prisma.$transaction(async (tx) => {
       const u = await tx.customer.update({
         where: { id: customerId },
         data: {
@@ -406,20 +435,43 @@ export async function booksRoutes(fastify: FastifyInstance) {
         },
       });
 
+      let jeEventId: string | null = null;
       if (!delta.equals(0)) {
-        await postCustomerOpeningBalanceDelta(tx, {
+        const je = await postCustomerOpeningBalanceDelta(tx, {
           companyId,
           customerName: u.name,
           delta,
           userId,
           kind: 'adjust',
         });
+        if (je?.id) {
+          jeEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: jeEventId,
+              eventType: 'journal.entry.created',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(je.id),
+              type: 'JournalEntryCreated',
+              payload: { journalEntryId: je.id, companyId },
+            },
+          });
+        }
       }
 
-      return u;
+      return { customer: u, jeEventId };
     });
 
-    return updated;
+    if ((result as any)?.jeEventId) {
+      publishEventsFastPath([(result as any).jeEventId]);
+    }
+    return (result as any).customer;
   });
 
   // --- Books: Vendors (for Accounts Payable / Bills) ---
@@ -468,7 +520,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const currency = normalizeCurrencyOrNull(body.currency ?? null);
     const opening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
 
-    return await prisma.$transaction(async (tx) => {
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+
+    const result = await prisma.$transaction(async (tx) => {
       const created = await tx.vendor.create({
         data: {
           companyId,
@@ -480,18 +535,42 @@ export async function booksRoutes(fastify: FastifyInstance) {
         },
       });
 
+      let jeEventId: string | null = null;
       if (opening && !opening.equals(0)) {
-        await postVendorOpeningBalanceDelta(tx, {
+        const je = await postVendorOpeningBalanceDelta(tx, {
           companyId,
           vendorName: created.name,
           delta: opening,
           userId,
           kind: 'create',
         });
+        if (je?.id) {
+          jeEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: jeEventId,
+              eventType: 'journal.entry.created',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(je.id),
+              type: 'JournalEntryCreated',
+              payload: { journalEntryId: je.id, companyId },
+            },
+          });
+        }
       }
 
-      return created;
+      return { vendor: created, jeEventId };
     });
+    if ((result as any)?.jeEventId) {
+      publishEventsFastPath([(result as any).jeEventId]);
+    }
+    return (result as any).vendor;
   });
 
   fastify.put('/companies/:companyId/vendors/:vendorId', async (request, reply) => {
@@ -526,7 +605,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
     const newOpening = body.openingBalance === undefined ? null : toMoneyDecimal(body.openingBalance);
     const delta = newOpening === null ? new Prisma.Decimal(0) : new Prisma.Decimal(newOpening).sub(oldOpening).toDecimalPlaces(2);
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const occurredAt = isoNow();
+    const correlationId = randomUUID();
+
+    const result = await prisma.$transaction(async (tx) => {
       const u = await tx.vendor.update({
         where: { id: vendorId },
         data: {
@@ -538,20 +620,43 @@ export async function booksRoutes(fastify: FastifyInstance) {
         },
       });
 
+      let jeEventId: string | null = null;
       if (!delta.equals(0)) {
-        await postVendorOpeningBalanceDelta(tx, {
+        const je = await postVendorOpeningBalanceDelta(tx, {
           companyId,
           vendorName: u.name,
           delta,
           userId,
           kind: 'adjust',
         });
+        if (je?.id) {
+          jeEventId = randomUUID();
+          await tx.event.create({
+            data: {
+              companyId,
+              eventId: jeEventId,
+              eventType: 'journal.entry.created',
+              schemaVersion: 'v1',
+              occurredAt: new Date(occurredAt),
+              source: 'cashflow-api',
+              partitionKey: String(companyId),
+              correlationId,
+              aggregateType: 'JournalEntry',
+              aggregateId: String(je.id),
+              type: 'JournalEntryCreated',
+              payload: { journalEntryId: je.id, companyId },
+            },
+          });
+        }
       }
 
-      return u;
+      return { vendor: u, jeEventId };
     });
 
-    return updated;
+    if ((result as any)?.jeEventId) {
+      publishEventsFastPath([(result as any).jeEventId]);
+    }
+    return (result as any).vendor;
   });
 
   // --- Books: Items ---
@@ -813,6 +918,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
     });
     const totalCreditNotes = (creditNotes ?? []).reduce((sum, cn: any) => sum + Number(cn.total ?? 0), 0);
 
+    // Credit notes issued FROM this invoice (returns). These block adjusting/voiding unless voided first.
+    const issuedCreditNotesPostedCount = await prisma.creditNote.count({
+      where: { companyId, invoiceId: invoice.id, status: 'POSTED' as any } as any,
+    });
+
     const totalPaid = totalPayments + totalCredits + totalCreditNotes;
 
     const creditsAgg = await prisma.customerAdvance.aggregate({
@@ -947,6 +1057,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
           creditNoteNumber: cn.creditNoteNumber,
         })),
       ],
+      issuedCreditNotesPostedCount,
       creditsAvailable: creditsAvailable.toString(),
       totalPaid: totalPaid,
       remainingBalance,
@@ -1562,6 +1673,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
         quantity: number;
         unitPrice?: number;
         taxRate?: number;
+        discountAmount?: number;
         incomeAccountId?: number;
       }>;
     };
@@ -1686,13 +1798,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
               const qty = toMoneyDecimal(line.quantity);
               const unit = toMoneyDecimal(line.unitPrice ?? Number(item.sellingPrice));
               const lineSubtotal = qty.mul(unit).toDecimalPlaces(2);
+              const discount = toMoneyDecimal((line as any).discountAmount ?? 0).toDecimalPlaces(2);
+              if (discount.lessThan(0) || discount.greaterThan(lineSubtotal)) {
+                throw Object.assign(new Error(`invalid discountAmount for itemId ${line.itemId}: must be between 0 and line subtotal`), {
+                  statusCode: 400,
+                });
+              }
+              const netSubtotal = lineSubtotal.sub(discount).toDecimalPlaces(2);
               const rate = new Prisma.Decimal(Number((line as any).taxRate ?? 0)).toDecimalPlaces(4);
               if (rate.lessThan(0) || rate.greaterThan(1)) {
                 throw Object.assign(new Error(`invalid taxRate for itemId ${line.itemId}: must be between 0 and 1`), { statusCode: 400 });
               }
-              const lineTax = lineSubtotal.mul(rate).toDecimalPlaces(2);
-              const lineTotal = lineSubtotal.add(lineTax).toDecimalPlaces(2);
-              subtotal = subtotal.add(lineSubtotal);
+              const lineTax = netSubtotal.mul(rate).toDecimalPlaces(2);
+              const lineTotal = netSubtotal.add(lineTax).toDecimalPlaces(2);
+              subtotal = subtotal.add(netSubtotal);
               taxAmount = taxAmount.add(lineTax);
               total = total.add(lineTotal);
 
@@ -1702,7 +1821,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 description: line.description ?? null,
                 quantity: qty,
                 unitPrice: unit,
-                lineTotal: lineSubtotal, // keep backwards compat
+                discountAmount: discount,
+                lineTotal: netSubtotal, // keep backwards compat (net subtotal)
                 taxRate: rate,
                 taxAmount: lineTax,
                 incomeAccountId: Number((line as any).incomeAccountId ?? 0) || salesIncomeAccountId,

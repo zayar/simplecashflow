@@ -19,6 +19,7 @@ import {
   Percent,
   CreditCard,
   Coins,
+  Sparkles,
 } from "lucide-react"
 
 import { useAuth } from "@/contexts/auth-context"
@@ -35,7 +36,13 @@ type NavItem = {
 
 const navGroups: { label: string; items: NavItem[] }[] = [
   // Home
-  { label: "Home", items: [{ href: "/dashboard", label: "Dashboard", icon: LayoutDashboard }] },
+  {
+    label: "Home",
+    items: [
+      { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+      { href: "/cashflow-copilot", label: "Cashflow Copilot", icon: Sparkles },
+    ],
+  },
 
   // Top-level items
   { label: "", items: [{ href: "/items", label: "Items", icon: Package }] },

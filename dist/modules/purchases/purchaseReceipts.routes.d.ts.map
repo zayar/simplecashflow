@@ -1,1 +1,1 @@
-{"version":3,"file":"purchaseReceipts.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/purchases/purchaseReceipts.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AAuB/C,wBAAsB,sBAAsB,CAAC,OAAO,EAAE,eAAe,iBAq2BpE"}
+{"version":3,"file":"purchaseReceipts.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/purchases/purchaseReceipts.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AAwB/C,wBAAsB,sBAAsB,CAAC,OAAO,EAAE,eAAe,iBAg4BpE"}

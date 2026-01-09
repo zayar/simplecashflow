@@ -137,7 +137,7 @@ type PresetKey =
   | "customer_advance"
   | "loan_interest"
   | "loan_principal"
-  | "supplier_advance"
+  | "vendor_advance"
   | "owner_drawings"
 
 function toNumber(v: string): number {
@@ -315,7 +315,7 @@ export function AddTransaction({
       customer_advance: "other_in",
       loan_interest: "other_out",
       loan_principal: "other_out",
-      supplier_advance: "other_out",
+      vendor_advance: "other_out",
       owner_drawings: "other_out",
     }
     const f = presetToFlow[p]
@@ -364,7 +364,7 @@ export function AddTransaction({
     if (flow === "expense") {
       fetchApi(`/companies/${companyId}/vendors`).then(setVendors).catch(console.error)
     }
-    if (flow === "other_out" && preset === "supplier_advance") {
+    if (flow === "other_out" && preset === "vendor_advance") {
       fetchApi(`/companies/${companyId}/vendors`).then(setVendors).catch(console.error)
     }
     if (flow === "other_in" && preset === "customer_advance") {
@@ -487,7 +487,7 @@ export function AddTransaction({
           return pick((a) => a.type === "EXPENSE" && byContains(a, ["interest"])) ?? null
         case "loan_principal":
           return pick((a) => a.type === "LIABILITY" && byContains(a, ["loan"])) ?? null
-        case "supplier_advance":
+        case "vendor_advance":
           return (
             pick((a) => a.type === "ASSET" && (byContains(a, ["advance"]) || byContains(a, ["prepayment"]) || byContains(a, ["prepaid"]))) ??
             null
@@ -532,8 +532,8 @@ export function AddTransaction({
             ? "Loan interest"
             : preset === "loan_principal"
               ? "Loan repayment (principal)"
-              : preset === "supplier_advance"
-                ? "Supplier advance"
+              : preset === "vendor_advance"
+                ? "Vendor advance"
                 : preset === "owner_drawings"
                   ? "Owner drawings"
                   : "Money out"
@@ -798,25 +798,47 @@ export function AddTransaction({
       if (flow === "other_out") {
         const amount = toNumber(otherOut.amount)
         if (!amount || amount <= 0) throw new Error("Amount must be > 0")
-        if (!otherOut.accountId) throw new Error("Please select an account")
-        const accountId = Number(otherOut.accountId)
-        if (accountId === bankAccountCoaId) throw new Error("Account must be different from the bank account")
-        if (bankCoaIdSet.has(accountId)) throw new Error("Use Transfer to Another Account for bank-to-bank moves")
 
         let description = String(otherOut.description ?? "")
         if (otherOut.reference) description = `Ref: ${otherOut.reference} - ${description}`
-        if (!description.trim()) description = preset === "supplier_advance" ? "Supplier advance" : "Money out"
+        if (!description.trim()) description = preset === "vendor_advance" ? "Vendor advance" : "Money out"
 
-        if (preset === "supplier_advance") {
+        // Vendor Advance: use the dedicated endpoint so it always posts to the canonical account
+        // and can be applied to purchase bills later.
+        if (preset === "vendor_advance") {
           if (!warehouseId) throw new Error("Please select a location")
           if (!supplierAdvanceVendorId) throw new Error("Please select a supplier")
           const supplierName = String(selectedSupplier?.name ?? "").trim()
           if (supplierName) {
             // Make the supplier visible in transaction list and journal entry description.
-            description = `Supplier advance • ${supplierName} — ${description}`.trim()
+            description = `Vendor advance • ${supplierName} — ${description}`.trim()
           }
+          description = decorateDescription(description)
+
+          await fetchApi(`/companies/${companyId}/vendor-advances`, {
+            method: "POST",
+            body: JSON.stringify({
+              vendorId: Number(supplierAdvanceVendorId),
+              locationId: whId || undefined,
+              advanceDate: otherOut.date,
+              amount,
+              bankAccountId: bankAccountCoaId,
+              receivedVia: bankKind,
+              reference: otherOut.reference || undefined,
+              description: otherOut.description || undefined,
+            }),
+          })
+          // Skip the generic journal entry below.
+          close()
+          onDone?.()
+          return
         }
         description = decorateDescription(description)
+
+        if (!otherOut.accountId) throw new Error("Please select an account")
+        const accountId = Number(otherOut.accountId)
+        if (accountId === bankAccountCoaId) throw new Error("Account must be different from the bank account")
+        if (bankCoaIdSet.has(accountId)) throw new Error("Use Transfer to Another Account for bank-to-bank moves")
 
         await fetchApi(`/companies/${companyId}/journal-entries`, {
           method: "POST",
@@ -860,7 +882,7 @@ export function AddTransaction({
       case "transfer_in":
         return "Transfer From Another Account (Money In)"
       case "other_out":
-        return preset === "supplier_advance" ? "Supplier Advance (Money Out)" : "Other (Money Out)"
+        return preset === "vendor_advance" ? "Vendor Advance (Money Out)" : "Other (Money Out)"
       default:
         return "Add Transaction"
     }
@@ -887,8 +909,8 @@ export function AddTransaction({
       case "transfer_in":
         return `Move money into ${bankAccountLabel} from another deposit account.`
       case "other_out":
-        return preset === "supplier_advance"
-          ? `Record a supplier advance payment from ${bankAccountLabel}. Choose the supplier and the category (advance/prepayment) account.`
+        return preset === "vendor_advance"
+          ? `Record a vendor advance payment from ${bankAccountLabel}. Choose the supplier.`
           : `Record a withdrawal from ${bankAccountLabel} and choose any category account (e.g., loan payment, advance).`
       default:
         return ""
@@ -918,7 +940,7 @@ export function AddTransaction({
               <DropdownMenuLabel className="px-2 py-1 text-xs text-muted-foreground">Common</DropdownMenuLabel>
               <DropdownMenuItem onSelect={() => openPreset("loan_interest")}>Loan Interest</DropdownMenuItem>
               <DropdownMenuItem onSelect={() => openPreset("loan_principal")}>Loan Repayment (Principal)</DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => openPreset("supplier_advance")}>Supplier Advance</DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openPreset("vendor_advance")}>Vendor Advance</DropdownMenuItem>
               <DropdownMenuItem onSelect={() => openPreset("owner_drawings")}>Owner Drawings</DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={() => openFlow("other_out")}>Other…</DropdownMenuItem>
@@ -965,11 +987,11 @@ export function AddTransaction({
           <div className="grid gap-2 md:max-w-[420px]">
             <Label>
               Location
-              {preset === "supplier_advance" || preset === "customer_advance" ? "*" : ""}
+              {preset === "vendor_advance" || preset === "customer_advance" ? "*" : ""}
             </Label>
             <SelectNative value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)}>
               <option value="">
-                {preset === "supplier_advance" || preset === "customer_advance" ? "Select branch" : "Select branch (optional)"}
+                {preset === "vendor_advance" || preset === "customer_advance" ? "Select branch" : "Select branch (optional)"}
               </option>
               {(Array.isArray(warehouses) ? warehouses : []).map((w: any) => (
                 <option key={w.id} value={w.id}>
@@ -1108,17 +1130,26 @@ export function AddTransaction({
                   <Label>Date*</Label>
                   <Input type="date" value={otherOut.date} onChange={(e) => setOtherOut({ ...otherOut, date: e.target.value })} />
                 </div>
-                <div className="grid gap-2">
-                  <Label>Account*</Label>
-                  {/* NOTE: AccountPicker uses a portal to document.body which Radix Dialog blocks for pointer events.
-                      Use SelectNative here (in-dialog) so selection works reliably. */}
-                  <InlineAccountPicker
-                    accounts={selectableCoaAccounts}
-                    value={otherOut.accountId}
-                    onChange={(nextId) => setOtherOut((prev) => ({ ...prev, accountId: nextId }))}
-                    disabled={loadingAccounts}
-                  />
-                </div>
+                {preset === "vendor_advance" ? (
+                  <div className="grid gap-2">
+                    <Label>Account</Label>
+                    <div className="rounded-md border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                      This will post to the company’s <b>Vendor Advance</b> account automatically.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid gap-2">
+                    <Label>Account*</Label>
+                    {/* NOTE: AccountPicker uses a portal to document.body which Radix Dialog blocks for pointer events.
+                        Use SelectNative here (in-dialog) so selection works reliably. */}
+                    <InlineAccountPicker
+                      accounts={selectableCoaAccounts}
+                      value={otherOut.accountId}
+                      onChange={(nextId) => setOtherOut((prev) => ({ ...prev, accountId: nextId }))}
+                      disabled={loadingAccounts}
+                    />
+                  </div>
+                )}
                 <div className="grid gap-2">
                   <Label>Amount*</Label>
                   <div className="flex gap-2">
@@ -1138,7 +1169,7 @@ export function AddTransaction({
                 </div>
               </div>
               <div className="space-y-4">
-                {preset === "supplier_advance" ? (
+                {preset === "vendor_advance" ? (
                   <div className="grid gap-2">
                     <Label>Supplier*</Label>
                     <SelectNative value={supplierAdvanceVendorId} onChange={(e) => setSupplierAdvanceVendorId(e.target.value)}>

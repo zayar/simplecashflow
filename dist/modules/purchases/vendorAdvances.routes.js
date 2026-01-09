@@ -1,4 +1,4 @@
-import { AccountReportGroup, AccountType, BankingAccountKind, Prisma } from '@prisma/client';
+import { AccountType, BankingAccountKind, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { prisma } from '../../infrastructure/db.js';
 import { getRedis } from '../../infrastructure/redis.js';
@@ -12,36 +12,7 @@ import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 import { ensureInventoryCompanyDefaults } from '../inventory/stock.service.js';
-import { pickFirstUnusedNumericCode } from '../../utils/tax.js';
-async function ensureVendorPrepaymentAccount(tx, companyId) {
-    // Prefer existing by name (tenant-safe)
-    const byName = await tx.account.findFirst({
-        where: { companyId, type: 'ASSET', name: 'Vendor Prepayments' },
-        select: { id: true },
-    });
-    if (byName?.id)
-        return byName.id;
-    // Choose a safe unused ASSET code in 1400..1499 (commonly "prepaids").
-    const assetCodes = await tx.account.findMany({
-        where: { companyId, type: 'ASSET' },
-        select: { code: true },
-    });
-    const used = new Set(assetCodes.map((a) => String(a.code ?? '').trim()).filter(Boolean));
-    const desired = !used.has('1400') ? '1400' : pickFirstUnusedNumericCode(used, 1401, 1499);
-    const created = await tx.account.create({
-        data: {
-            companyId,
-            code: desired,
-            name: 'Vendor Prepayments',
-            type: 'ASSET',
-            normalBalance: 'DEBIT',
-            reportGroup: AccountReportGroup.OTHER_CURRENT_ASSET,
-            cashflowActivity: 'OPERATING',
-        },
-        select: { id: true },
-    });
-    return created.id;
-}
+import { ensureVendorAdvanceAccount } from './vendorAdvanceAccount.js';
 async function ensureAccountsPayableAccount(tx, companyId) {
     // Prefer company default if set
     const company = await tx.company.findFirst({
@@ -170,7 +141,7 @@ export async function vendorAdvancesRoutes(fastify) {
                     if (bankAcc.type !== AccountType.ASSET) {
                         throw Object.assign(new Error('bankAccountId must be an ASSET account'), { statusCode: 400 });
                     }
-                    const prepaymentAccountId = await ensureVendorPrepaymentAccount(tx, companyId);
+                    const prepaymentAccountId = await ensureVendorAdvanceAccount(tx, companyId);
                     const receivedVia = body.receivedVia ?? null;
                     const reference = body.reference ? String(body.reference).trim() : null;
                     const descriptionRaw = body.description ? String(body.description).trim() : '';
@@ -259,7 +230,7 @@ export async function vendorAdvancesRoutes(fastify) {
             throw err;
         }
     });
-    // Apply a vendor advance to a purchase bill (posts a JE: Dr AP, Cr Vendor Prepayments)
+    // Apply a vendor advance to a purchase bill (posts a JE: Dr AP, Cr Vendor Advance)
     // POST /companies/:companyId/purchase-bills/:purchaseBillId/apply-vendor-advance
     fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/apply-vendor-advance', async (request, reply) => {
         const companyId = requireCompanyIdParam(request, reply);

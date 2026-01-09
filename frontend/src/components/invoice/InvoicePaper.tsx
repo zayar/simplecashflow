@@ -321,58 +321,61 @@ export function InvoicePaper({
         </div>
 
         <div className="sm:justify-self-end sm:text-right">
-          <div className="ml-auto w-full max-w-sm space-y-2 text-sm">
-            <div className="flex items-center justify-between">
+          <div className="ml-auto w-full max-w-sm rounded-lg bg-slate-50 px-4 py-4 text-sm">
+            <div className="grid grid-cols-[1fr_auto] gap-x-10 gap-y-2.5">
               <span className="text-muted-foreground">Sub Total</span>
               <span className="font-medium tabular-nums">
                 {formatMoneyWithCurrency(toDisp(grossSubtotal), dispCur ?? undefined)}
               </span>
-            </div>
-            <div className="flex items-center justify-between">
+
               <span className="text-muted-foreground">Discount</span>
               <span className="font-medium tabular-nums">
                 {formatMoneyWithCurrency(toDisp(discountTotal), dispCur ?? undefined)}
               </span>
-            </div>
-            <div className="flex items-center justify-between">
+
               <span className="text-muted-foreground">Tax</span>
               <span className="font-medium tabular-nums">
                 {formatMoneyWithCurrency(toDisp(taxAmount), dispCur ?? undefined)}
               </span>
-            </div>
-            <div className="flex items-center justify-between">
+
+              <div className="col-span-2 my-1 border-t" />
+
               <span className="text-muted-foreground">Total</span>
               <span className="font-semibold tabular-nums">
                 {formatMoneyWithCurrency(toDisp((invoice as any).total), dispCur ?? undefined)}
               </span>
-            </div>
-            {typeof paymentsTotal === "number" && paymentsTotal > 0 ? (
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Payments Made</span>
-                <span className="font-medium tabular-nums">
-                  {formatMoneyWithCurrency(toDisp(paymentsTotal), dispCur ?? undefined)}
-                </span>
-              </div>
-            ) : null}
-            {typeof creditsTotal === "number" && creditsTotal > 0 ? (
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Credits Applied</span>
-                <span className="font-medium tabular-nums">
-                  {formatMoneyWithCurrency(toDisp(creditsTotal), dispCur ?? undefined)}
-                </span>
-              </div>
-            ) : null}
-            {!(typeof paymentsTotal === "number" && paymentsTotal > 0) && !(typeof creditsTotal === "number" && creditsTotal > 0) ? (
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">{labelSettled}</span>
-                <span className="font-medium tabular-nums">
-                  {formatMoneyWithCurrency(toDisp((invoice as any).totalPaid), dispCur ?? undefined)}
-                </span>
-              </div>
-            ) : null}
-            <div className="mt-2 flex items-center justify-between border-t pt-2">
-              <span className="font-semibold">Balance Due</span>
-              <span className="font-semibold tabular-nums">
+
+              {typeof paymentsTotal === "number" && paymentsTotal > 0 ? (
+                <>
+                  <span className="text-muted-foreground">Payments Made</span>
+                  <span className="font-medium tabular-nums">
+                    {formatMoneyWithCurrency(toDisp(paymentsTotal), dispCur ?? undefined)}
+                  </span>
+                </>
+              ) : null}
+
+              {typeof creditsTotal === "number" && creditsTotal > 0 ? (
+                <>
+                  <span className="text-muted-foreground">Credits Applied</span>
+                  <span className="font-medium tabular-nums">
+                    {formatMoneyWithCurrency(toDisp(creditsTotal), dispCur ?? undefined)}
+                  </span>
+                </>
+              ) : null}
+
+              {!(typeof paymentsTotal === "number" && paymentsTotal > 0) && !(typeof creditsTotal === "number" && creditsTotal > 0) ? (
+                <>
+                  <span className="text-muted-foreground">{labelSettled}</span>
+                  <span className="font-medium tabular-nums">
+                    {formatMoneyWithCurrency(toDisp((invoice as any).totalPaid), dispCur ?? undefined)}
+                  </span>
+                </>
+              ) : null}
+
+              <div className="col-span-2 mt-1 border-t" />
+
+              <span className="font-semibold text-slate-900">Balance Due</span>
+              <span className="font-semibold tabular-nums text-slate-900">
                 {formatMoneyWithCurrency(toDisp((invoice as any).remainingBalance), dispCur ?? undefined)}
               </span>
             </div>

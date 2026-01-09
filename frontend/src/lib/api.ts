@@ -501,6 +501,8 @@ export interface VendorCreditLineInput {
   itemId: number;
   quantity: number;
   unitCost: number;
+  discountAmount?: number;
+  taxRate?: number; // decimal (e.g., 0.07 for 7%)
   description?: string;
   accountId?: number;
 }
@@ -855,6 +857,142 @@ export interface CashflowStatement {
 
 export async function getCashflowStatement(companyId: number, from: string, to: string): Promise<CashflowStatement> {
   return fetchApi(`/companies/${companyId}/reports/cashflow?from=${from}&to=${to}`);
+}
+
+// --- Cashflow Copilot (forecast) ---
+export type CashflowCopilotScenario = 'base' | 'conservative' | 'optimistic';
+
+export type CashflowCopilotDriver =
+  | { kind: 'invoice'; id: number; label: string; expectedDate: string; amount: string }
+  | { kind: 'purchase_bill' | 'expense'; id: number; label: string; expectedDate: string; amount: string }
+  | { kind: 'recurring'; id: number; label: string; expectedDate: string; amount: string };
+
+export type CashflowCopilotForecast = {
+  asOfDate: string;
+  weeks: number;
+  scenario: CashflowCopilotScenario;
+  currency: string | null;
+  warnings: string[];
+  startingCash: string;
+  minCashBuffer: string;
+  lowestCash: { weekStart: string; endingCash: string } | null;
+  series: Array<{
+    weekStart: string;
+    cashIn: string;
+    cashOut: string;
+    net: string;
+    endingCash: string;
+  }>;
+  topInflows: CashflowCopilotDriver[];
+  topOutflows: CashflowCopilotDriver[];
+  alerts: Array<{ severity: 'high' | 'medium' | 'low'; code: string; message: string; weekStart?: string }>;
+};
+
+export type CashflowCopilotSettings = {
+  companyId: number;
+  defaultArDelayDays: number;
+  defaultApDelayDays: number;
+  minCashBuffer: string;
+};
+
+export type CashflowRecurringItem = {
+  id: number;
+  companyId: number;
+  direction: 'INFLOW' | 'OUTFLOW';
+  name: string;
+  amount: string;
+  currency: string | null;
+  startDate: string;
+  endDate: string | null;
+  frequency: 'WEEKLY' | 'MONTHLY';
+  interval: number;
+  isActive: boolean;
+};
+
+export async function getCashflowCopilotForecast(
+  companyId: number,
+  opts?: { weeks?: number; scenario?: CashflowCopilotScenario; asOfDate?: string }
+): Promise<CashflowCopilotForecast> {
+  const qs = new URLSearchParams();
+  if (opts?.weeks) qs.set('weeks', String(opts.weeks));
+  if (opts?.scenario) qs.set('scenario', String(opts.scenario));
+  if (opts?.asOfDate) qs.set('asOfDate', String(opts.asOfDate));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return fetchApi(`/companies/${companyId}/cashflow/forecast${suffix}`);
+}
+
+export async function getCashflowCopilotSettings(companyId: number): Promise<CashflowCopilotSettings> {
+  return fetchApi(`/companies/${companyId}/cashflow/settings`);
+}
+
+export async function updateCashflowCopilotSettings(
+  companyId: number,
+  data: { defaultArDelayDays?: number; defaultApDelayDays?: number; minCashBuffer?: number }
+): Promise<CashflowCopilotSettings> {
+  return fetchApi(`/companies/${companyId}/cashflow/settings`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function listCashflowRecurringItems(companyId: number): Promise<CashflowRecurringItem[]> {
+  return fetchApi(`/companies/${companyId}/cashflow/recurring-items`);
+}
+
+export async function createCashflowRecurringItem(companyId: number, data: {
+  direction: 'INFLOW' | 'OUTFLOW';
+  name: string;
+  amount: number;
+  currency?: string | null;
+  startDate: string;
+  endDate?: string | null;
+  frequency: 'WEEKLY' | 'MONTHLY';
+  interval?: number;
+  isActive?: boolean;
+}): Promise<CashflowRecurringItem> {
+  return fetchApi(`/companies/${companyId}/cashflow/recurring-items`, { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function updateCashflowRecurringItem(companyId: number, id: number, data: Partial<{
+  direction: 'INFLOW' | 'OUTFLOW';
+  name: string;
+  amount: number;
+  currency: string | null;
+  startDate: string;
+  endDate: string | null;
+  frequency: 'WEEKLY' | 'MONTHLY';
+  interval: number;
+  isActive: boolean;
+}>): Promise<CashflowRecurringItem> {
+  return fetchApi(`/companies/${companyId}/cashflow/recurring-items/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteCashflowRecurringItem(companyId: number, id: number): Promise<{ ok: true }> {
+  return fetchApi(`/companies/${companyId}/cashflow/recurring-items/${id}`, { method: 'DELETE' });
+}
+
+export type CashflowCopilotInsights = {
+  asOfDate: string;
+  scenario: CashflowCopilotScenario;
+  provider: string;
+  model: string;
+  cached: boolean;
+  traceId: string;
+  insights: {
+    headline: string;
+    summary: string;
+    key_risks: Array<{ title: string; severity: 'high' | 'medium' | 'low'; evidence: string }>;
+    recommended_actions: Array<{ title: string; why: string; link?: { label: string; href: string } }>;
+    assumptions: string[];
+    confidence_notes: string[];
+  };
+};
+
+export async function getCashflowCopilotInsights(
+  companyId: number,
+  opts?: { scenario?: CashflowCopilotScenario }
+): Promise<CashflowCopilotInsights> {
+  const qs = new URLSearchParams();
+  if (opts?.scenario) qs.set('scenario', String(opts.scenario));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return fetchApi(`/companies/${companyId}/cashflow/insights${suffix}`);
 }
 
 // --- Period Close ---

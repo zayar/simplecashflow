@@ -29,8 +29,14 @@ export async function purchaseReceiptsRoutes(fastify: FastifyInstance) {
   // List
   fastify.get('/companies/:companyId/purchase-receipts', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
+    const purchaseOrderIdRaw = (request.query as any)?.purchaseOrderId;
+    const purchaseOrderId = purchaseOrderIdRaw !== undefined && purchaseOrderIdRaw !== null && purchaseOrderIdRaw !== '' ? Number(purchaseOrderIdRaw) : null;
+    if (purchaseOrderId !== null && (!Number.isInteger(purchaseOrderId) || purchaseOrderId <= 0)) {
+      reply.status(400);
+      return { error: 'invalid purchaseOrderId' };
+    }
     const rows = await prisma.purchaseReceipt.findMany({
-      where: { companyId },
+      where: { companyId, ...(purchaseOrderId ? { purchaseOrderId } : {}) } as any,
       orderBy: [{ receiptDate: 'desc' }, { id: 'desc' }],
       include: { vendor: true, location: true, purchaseOrder: true, billedBy: true },
     });

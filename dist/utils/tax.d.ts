@@ -30,6 +30,18 @@ export declare function pickFirstUnusedNumericCode(usedCodes: Set<string>, start
  * - Otherwise create one, using code 2100 if free; else pick the next free numeric code in 2101..2999
  */
 export declare function ensureTaxPayableAccount(tx: any, companyId: number): Promise<number>;
+/**
+ * Ensures the company has a dedicated Tax Receivable account (ASSET) and returns its id.
+ *
+ * Used for purchase-side taxes (input tax / recoverable VAT). This keeps purchase taxes
+ * off P&L and tracks them as an asset until settled/claimed.
+ *
+ * Strategy:
+ * - Prefer an existing ASSET account named "Tax Receivable"
+ * - Otherwise create one, using code 1210 if free; else pick the next free numeric code in 1211..1999
+ */
+export declare function ensureTaxReceivableAccount(tx: any, companyId: number): Promise<number>;
+export declare function ensureTaxReceivableAccountIfNeeded(tx: any, companyId: number, taxAmount: Prisma.Decimal | number | string | null | undefined): Promise<number | null>;
 export declare function ensureTaxPayableAccountIfNeeded(tx: any, companyId: number, taxAmount: Prisma.Decimal | number | string | null | undefined): Promise<number | null>;
 /**
  * Calculate tax for a single line item.

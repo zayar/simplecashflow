@@ -8,6 +8,7 @@ import { runWithTenantAsync } from './infrastructure/tenantContext.js';
 import { normalizeToDay } from './utils/date.js';
 import { Prisma } from '@prisma/client';
 import { rebuildProjectionsFromLedger, runInventoryRecalcForward } from './modules/inventory/recalc.service.js';
+import { refreshCashflowSnapshotsForCompany } from './modules/cashflow/refresh.service.js';
 
 const fastify = Fastify({ logger: true });
 const redis = getRedis();
@@ -417,11 +418,60 @@ async function handleJournalEntryCreated(event: DomainEventEnvelope) {
             },
           });
         }
+
+        // 6) Background refresh Cashflow Copilot cached forecast (13-week, all scenarios).
+        // This makes the dashboard fast and keeps forecasts up-to-date after posting transactions.
+        await refreshCashflowSnapshotsForCompany(tx as any, { companyId });
       },
       redis
     );
   });
 }
+
+// ---------------------------------------------------------------------------
+// Nightly job: refresh cached cashflow forecasts for all companies.
+// Trigger this via Cloud Scheduler hitting GET /jobs/cashflow/nightly with OIDC or token.
+// ---------------------------------------------------------------------------
+function requireJobToken(request: any, reply: any): boolean {
+  const token = (process.env.CASHFLOW_JOB_TOKEN ?? '').trim();
+  if (!token) {
+    reply.status(500).send({ error: 'CASHFLOW_JOB_TOKEN is not configured' });
+    return false;
+  }
+  const provided = String(request.headers['x-job-token'] ?? '').trim();
+  if (!provided || provided !== token) {
+    reply.status(401).send({ error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+fastify.get('/jobs/cashflow/nightly', async (request, reply) => {
+  if (!requireJobToken(request, reply)) return;
+
+  // Refresh in batches to avoid long locks.
+  const companies = await prisma.company.findMany({ select: { id: true }, orderBy: { id: 'asc' } });
+
+  let ok = 0;
+  let fail = 0;
+  for (const c of companies) {
+    const companyId = Number(c.id);
+    if (!Number.isFinite(companyId) || companyId <= 0) continue;
+    try {
+      await runWithTenantAsync(companyId, async () => {
+        await prisma.$transaction(async (tx) => {
+          await refreshCashflowSnapshotsForCompany(tx as any, { companyId });
+        });
+      });
+      ok += 1;
+    } catch (e: any) {
+      fail += 1;
+      fastify.log.error({ companyId, err: e?.message ?? String(e) }, 'Cashflow nightly refresh failed');
+    }
+  }
+
+  return { status: 'ok', companies: companies.length, refreshed: ok, failed: fail };
+});
 
 const start = async () => {
   try {

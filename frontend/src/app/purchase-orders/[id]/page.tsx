@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, PackagePlus, CheckCircle2, Ban } from 'lucide-react';
+import { ArrowLeft, PackagePlus, CheckCircle2, Ban, FileText } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from '@/lib/api';
@@ -39,6 +39,8 @@ export default function PurchaseOrderDetailPage() {
 
   const [po, setPo] = useState<any | null>(null);
   const [summary, setSummary] = useState<any | null>(null);
+  const [linkedReceipts, setLinkedReceipts] = useState<any[]>([]);
+  const [linkedBills, setLinkedBills] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [receiptDate, setReceiptDate] = useState('');
@@ -55,6 +57,10 @@ export default function PurchaseOrderDetailPage() {
       setPo(data);
       const s = await fetchApi(`/companies/${user.companyId}/purchase-orders/${id}/receiving/summary`).catch(() => null);
       setSummary(s);
+      const receipts = await fetchApi(`/companies/${user.companyId}/purchase-receipts?purchaseOrderId=${id}`).catch(() => []);
+      setLinkedReceipts(Array.isArray(receipts) ? receipts : []);
+      const bills = await fetchApi(`/companies/${user.companyId}/purchase-bills?purchaseOrderId=${id}`).catch(() => []);
+      setLinkedBills(Array.isArray(bills) ? bills : []);
     } finally {
       setLoading(false);
     }
@@ -135,6 +141,46 @@ export default function PurchaseOrderDetailPage() {
       else await load();
     } catch (err: any) {
       alert(err?.message ?? 'Failed to create receipt');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function receiveAndBill() {
+    if (!user?.companyId) return;
+    if (!confirm('Receive remaining quantities now and create a linked draft bill?')) return;
+    setSaving(true);
+    try {
+      const res = await fetchApi(`/companies/${user.companyId}/purchase-orders/${id}/receive-and-bill`, {
+        method: 'POST',
+        body: JSON.stringify({ receiptDate: receiptDate || undefined, billDate: receiptDate || undefined }),
+      });
+      const billId = Number((res as any)?.purchaseBillId);
+      const receiptId = Number((res as any)?.purchaseReceiptId);
+      if (billId) router.push(`/purchase-bills/${billId}`);
+      else if (receiptId) router.push(`/purchase-receipts/${receiptId}`);
+      else await load();
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to receive & bill');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function convertToBill() {
+    if (!user?.companyId) return;
+    if (!confirm('Convert this purchase order into a draft bill? (For services / non-inventory lines)')) return;
+    setSaving(true);
+    try {
+      const bill = await fetchApi(`/companies/${user.companyId}/purchase-orders/${id}/convert-to-bill`, {
+        method: 'POST',
+        body: JSON.stringify({ billDate: receiptDate || undefined }),
+      });
+      const billId = Number((bill as any)?.id);
+      if (billId) router.push(`/purchase-bills/${billId}`);
+      else await load();
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to convert to bill');
     } finally {
       setSaving(false);
     }
@@ -291,10 +337,29 @@ export default function PurchaseOrderDetailPage() {
               <Label className="text-xs text-muted-foreground">Receipt date</Label>
               <Input type="date" value={receiptDate} onChange={(e) => setReceiptDate(e.target.value)} className="h-9" />
             </div>
-            <Button className="gap-2" onClick={createReceipt} disabled={saving || !summary || remainingTotalQty <= 0}>
-              <PackagePlus className="h-4 w-4" />
-              Create Receipt
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                className="gap-2"
+                onClick={createReceipt}
+                disabled={saving || !summary || remainingTotalQty <= 0}
+              >
+                <PackagePlus className="h-4 w-4" />
+                Create Receipt
+              </Button>
+              <Button
+                className="gap-2"
+                onClick={receiveAndBill}
+                disabled={saving || !summary || remainingTotalQty <= 0}
+              >
+                <PackagePlus className="h-4 w-4" />
+                Receive &amp; Bill
+              </Button>
+              <Button variant="outline" className="gap-2" onClick={convertToBill} disabled={saving}>
+                <FileText className="h-4 w-4" />
+                Convert to Bill
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
@@ -332,6 +397,59 @@ export default function PurchaseOrderDetailPage() {
               )}
             </TableBody>
           </Table>
+        </CardContent>
+      </Card>
+
+      <Card className="shadow-sm">
+        <CardHeader>
+          <CardTitle className="text-lg">Linked Documents</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Purchase Receipts</div>
+            {linkedReceipts.length ? (
+              <div className="space-y-2">
+                {linkedReceipts.map((r: any) => (
+                  <div key={r.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm">
+                    <div className="flex items-center gap-2">
+                      <Link className="font-medium underline-offset-4 hover:underline" href={`/purchase-receipts/${r.id}`}>
+                        {r.receiptNumber ?? `Receipt #${r.id}`}
+                      </Link>
+                      <span className="text-muted-foreground">{r.status}</span>
+                    </div>
+                    <div className="text-muted-foreground">
+                      {r.receiptDate ? formatDateInTimeZone(r.receiptDate, tz) : '—'} • {Number(r.total ?? 0).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm text-muted-foreground">No receipts yet.</div>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Purchase Bills</div>
+            {linkedBills.length ? (
+              <div className="space-y-2">
+                {linkedBills.map((b: any) => (
+                  <div key={b.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm">
+                    <div className="flex items-center gap-2">
+                      <Link className="font-medium underline-offset-4 hover:underline" href={`/purchase-bills/${b.id}`}>
+                        {b.billNumber ?? `Bill #${b.id}`}
+                      </Link>
+                      <span className="text-muted-foreground">{b.status}</span>
+                    </div>
+                    <div className="text-muted-foreground">
+                      {b.billDate ? formatDateInTimeZone(b.billDate, tz) : '—'} • {Number(b.total ?? 0).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm text-muted-foreground">No bills yet.</div>
+            )}
+          </div>
         </CardContent>
       </Card>
     </div>

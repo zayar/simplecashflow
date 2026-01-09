@@ -82,6 +82,9 @@ model Company {
   locations                     Location[]
   inventoryRecalcState          InventoryRecalcState?
   journalEntryInventoryValuations JournalEntryInventoryValuation[]
+  cashflowSettings              CashflowSettings?
+  cashflowRecurringItems        CashflowRecurringItem[]
+  cashflowForecastSnapshots     CashflowForecastSnapshot[]
 
   @@index([accountsPayableAccountId], map: "Company_accountsPayableAccountId_fkey")
   @@index([accountsReceivableAccountId], map: "Company_accountsReceivableAccountId_fkey")
@@ -670,12 +673,15 @@ model PurchaseBill {
   id                           Int                        @id @default(autoincrement())
   companyId                    Int
   vendorId                     Int?
+  purchaseOrderId              Int?
   locationId                   Int                        @map("warehouseId")
   billNumber                   String
   status                       PurchaseBillStatus
   billDate                     DateTime
   dueDate                      DateTime?
   currency                     String?
+  subtotal                     Decimal                    @default(0.00) @db.Decimal(18, 2)
+  taxAmount                    Decimal                    @default(0.00) @db.Decimal(18, 2)
   total                        Decimal                    @db.Decimal(18, 2)
   amountPaid                   Decimal                    @default(0.00) @db.Decimal(18, 2)
   journalEntryId               Int?                       @unique
@@ -693,6 +699,7 @@ model PurchaseBill {
   lastAdjustmentJournalEntry   JournalEntry?              @relation("PurchaseBill_LastAdjustmentJournalEntry", fields: [lastAdjustmentJournalEntryId], references: [id])
   updatedByUser                User?                      @relation("User_UpdatedPurchaseBills", fields: [updatedByUserId], references: [id])
   vendor                       Vendor?                    @relation(fields: [vendorId], references: [id])
+  purchaseOrder                PurchaseOrder?             @relation(fields: [purchaseOrderId], references: [id])
   voidJournalEntry             JournalEntry?              @relation("PurchaseBill_VoidJournalEntry", fields: [voidJournalEntryId], references: [id])
   voidedByUser                 User?                      @relation("User_VoidedPurchaseBills", fields: [voidedByUserId], references: [id])
   location                     Location                   @relation(fields: [locationId], references: [id])
@@ -709,6 +716,7 @@ model PurchaseBill {
   @@index([lastAdjustmentJournalEntryId], map: "PurchaseBill_lastAdjustmentJournalEntryId_fkey")
   @@index([updatedByUserId], map: "PurchaseBill_updatedByUserId_fkey")
   @@index([vendorId], map: "PurchaseBill_vendorId_fkey")
+  @@index([purchaseOrderId])
   @@index([voidedByUserId], map: "PurchaseBill_voidedByUserId_fkey")
   @@index([locationId], map: "PurchaseBill_warehouseId_fkey")
   @@index([purchaseReceiptId])
@@ -801,6 +809,7 @@ model PurchaseReceiptLine {
   item            Item            @relation(fields: [itemId], references: [id])
   location        Location        @relation(fields: [locationId], references: [id])
   landedCostAllocations PurchaseBillLandedCostAllocation[]
+  billLines            PurchaseBillLine[] @relation("PurchaseBillLine_PurchaseReceiptLine")
 
   @@index([companyId])
   @@index([purchaseReceiptId])
@@ -879,6 +888,8 @@ model VendorCredit {
   status                       VendorCreditStatus
   creditDate                   DateTime
   currency                     String?
+  subtotal                     Decimal                   @default(0.00) @db.Decimal(18, 2)
+  taxAmount                    Decimal                   @default(0.00) @db.Decimal(18, 2)
   total                        Decimal                   @db.Decimal(18, 2)
   amountApplied                Decimal                   @default(0.00) @db.Decimal(18, 2)
   journalEntryId               Int?                      @unique
@@ -922,7 +933,10 @@ model VendorCreditLine {
   description    String?
   quantity       Decimal      @db.Decimal(18, 2)
   unitCost       Decimal      @db.Decimal(18, 2)
+  discountAmount Decimal      @default(0.00) @db.Decimal(18, 2)
   lineTotal      Decimal      @db.Decimal(18, 2)
+  taxRate        Decimal?     @db.Decimal(5, 4)
+  taxAmount      Decimal      @default(0.00) @db.Decimal(18, 2)
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @default(now()) @updatedAt
   account        Account?     @relation("VendorCreditLine_Account", fields: [accountId], references: [id])
@@ -1027,15 +1041,21 @@ model PurchaseBillLine {
   purchaseBillId Int
   locationId     Int          @map("warehouseId")
   itemId         Int
+  purchaseOrderLineId  Int?
+  purchaseReceiptLineId Int?
   description    String?
   quantity       Decimal      @db.Decimal(18, 2)
   unitCost       Decimal      @db.Decimal(18, 2)
   discountAmount Decimal      @default(0.00) @db.Decimal(18, 2)
   lineTotal      Decimal      @db.Decimal(18, 2)
+  taxRate        Decimal?     @db.Decimal(5, 4)
+  taxAmount      Decimal      @default(0.00) @db.Decimal(18, 2)
   accountId      Int?
   account        Account?     @relation(fields: [accountId], references: [id])
   company        Company      @relation(fields: [companyId], references: [id])
   item           Item         @relation(fields: [itemId], references: [id])
+  purchaseOrderLine PurchaseOrderLine? @relation("PurchaseBillLine_PurchaseOrderLine", fields: [purchaseOrderLineId], references: [id], onDelete: SetNull)
+  purchaseReceiptLine PurchaseReceiptLine? @relation("PurchaseBillLine_PurchaseReceiptLine", fields: [purchaseReceiptLineId], references: [id], onDelete: SetNull)
   purchaseBill   PurchaseBill @relation(fields: [purchaseBillId], references: [id])
   location       Location     @relation(fields: [locationId], references: [id])
 
@@ -1043,6 +1063,8 @@ model PurchaseBillLine {
   @@index([purchaseBillId])
   @@index([companyId, itemId])
   @@index([accountId])
+  @@index([purchaseOrderLineId])
+  @@index([purchaseReceiptLineId])
   @@index([itemId], map: "PurchaseBillLine_itemId_fkey")
   @@index([locationId], map: "PurchaseBillLine_warehouseId_fkey")
 }
@@ -1261,6 +1283,59 @@ model InventoryRecalcState {
   @@index([lockedAt])
 }
 
+// --- Cashflow Copilot settings (per company) ---
+// Owner-facing defaults used by the deterministic cashflow forecast engine.
+model CashflowSettings {
+  companyId            Int      @id
+  defaultArDelayDays   Int      @default(7)
+  defaultApDelayDays   Int      @default(0)
+  minCashBuffer        Decimal  @default(0.00) @db.Decimal(18, 2)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+// --- Cashflow Copilot recurring items (per company) ---
+// Used to model predictable cash movements (payroll, rent, loan repayments, tax).
+model CashflowRecurringItem {
+  id         Int                       @id @default(autoincrement())
+  companyId  Int
+  direction  CashflowRecurringDirection
+  name       String                    @db.VarChar(128)
+  amount     Decimal                   @db.Decimal(18, 2)
+  currency   String?                   @db.VarChar(3)
+  startDate  DateTime
+  endDate    DateTime?
+  frequency  CashflowRecurringFrequency
+  interval   Int                       @default(1)
+  isActive   Boolean                   @default(true)
+  createdAt  DateTime                  @default(now())
+  updatedAt  DateTime                  @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, isActive])
+  @@index([companyId, startDate])
+}
+
+// --- Cached cashflow forecasts (per company, per scenario, per day) ---
+// Used for background refresh and fast dashboard loads.
+model CashflowForecastSnapshot {
+  id         Int      @id @default(autoincrement())
+  companyId  Int
+  scenario   String   @db.VarChar(24)
+  asOfDate   DateTime
+  computedAt DateTime @default(now())
+  payload    Json
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, scenario, asOfDate], map: "CFS_uq")
+  @@index([companyId, computedAt], map: "CFS_company_computedAt_idx")
+  @@index([companyId, scenario, computedAt], map: "CFS_company_scenario_computedAt_idx")
+}
+
 // Tracks the net COGS/inventory adjustment applied by the inventory revaluation pipeline
 // for a given source journal entry. This makes revaluation idempotent across retries.
 model JournalEntryInventoryValuation {
@@ -1435,6 +1510,16 @@ enum CashflowActivity {
   FINANCING
 }
 
+enum CashflowRecurringDirection {
+  INFLOW
+  OUTFLOW
+}
+
+enum CashflowRecurringFrequency {
+  WEEKLY
+  MONTHLY
+}
+
 enum ItemType {
   GOODS
   SERVICE
@@ -1537,6 +1622,7 @@ model PurchaseOrder {
   location      Location           @relation(fields: [locationId], references: [id])
   lines         PurchaseOrderLine[]
   purchaseReceipts PurchaseReceipt[]
+  purchaseBills  PurchaseBill[]
 
   @@unique([companyId, poNumber])
   @@index([companyId, orderDate])
@@ -1564,6 +1650,7 @@ model PurchaseOrderLine {
   item            Item         @relation(fields: [itemId], references: [id])
   location        Location     @relation(fields: [locationId], references: [id])
   receiptLines    PurchaseReceiptLine[]
+  billLines       PurchaseBillLine[] @relation("PurchaseBillLine_PurchaseOrderLine")
 
   @@index([companyId])
   @@index([purchaseOrderId])

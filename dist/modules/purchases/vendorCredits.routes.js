@@ -3,7 +3,7 @@ import { AccountType, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
@@ -14,6 +14,8 @@ import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
+import { ensureTaxReceivableAccountIfNeeded } from '../../utils/tax.js';
+import { assertOpenPeriodOrThrow } from '../../utils/periodClosePolicy.js';
 export async function vendorCreditsRoutes(fastify) {
     fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
@@ -91,12 +93,14 @@ export async function vendorCreditsRoutes(fastify) {
             reply.status(400);
             return { error: 'locationId not found in this company' };
         }
-        let total = new Prisma.Decimal(0);
+        let subtotal = new Prisma.Decimal(0);
+        let taxAmount = new Prisma.Decimal(0);
         const computedLines = [];
         for (const [idx, l] of (body.lines ?? []).entries()) {
             const itemId = Number(l.itemId);
             const qty = Number(l.quantity ?? 0);
             const unitCost = Number(l.unitCost ?? 0);
+            const discountAmount = Number(l.discountAmount ?? 0);
             if (!itemId || Number.isNaN(itemId)) {
                 reply.status(400);
                 return { error: `lines[${idx}].itemId is required` };
@@ -108,6 +112,10 @@ export async function vendorCreditsRoutes(fastify) {
             if (!unitCost || unitCost <= 0) {
                 reply.status(400);
                 return { error: `lines[${idx}].unitCost must be > 0` };
+            }
+            if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount must be >= 0` };
             }
             const item = await prisma.item.findFirst({
                 where: { id: itemId, companyId },
@@ -135,8 +143,21 @@ export async function vendorCreditsRoutes(fastify) {
             }
             const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
             const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
-            const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
-            total = total.add(lineTotal);
+            const gross = qtyDec.mul(unitDec).toDecimalPlaces(2);
+            const disc = new Prisma.Decimal(discountAmount).toDecimalPlaces(2);
+            if (disc.greaterThan(gross)) {
+                reply.status(400);
+                return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
+            }
+            const lineTotal = gross.sub(disc).toDecimalPlaces(2); // net subtotal (tax-exclusive)
+            const rate = new Prisma.Decimal(Number(l.taxRate ?? 0)).toDecimalPlaces(4);
+            if (rate.lessThan(0) || rate.greaterThan(1)) {
+                reply.status(400);
+                return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+            }
+            const lineTax = lineTotal.mul(rate).toDecimalPlaces(2);
+            subtotal = subtotal.add(lineTotal);
+            taxAmount = taxAmount.add(lineTax);
             computedLines.push({
                 companyId,
                 locationId,
@@ -145,10 +166,15 @@ export async function vendorCreditsRoutes(fastify) {
                 description: l.description ?? null,
                 quantity: qtyDec,
                 unitCost: unitDec,
-                lineTotal,
+                discountAmount: disc,
+                lineTotal, // net subtotal
+                taxRate: rate,
+                taxAmount: lineTax,
             });
         }
-        total = total.toDecimalPlaces(2);
+        subtotal = subtotal.toDecimalPlaces(2);
+        taxAmount = taxAmount.toDecimalPlaces(2);
+        const total = subtotal.add(taxAmount).toDecimalPlaces(2);
         const created = await prisma.$transaction(async (tx) => {
             const creditNumber = await nextVendorCreditNumber(tx, companyId);
             return await tx.vendorCredit.create({
@@ -160,6 +186,8 @@ export async function vendorCreditsRoutes(fastify) {
                     status: 'DRAFT',
                     creditDate,
                     currency: body.currency ?? null,
+                    subtotal,
+                    taxAmount,
                     total,
                     amountApplied: new Prisma.Decimal(0),
                     lines: { create: computedLines },
@@ -265,13 +293,22 @@ export async function vendorCreditsRoutes(fastify) {
         const lockKey = `lock:vendor-credit:post:${companyId}:${vendorCreditId}`;
         const pre = await prisma.vendorCredit.findFirst({
             where: { id: vendorCreditId, companyId },
-            select: { id: true, locationId: true, lines: { select: { itemId: true } } },
+            select: {
+                id: true,
+                locationId: true,
+                lines: { select: { itemId: true, item: { select: { type: true, trackInventory: true } } } },
+            },
         });
         if (!pre) {
             reply.status(404);
             return { error: 'vendor credit not found' };
         }
-        const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
+        // Only lock stock for tracked inventory items (avoid unnecessary lock conflicts for services/non-inventory).
+        const trackedItemIds = Array.from(new Set((pre.lines ?? [])
+            .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
+            .map((l) => Number(l.itemId))
+            .filter((n) => Number.isFinite(n) && n > 0)));
+        const stockLocks = trackedItemIds.map((itemId) => `lock:stock:${companyId}:${pre.locationId}:${itemId}`);
         try {
             const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
@@ -293,32 +330,59 @@ export async function vendorCreditsRoutes(fastify) {
                         // already posted
                         return { vendorCreditId: vc.id, status: vc.status, journalEntryId: vc.journalEntryId };
                     }
-                    const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                     const apId = vc.company.accountsPayableAccountId;
                     if (!apId)
                         throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
-                    const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } });
+                    const [periodCheck, cfg, apAcc] = await Promise.all([
+                        assertOpenPeriodOrThrow(tx, { companyId, transactionDate: new Date(vc.creditDate), action: 'vendor_credit.post' }).then(() => true),
+                        ensureInventoryCompanyDefaults(tx, companyId),
+                        tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } }),
+                    ]);
+                    void periodCheck;
                     if (!apAcc)
                         throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), { statusCode: 400 });
-                    let total = new Prisma.Decimal(0);
+                    let subtotal = new Prisma.Decimal(0);
+                    let taxAmount = new Prisma.Decimal(0);
                     const creditByAccount = new Map();
+                    // Performance: precompute tracked and non-tracked needs to avoid N+1 validations.
+                    const trackedLineItemIds = Array.from(new Set((vc.lines ?? [])
+                        .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
+                        .map((l) => Number(l.itemId))
+                        .filter((n) => Number.isFinite(n) && n > 0)));
+                    if (trackedLineItemIds.length > 0) {
+                        if (!cfg.inventoryAssetAccountId) {
+                            throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                        }
+                        await Promise.all(trackedLineItemIds.map((itemId) => ensureInventoryItem(tx, companyId, itemId)));
+                    }
+                    const nonTrackedAccountIds = Array.from(new Set((vc.lines ?? [])
+                        .filter((l) => !(l?.item?.type === 'GOODS' && !!l?.item?.trackInventory))
+                        .map((l) => Number(l.accountId ?? l.item?.expenseAccountId ?? 0))
+                        .filter((n) => Number.isFinite(n) && n > 0)));
+                    const validExpenseAccounts = new Set();
+                    if (nonTrackedAccountIds.length > 0) {
+                        const rows = await tx.account.findMany({
+                            where: { companyId, type: AccountType.EXPENSE, id: { in: nonTrackedAccountIds } },
+                            select: { id: true },
+                        });
+                        for (const r of rows)
+                            validExpenseAccounts.add(r.id);
+                    }
                     for (const [idx, l] of (vc.lines ?? []).entries()) {
                         const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                         const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
                         const lineTotal = new Prisma.Decimal(l.lineTotal).toDecimalPlaces(2);
+                        const lineTax = new Prisma.Decimal(l.taxAmount ?? 0).toDecimalPlaces(2);
                         if (qty.lessThanOrEqualTo(0) || unitCost.lessThanOrEqualTo(0) || lineTotal.lessThanOrEqualTo(0)) {
                             throw Object.assign(new Error(`invalid line[${idx}] quantity/unitCost`), { statusCode: 400 });
                         }
-                        total = total.add(lineTotal);
+                        subtotal = subtotal.add(lineTotal);
+                        taxAmount = taxAmount.add(lineTax);
                         const item = l.item;
                         const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
                         let creditAccountId = l.accountId ?? null;
                         if (isTracked) {
-                            if (!cfg.inventoryAssetAccountId) {
-                                throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
-                            }
                             creditAccountId = cfg.inventoryAssetAccountId;
-                            await ensureInventoryItem(tx, companyId, l.itemId);
                             await applyStockMoveWac(tx, {
                                 companyId,
                                 locationId: vc.locationId,
@@ -345,15 +409,20 @@ export async function vendorCreditsRoutes(fastify) {
                             if (!creditAccountId) {
                                 throw Object.assign(new Error(`line[${idx}].accountId is required for non-inventory items`), { statusCode: 400 });
                             }
-                            const exp = await tx.account.findFirst({ where: { id: creditAccountId, companyId, type: AccountType.EXPENSE } });
-                            if (!exp)
+                            if (!validExpenseAccounts.has(creditAccountId)) {
                                 throw Object.assign(new Error(`line[${idx}].accountId must be an EXPENSE account`), { statusCode: 400 });
+                            }
+                        }
+                        if (!creditAccountId) {
+                            throw Object.assign(new Error(`line[${idx}] is missing credit account mapping`), { statusCode: 400 });
                         }
                         const prev = creditByAccount.get(creditAccountId) ?? new Prisma.Decimal(0);
                         creditByAccount.set(creditAccountId, prev.add(lineTotal));
                     }
-                    total = total.toDecimalPlaces(2);
+                    subtotal = subtotal.toDecimalPlaces(2);
+                    taxAmount = taxAmount.toDecimalPlaces(2);
                     const storedTotal = new Prisma.Decimal(vc.total).toDecimalPlaces(2);
+                    const total = subtotal.add(taxAmount).toDecimalPlaces(2);
                     if (!total.equals(storedTotal)) {
                         throw Object.assign(new Error(`rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}`), { statusCode: 400 });
                     }
@@ -362,12 +431,19 @@ export async function vendorCreditsRoutes(fastify) {
                         debit: new Prisma.Decimal(0),
                         credit: amt.toDecimalPlaces(2),
                     }));
+                    const taxReceivableId = await ensureTaxReceivableAccountIfNeeded(tx, companyId, taxAmount);
+                    if (taxAmount.greaterThan(0)) {
+                        if (!taxReceivableId)
+                            throw Object.assign(new Error('tax receivable account required when taxAmount > 0'), { statusCode: 400 });
+                        creditLines.push({ accountId: taxReceivableId, debit: new Prisma.Decimal(0), credit: taxAmount });
+                    }
                     const je = await postJournalEntry(tx, {
                         companyId,
                         date: vc.creditDate,
                         description: `Vendor Credit ${vc.creditNumber}${vc.vendor ? ` for ${vc.vendor.name}` : ''}`,
                         createdByUserId: request.user?.userId ?? null,
                         skipAccountValidation: true,
+                        skipPeriodCheck: true,
                         lines: [
                             { accountId: apAcc.id, debit: total, credit: new Prisma.Decimal(0) },
                             ...creditLines,
@@ -463,7 +539,7 @@ export async function vendorCreditsRoutes(fastify) {
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
-            const { replay, response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { replay, response: result } = await runWithResourceLockRetry(() => wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
               SELECT id FROM VendorCredit
@@ -567,7 +643,7 @@ export async function vendorCreditsRoutes(fastify) {
                     return { vendorCreditId: vc.id, status: 'VOID', voidJournalEntryId: reversal.id, _jeEventId: jeEventId };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-            }, redis));
+            }, redis)));
             // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
             if (!replay && result._jeEventId) {
                 publishEventsFastPath([result._jeEventId]);

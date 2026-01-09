@@ -17,15 +17,28 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Textarea } from '@/components/ui/textarea';
 import { AccountPicker } from '@/components/account-picker';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { ItemCombobox } from '@/components/item-combobox';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 type Line = {
   itemId: string;
+  itemText: string;
   accountId: string;
   quantity: string;
   unitCost: string;
   discountAmount: string;
+  taxRate: string;
+  taxLabel: string;
   description: string;
 };
+
+type TaxOption = { id: number; name: string; ratePercent: number; type: 'rate' | 'group' };
 
 export default function EditPurchaseBillPage() {
   const { user, companySettings } = useAuth();
@@ -47,6 +60,11 @@ export default function EditPurchaseBillPage() {
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [inventoryAccountId, setInventoryAccountId] = useState<number | null>(null);
+  const [defaultLocationId, setDefaultLocationId] = useState<number | null>(null);
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
+  const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
+  const [taxSearchTerm, setTaxSearchTerm] = useState('');
+  const [openTaxIdx, setOpenTaxIdx] = useState<number | null>(null);
 
   const [currencyOptions, setCurrencyOptions] = useState<string[]>([]);
   const [entryCurrency, setEntryCurrency] = useState<string>('');
@@ -67,7 +85,7 @@ export default function EditPurchaseBillPage() {
     locationId: '',
   });
   const [lines, setLines] = useState<Line[]>([
-    { itemId: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
+    { itemId: '', itemText: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', taxRate: '0', taxLabel: '', description: '' },
   ]);
 
   useEffect(() => {
@@ -75,10 +93,37 @@ export default function EditPurchaseBillPage() {
     getVendors(user.companyId).then(setVendors).catch(console.error);
     fetchApi(`/companies/${user.companyId}/locations`).then(setLocations).catch(console.error);
     fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/taxes`)
+      .then((t) => {
+        const options: TaxOption[] = [
+          ...(((t as any)?.taxRates ?? []) as any[]).map((r) => ({
+            id: r.id,
+            name: `${r.name} [${Number(r.ratePercent ?? 0).toFixed(0)}%]`,
+            ratePercent: Number(r.ratePercent ?? 0),
+            type: 'rate' as const,
+          })),
+          ...(((t as any)?.taxGroups ?? []) as any[]).map((g) => ({
+            id: g.id,
+            name: `${g.name} [${Number(g.totalRatePercent ?? 0).toFixed(0)}%]`,
+            ratePercent: Number(g.totalRatePercent ?? 0),
+            type: 'group' as const,
+          })),
+        ];
+        setTaxOptions(options);
+      })
+      .catch(() => setTaxOptions([]));
     getAccounts(user.companyId).then(setAccounts).catch(console.error);
     fetchApi(`/companies/${user.companyId}/settings`)
-      .then((s) => setInventoryAccountId(Number(s.inventoryAssetAccountId ?? 0) || null))
-      .catch(() => setInventoryAccountId(null));
+      .then((s) => {
+        setInventoryAccountId(Number((s as any).inventoryAssetAccountId ?? 0) || null);
+        const defId =
+          Number(((s as any).defaultLocationId ?? (s as any).defaultWarehouseId ?? 0) || 0) || null;
+        setDefaultLocationId(defId);
+      })
+      .catch(() => {
+        setInventoryAccountId(null);
+        setDefaultLocationId(null);
+      });
 
     getCurrenciesOverview(user.companyId)
       .then((ov) => {
@@ -131,10 +176,13 @@ export default function EditPurchaseBillPage() {
           setLines(
             docLines.map((l: any) => ({
               itemId: String(l.itemId ?? ''),
+              itemText: String(l.item?.name ?? ''),
               accountId: l.accountId ? String(l.accountId) : '',
               quantity: String(Number(l.quantity ?? 0)),
               unitCost: String(Number(l.unitCost ?? 0)),
               discountAmount: String(Number(l.discountAmount ?? 0)),
+              taxRate: String(Number(l.taxRate ?? 0) || 0),
+              taxLabel: '',
               description: l.description ?? '',
             }))
           );
@@ -226,24 +274,119 @@ export default function EditPurchaseBillPage() {
     () => (inventoryAccountId ? accounts.find((a) => a.id === inventoryAccountId) ?? null : null),
     [accounts, inventoryAccountId]
   );
-  const total = useMemo(
-    () =>
-      lines.reduce((sum, l) => {
-        const gross = Number(l.quantity || 0) * Number(l.unitCost || 0);
-        const disc = Number(l.discountAmount || 0);
-        return sum + Math.max(0, gross - (Number.isFinite(disc) ? disc : 0));
-      }, 0),
-    [lines]
-  );
+  const subtotalAmount = useMemo(() => {
+    return lines.reduce((sum, l) => {
+      const gross = Number(l.quantity || 0) * Number(l.unitCost || 0);
+      const disc = Number(l.discountAmount || 0);
+      return sum + Math.max(0, gross - (Number.isFinite(disc) ? disc : 0));
+    }, 0);
+  }, [lines]);
+
+  const taxAmount = useMemo(() => {
+    return lines.reduce((sum, l: any) => {
+      const gross = Number(l.quantity || 0) * Number(l.unitCost || 0);
+      const disc = Number(l.discountAmount || 0);
+      const net = Math.max(0, gross - (Number.isFinite(disc) ? disc : 0));
+      const rate = Number(l.taxRate ?? 0);
+      if (!Number.isFinite(rate) || rate <= 0) return sum;
+      return sum + net * rate;
+    }, 0);
+  }, [lines]);
+
+  const total = useMemo(() => subtotalAmount + taxAmount, [subtotalAmount, taxAmount]);
 
   function updateLine(idx: number, patch: Partial<Line>) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
 
+  const effectiveLocationId = useMemo(() => {
+    const fromForm = Number(form.locationId || 0) || null;
+    if (fromForm) return fromForm;
+    const fromSettings = defaultLocationId ?? null;
+    if (fromSettings) return fromSettings;
+    const fromLocs = Number((locations ?? []).find((l: any) => l?.isDefault)?.id ?? 0) || null;
+    return fromLocs;
+  }, [form.locationId, defaultLocationId, locations]);
+
+  const selectedLocationLabel = useMemo(() => {
+    if (!effectiveLocationId) return null;
+    const loc = (locations ?? []).find((l: any) => Number(l?.id) === Number(effectiveLocationId));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [locations, effectiveLocationId]);
+
+  // Stock on hand map for selected location (UX only).
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!effectiveLocationId) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(effectiveLocationId))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, effectiveLocationId]);
+
+  function applyPickedItem(idx: number, picked: any | null) {
+    const itemId = picked?.id ? String(picked.id) : '';
+    const pickedTracked = picked?.type === 'GOODS' && !!picked?.trackInventory;
+    const nextAccountId = pickedTracked
+      ? inventoryAccountId
+        ? String(inventoryAccountId)
+        : ''
+      : picked?.expenseAccountId
+        ? String(picked.expenseAccountId)
+        : '';
+
+    const showFx = !!(isFx && enterInEntryCurrency && fxRateToBase && fxRateToBase > 0);
+    const baseCost = Number(picked?.costPrice ?? 0);
+    const nextCost = showFx ? baseCost / Number(fxRateToBase || 1) : baseCost;
+
+    updateLine(idx, {
+      itemId,
+      itemText: picked?.name ? String(picked.name) : '',
+      accountId: nextAccountId,
+      unitCost:
+        String(lines[idx]?.unitCost ?? '').trim() || !Number.isFinite(nextCost) || nextCost <= 0
+          ? String(lines[idx]?.unitCost ?? '')
+          : String(nextCost),
+      description: picked?.name ? String(picked.name) : '',
+    });
+  }
+
+  function handleItemTextChange(idx: number, text: string) {
+    const normalized = String(text ?? '').trim();
+    const picked = selectableItems.find((i: any) => String(i.name ?? '').trim().toLowerCase() === normalized.toLowerCase());
+    if (picked) {
+      applyPickedItem(idx, picked);
+      return;
+    }
+    updateLine(idx, { itemText: text, itemId: '' });
+  }
+
   function addLine() {
     setLines((prev) => [
       ...prev,
-      { itemId: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', description: '' },
+      { itemId: '', itemText: '', accountId: '', quantity: '1', unitCost: '', discountAmount: '0', taxRate: '0', taxLabel: '', description: '' },
     ]);
   }
 
@@ -265,6 +408,7 @@ export default function EditPurchaseBillPage() {
         quantity: Number(l.quantity),
         unitCost: Number(l.unitCost),
         discountAmount: Number(l.discountAmount || 0),
+        taxRate: Number((l as any).taxRate || 0),
         description: l.description || undefined,
       }))
       .filter((l) => l.itemId && l.quantity > 0 && l.unitCost > 0);
@@ -455,29 +599,28 @@ export default function EditPurchaseBillPage() {
                             <TableRow key={`main-${idx}`} className="border-b-0">
                               <TableCell className="align-top">
                                 <div className="space-y-2">
-                                  <SelectNative
-                                    value={l.itemId}
-                                    onChange={(e) => {
-                                      const itemId = e.target.value;
-                                      const picked = selectableItems.find((x) => String(x.id) === String(itemId));
-                                      const pickedTracked = picked?.type === 'GOODS' && !!picked?.trackInventory;
-                                      const nextAccountId = pickedTracked
-                                        ? inventoryAccountId
-                                          ? String(inventoryAccountId)
-                                          : ''
-                                        : picked?.expenseAccountId
-                                          ? String(picked.expenseAccountId)
-                                          : '';
-                                      updateLine(idx, { itemId, accountId: nextAccountId });
-                                    }}
-                                  >
-                                    <option value="">Select item…</option>
-                                    {selectableItems.map((it2) => (
-                                      <option key={it2.id} value={String(it2.id)}>
-                                        {it2.name}
-                                      </option>
-                                    ))}
-                                  </SelectNative>
+                                  <Input className="hidden" />
+                                  <ItemCombobox
+                                    items={(selectableItems ?? []).map((i: any) => ({
+                                      id: Number(i.id),
+                                      name: String(i.name ?? ''),
+                                      sku: i.sku ?? null,
+                                      sellingPrice: i.sellingPrice,
+                                      costPrice: i.costPrice,
+                                      trackInventory: !!i.trackInventory,
+                                    }))}
+                                    valueText={(l as any).itemText ?? (l.itemId ? (selectableItems.find((x: any) => String(x.id) === String(l.itemId))?.name ?? '') : '')}
+                                    placeholder="Type or click to select an item…"
+                                    onChangeText={(t) => handleItemTextChange(idx, t)}
+                                    onSelectItem={(it) => applyPickedItem(idx, { ...it, ...selectableItems.find((x: any) => Number(x.id) === Number(it.id)) })}
+                                    stockByItemId={stockByItemId}
+                                    selectedLocationLabel={selectedLocationLabel}
+                                    currencyLabel={enterInEntryCurrency && entryCurrency ? entryCurrency : baseCurrency}
+                                    priceLabel="Cost"
+                                    getPrice={(it) => Number(it.costPrice ?? 0)}
+                                    addNewHref="/items/new"
+                                    disabled={!selectableItems.length}
+                                  />
 
                                 </div>
                               </TableCell>

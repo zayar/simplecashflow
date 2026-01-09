@@ -20,6 +20,7 @@ import { dashboardRoutes } from './modules/reports/dashboard.routes.js';
 import { arApSummaryRoutes } from './modules/reports/arApSummary.routes.js';
 import { taxesRoutes } from './modules/taxes/taxes.routes.js';
 import { currenciesRoutes } from './modules/currencies/currencies.routes.js';
+import { cashflowRoutes } from './modules/cashflow/cashflow.routes.js';
 import { runWithTenant } from './infrastructure/tenantContext.js';
 
 function requireEnv(name: string): string {
@@ -189,6 +190,7 @@ async function buildApp() {
   await fastify.register(arApSummaryRoutes);
   await fastify.register(taxesRoutes);
   await fastify.register(currenciesRoutes);
+  await fastify.register(cashflowRoutes);
 
   // Tenant context (ALS) must be installed AFTER module-level auth hooks are registered,
   // so it can wrap the actual route handler execution with a verified tenant id.

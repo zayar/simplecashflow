@@ -53,6 +53,52 @@ export async function ensureTaxPayableAccount(tx, companyId) {
     });
     return created.id;
 }
+/**
+ * Ensures the company has a dedicated Tax Receivable account (ASSET) and returns its id.
+ *
+ * Used for purchase-side taxes (input tax / recoverable VAT). This keeps purchase taxes
+ * off P&L and tracks them as an asset until settled/claimed.
+ *
+ * Strategy:
+ * - Prefer an existing ASSET account named "Tax Receivable"
+ * - Otherwise create one, using code 1210 if free; else pick the next free numeric code in 1211..1999
+ */
+export async function ensureTaxReceivableAccount(tx, companyId) {
+    if (!companyId || Number.isNaN(Number(companyId))) {
+        throw Object.assign(new Error('companyId is required'), { statusCode: 400 });
+    }
+    const byName = await tx.account.findFirst({
+        where: { companyId, type: 'ASSET', name: 'Tax Receivable' },
+        select: { id: true },
+    });
+    if (byName?.id)
+        return byName.id;
+    const assetCodes = await tx.account.findMany({
+        where: { companyId, type: 'ASSET' },
+        select: { code: true },
+    });
+    const used = new Set(assetCodes.map((a) => String(a.code ?? '').trim()).filter(Boolean));
+    const desired = !used.has('1210') ? '1210' : pickFirstUnusedNumericCode(used, 1211, 1999);
+    const created = await tx.account.create({
+        data: {
+            companyId,
+            code: desired,
+            name: 'Tax Receivable',
+            type: 'ASSET',
+            normalBalance: 'DEBIT',
+            reportGroup: 'OTHER_CURRENT_ASSET',
+            cashflowActivity: 'OPERATING',
+        },
+        select: { id: true },
+    });
+    return created.id;
+}
+export async function ensureTaxReceivableAccountIfNeeded(tx, companyId, taxAmount) {
+    const amt = taxAmount instanceof Prisma.Decimal ? taxAmount : new Prisma.Decimal(taxAmount ?? 0);
+    if (!amt.greaterThan(0))
+        return null;
+    return await ensureTaxReceivableAccount(tx, companyId);
+}
 export async function ensureTaxPayableAccountIfNeeded(tx, companyId, taxAmount) {
     const amt = taxAmount instanceof Prisma.Decimal ? taxAmount : new Prisma.Decimal(taxAmount ?? 0);
     if (!amt.greaterThan(0))

@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { SelectNative } from '@/components/ui/select-native';
+import { ItemCombobox } from '@/components/item-combobox';
 import { Textarea } from '@/components/ui/textarea';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
@@ -28,6 +29,7 @@ type TaxOption = { id: number; name: string; ratePercent: number; type: 'rate' |
 type Line = {
   itemId: string;
   invoiceLineId?: string;
+  itemText?: string;
   description: string;
   quantity: number;
   unitPrice: number;
@@ -43,10 +45,17 @@ export default function EditCreditNotePage() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const baseCurrency = useMemo(() => {
+    const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [companySettings?.baseCurrency]);
 
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
+  const [locations, setLocations] = useState<any[]>([]);
+  const [stockLocationId, setStockLocationId] = useState<number | null>(null);
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
   const [defaultIncomeAccountId, setDefaultIncomeAccountId] = useState<number | null>(null);
   const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
   const [taxSearchTerm, setTaxSearchTerm] = useState('');
@@ -76,6 +85,9 @@ export default function EditCreditNotePage() {
     if (!user?.companyId) return;
     fetchApi(`/companies/${user.companyId}/customers`).then(setCustomers).catch(console.error);
     fetchApi(`/companies/${user.companyId}/items`).then(setItems).catch(console.error);
+    fetchApi(`/companies/${user.companyId}/locations`)
+      .then((locs) => setLocations(locs ?? []))
+      .catch(() => setLocations([]));
     fetchApi(`/companies/${user.companyId}/accounts`)
       .then((accounts) => {
         const activeAccounts = (accounts ?? []).filter((a: any) => a.isActive !== false);
@@ -110,7 +122,45 @@ export default function EditCreditNotePage() {
         setTaxOptions(opts);
       })
       .catch(console.error);
+    fetchApi(`/companies/${user.companyId}/settings`)
+      .then((s) => {
+        const defId = Number(((s as any)?.defaultLocationId ?? (s as any)?.defaultWarehouseId ?? 0) || 0) || null;
+        setStockLocationId(defId);
+      })
+      .catch(() => setStockLocationId(null));
   }, [user?.companyId]);
+
+  // Stock on hand map for the default location (credit note has no location field yet).
+  useEffect(() => {
+    if (!user?.companyId) return;
+    const fallbackId = stockLocationId ?? (Number((locations ?? []).find((l: any) => l?.isDefault)?.id ?? 0) || null);
+    if (!fallbackId) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(fallbackId))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, stockLocationId, locations]);
 
   useEffect(() => {
     if (!user?.companyId || !id) return;
@@ -133,6 +183,7 @@ export default function EditCreditNotePage() {
             docLines.map((l: any) => ({
               itemId: String(l.itemId ?? ''),
               invoiceLineId: l.invoiceLineId ? String(l.invoiceLineId) : undefined,
+              itemText: String(l.item?.name ?? ''),
               description: l.description ?? l.item?.name ?? '',
               quantity: Number(l.quantity ?? 1),
               unitPrice: Number(l.unitPrice ?? 0),
@@ -147,6 +198,13 @@ export default function EditCreditNotePage() {
       .catch((e) => setError(e?.message ?? String(e)))
       .finally(() => setLoadingDoc(false));
   }, [user?.companyId, id, tz]);
+
+  const selectedLocationLabel = useMemo(() => {
+    const fallbackId = stockLocationId ?? (Number((locations ?? []).find((l: any) => l?.isDefault)?.id ?? 0) || null);
+    if (!fallbackId) return null;
+    const loc = (locations ?? []).find((l: any) => Number(l?.id) === Number(fallbackId));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [locations, stockLocationId]);
 
   const totals = useMemo(() => {
     const subtotal = lines.reduce((sum, l) => {
@@ -172,6 +230,7 @@ export default function EditCreditNotePage() {
       ...prev,
       {
         itemId: '',
+        itemText: '',
         description: '',
         quantity: 1,
         unitPrice: 0,
@@ -181,6 +240,26 @@ export default function EditCreditNotePage() {
         incomeAccountId: defaultIncomeAccountId ? String(defaultIncomeAccountId) : '',
       },
     ]);
+  }
+
+  function handleItemTextChange(index: number, text: string) {
+    const normalized = String(text ?? '').trim();
+    const item = items.find((i: any) => String(i.name ?? '').trim().toLowerCase() === normalized.toLowerCase());
+    const next = [...lines];
+    if ((next[index] as any).invoiceLineId) return;
+    (next[index] as any).itemText = text;
+    if (item) {
+      next[index].itemId = String(item.id);
+      next[index].unitPrice = Number(item.sellingPrice ?? 0);
+      next[index].description = String(item.name ?? '');
+    } else {
+      next[index].itemId = '';
+      next[index].description = text;
+    }
+    if (!(next[index] as any).incomeAccountId && defaultIncomeAccountId) {
+      (next[index] as any).incomeAccountId = String(defaultIncomeAccountId);
+    }
+    setLines(next);
   }
 
   function removeLine(idx: number) {
@@ -336,14 +415,29 @@ export default function EditCreditNotePage() {
                         <TableRow key={`main-${idx}`} className="border-b-0">
                           <TableCell className="align-top">
                             <div className="space-y-2">
-                              <SelectNative value={l.itemId} disabled={!!l.invoiceLineId} onChange={(e) => updateLine(idx, { itemId: e.target.value })}>
-                                <option value="">Select item…</option>
-                                {items.map((it) => (
-                                  <option key={it.id} value={String(it.id)}>
-                                    {it.name}
-                                  </option>
-                                ))}
-                              </SelectNative>
+                              <Input className="hidden" />
+                              <ItemCombobox
+                                items={(items ?? []).map((i: any) => ({
+                                  id: Number(i.id),
+                                  name: String(i.name ?? ''),
+                                  sku: i.sku ?? null,
+                                  sellingPrice: i.sellingPrice,
+                                  costPrice: i.costPrice,
+                                  trackInventory: !!i.trackInventory,
+                                }))}
+                                valueText={
+                                  (l as any).itemText ??
+                                  (l.itemId ? (items.find((i: any) => String(i.id) === String(l.itemId))?.name ?? '') : '')
+                                }
+                                placeholder="Type or click to select an item…"
+                                onChangeText={(t) => handleItemTextChange(idx, t)}
+                                onSelectItem={(it) => updateLine(idx, { itemId: String(it.id), itemText: it.name, description: it.name })}
+                                stockByItemId={stockByItemId}
+                                selectedLocationLabel={selectedLocationLabel}
+                                currencyLabel={baseCurrency}
+                                addNewHref="/items/new"
+                                disabled={!items.length || !!l.invoiceLineId}
+                              />
                               {l.invoiceLineId ? (
                                 <div className="text-xs text-muted-foreground">Linked to invoice line #{l.invoiceLineId}</div>
                               ) : null}

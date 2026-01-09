@@ -1,1 +1,1 @@
-{"version":3,"file":"purchaseOrders.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/purchases/purchaseOrders.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AAoB/C,wBAAsB,oBAAoB,CAAC,OAAO,EAAE,eAAe,iBAgvBlE"}
+{"version":3,"file":"purchaseOrders.routes.d.ts","sourceRoot":"","sources":["../../../src/modules/purchases/purchaseOrders.routes.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,SAAS,CAAC;AA2B/C,wBAAsB,oBAAoB,CAAC,OAAO,EAAE,eAAe,iBA02ClE"}

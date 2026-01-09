@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { SelectNative } from '@/components/ui/select-native';
+import { ItemCombobox } from '@/components/item-combobox';
 import { Plus, Trash2, ArrowLeft, ChevronDown, Search, Loader2 } from 'lucide-react';
 import { Separator } from '@/components/ui/separator';
 import {
@@ -31,6 +32,7 @@ type TaxOption = {
 
 type CreditNoteLine = {
   itemId: string
+  itemText: string
   description: string
   quantity: number
   unitPrice: number
@@ -43,9 +45,16 @@ export default function NewCreditNoteWithTaxPage() {
   const router = useRouter();
   const search = useSearchParams();
   const tz = companySettings?.timeZone ?? 'Asia/Yangon';
+  const baseCurrency = useMemo(() => {
+    const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
+    return cur || null;
+  }, [companySettings?.baseCurrency]);
 
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
+  const [locations, setLocations] = useState<any[]>([]);
+  const [stockLocationId, setStockLocationId] = useState<number | null>(null);
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
   const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +65,7 @@ export default function NewCreditNoteWithTaxPage() {
   const [customerId, setCustomerId] = useState('');
   const [creditNoteDate, setCreditNoteDate] = useState('');
   const [lines, setLines] = useState<CreditNoteLine[]>([
-    { itemId: '', description: '', quantity: 1, unitPrice: 0, taxRateId: '', taxType: '' }
+    { itemId: '', itemText: '', description: '', quantity: 1, unitPrice: 0, taxRateId: '', taxType: '' }
   ]);
   const [sourceInvoice, setSourceInvoice] = useState<any>(null);
 
@@ -71,9 +80,19 @@ export default function NewCreditNoteWithTaxPage() {
       fetchApi(`/companies/${user.companyId}/customers`),
       fetchApi(`/companies/${user.companyId}/items`),
       fetchApi(`/companies/${user.companyId}/taxes`),
-    ]).then(([cust, itm, taxes]) => {
+      fetchApi(`/companies/${user.companyId}/locations`),
+      fetchApi(`/companies/${user.companyId}/settings`).catch(() => null),
+    ]).then(([cust, itm, taxes, locs, settings]) => {
       setCustomers(cust);
       setItems(itm);
+      setLocations(locs ?? []);
+      const defId =
+        settings && typeof settings === 'object'
+          ? Number(((settings as any).defaultLocationId ?? (settings as any).defaultWarehouseId ?? 0) || 0) || null
+          : null;
+      const fallbackId =
+        defId ?? (Number(((locs ?? []) as any[]).find((l: any) => l?.isDefault)?.id ?? 0) || null);
+      setStockLocationId(fallbackId);
       
       const options: TaxOption[] = [
         ...(taxes.taxRates || []).map((r: any) => ({
@@ -93,6 +112,37 @@ export default function NewCreditNoteWithTaxPage() {
     }).catch(console.error);
   }, [user?.companyId]);
 
+  // Stock on hand map for the default location (credit note has no location field yet).
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!stockLocationId) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(stockLocationId))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.companyId, stockLocationId]);
+
   useEffect(() => {
     if (!user?.companyId) return;
     const invoiceId = search?.get('invoiceId');
@@ -107,6 +157,7 @@ export default function NewCreditNoteWithTaxPage() {
           setLines(
             invLines.map((l: any) => ({
               itemId: String(l.itemId),
+              itemText: String(l.item?.name ?? ''),
               description: l.description ?? l.item?.name ?? '',
               quantity: 1,
               unitPrice: Number(l.unitPrice ?? 0),
@@ -119,6 +170,12 @@ export default function NewCreditNoteWithTaxPage() {
       .catch((e) => setError(e?.message ?? String(e)));
   }, [user?.companyId, search]);
 
+  const selectedLocationLabel = useMemo(() => {
+    if (!stockLocationId) return null;
+    const loc = (locations ?? []).find((l: any) => Number(l?.id) === Number(stockLocationId));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [locations, stockLocationId]);
+
   function updateLine(idx: number, patch: Partial<CreditNoteLine>) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
@@ -128,8 +185,25 @@ export default function NewCreditNoteWithTaxPage() {
     const next = [...lines];
     next[index].itemId = itemId;
     if (item) {
+      (next[index] as any).itemText = String(item.name ?? '');
       next[index].unitPrice = Number(item.sellingPrice);
       next[index].description = item.name;
+    }
+    setLines(next);
+  }
+
+  function handleItemTextChange(index: number, text: string) {
+    const normalized = String(text ?? '').trim();
+    const item = items.find((i: any) => String(i.name ?? '').trim().toLowerCase() === normalized.toLowerCase());
+    const next = [...lines];
+    (next[index] as any).itemText = text;
+    if (item) {
+      next[index].itemId = String(item.id);
+      next[index].unitPrice = Number(item.sellingPrice ?? 0);
+      next[index].description = String(item.name ?? '');
+    } else {
+      next[index].itemId = '';
+      next[index].description = text;
     }
     setLines(next);
   }
@@ -149,7 +223,10 @@ export default function NewCreditNoteWithTaxPage() {
   };
 
   function addLine() {
-    setLines((prev) => [...prev, { itemId: '', description: '', quantity: 1, unitPrice: 0, taxRateId: '', taxType: '' }]);
+    setLines((prev) => [
+      ...prev,
+      { itemId: '', itemText: '', description: '', quantity: 1, unitPrice: 0, taxRateId: '', taxType: '' },
+    ]);
   }
 
   function removeLine(idx: number) {
@@ -326,17 +403,29 @@ export default function NewCreditNoteWithTaxPage() {
               return (
                 <div key={index} className="grid grid-cols-12 gap-2 items-start py-2">
                   <div className="col-span-3">
-                    <SelectNative
-                      required
-                      value={line.itemId}
-                      onChange={(e) => handleItemChange(index, e.target.value)}
-                      className="text-sm"
-                    >
-                      <option value="">Type or click to select an item.</option>
-                      {items.map((i) => (
-                        <option key={i.id} value={i.id}>{i.name}</option>
-                      ))}
-                    </SelectNative>
+                    <Input className="hidden" />
+                    <ItemCombobox
+                      items={(items ?? []).map((i: any) => ({
+                        id: Number(i.id),
+                        name: String(i.name ?? ''),
+                        sku: i.sku ?? null,
+                        sellingPrice: i.sellingPrice,
+                        costPrice: i.costPrice,
+                        trackInventory: !!i.trackInventory,
+                      }))}
+                      valueText={
+                        (line as any).itemText ??
+                        (line.itemId ? (items.find((i: any) => String(i.id) === String(line.itemId))?.name ?? '') : '')
+                      }
+                      placeholder="Type or click to select an item…"
+                      onChangeText={(t) => handleItemTextChange(index, t)}
+                      onSelectItem={(it) => handleItemChange(index, String(it.id))}
+                      stockByItemId={stockByItemId}
+                      selectedLocationLabel={selectedLocationLabel}
+                      currencyLabel={baseCurrency}
+                      addNewHref="/items/new"
+                      disabled={!items.length}
+                    />
                   </div>
                   <div className="col-span-1">
                     <Input

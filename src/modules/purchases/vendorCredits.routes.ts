@@ -15,6 +15,7 @@ import { requireAnyRole, Roles } from '../../utils/rbac.js';
 import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
+import { ensureTaxReceivableAccountIfNeeded } from '../../utils/tax.js';
 
 export async function vendorCreditsRoutes(fastify: FastifyInstance) {
   fastify.addHook('preHandler', fastify.authenticate);
@@ -77,7 +78,15 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
       currency?: string;
       locationId?: number;
       warehouseId?: number;
-      lines?: { itemId?: number; quantity?: number; unitCost?: number; description?: string; accountId?: number }[];
+      lines?: {
+        itemId?: number;
+        quantity?: number;
+        unitCost?: number;
+        discountAmount?: number;
+        taxRate?: number;
+        description?: string;
+        accountId?: number;
+      }[];
     };
 
     if (!body.lines?.length) {
@@ -112,12 +121,14 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
       return { error: 'locationId not found in this company' };
     }
 
-    let total = new Prisma.Decimal(0);
+    let subtotal = new Prisma.Decimal(0);
+    let taxAmount = new Prisma.Decimal(0);
     const computedLines: any[] = [];
     for (const [idx, l] of (body.lines ?? []).entries()) {
       const itemId = Number(l.itemId);
       const qty = Number(l.quantity ?? 0);
       const unitCost = Number(l.unitCost ?? 0);
+      const discountAmount = Number((l as any).discountAmount ?? 0);
       if (!itemId || Number.isNaN(itemId)) {
         reply.status(400);
         return { error: `lines[${idx}].itemId is required` };
@@ -129,6 +140,10 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
       if (!unitCost || unitCost <= 0) {
         reply.status(400);
         return { error: `lines[${idx}].unitCost must be > 0` };
+      }
+      if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+        reply.status(400);
+        return { error: `lines[${idx}].discountAmount must be >= 0` };
       }
 
       const item = await prisma.item.findFirst({
@@ -158,8 +173,21 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
 
       const qtyDec = new Prisma.Decimal(qty).toDecimalPlaces(2);
       const unitDec = new Prisma.Decimal(unitCost).toDecimalPlaces(2);
-      const lineTotal = qtyDec.mul(unitDec).toDecimalPlaces(2);
-      total = total.add(lineTotal);
+      const gross = qtyDec.mul(unitDec).toDecimalPlaces(2);
+      const disc = new Prisma.Decimal(discountAmount).toDecimalPlaces(2);
+      if (disc.greaterThan(gross)) {
+        reply.status(400);
+        return { error: `lines[${idx}].discountAmount cannot exceed line subtotal` };
+      }
+      const lineTotal = gross.sub(disc).toDecimalPlaces(2); // net subtotal (tax-exclusive)
+      const rate = new Prisma.Decimal(Number((l as any).taxRate ?? 0)).toDecimalPlaces(4);
+      if (rate.lessThan(0) || rate.greaterThan(1)) {
+        reply.status(400);
+        return { error: `lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)` };
+      }
+      const lineTax = lineTotal.mul(rate).toDecimalPlaces(2);
+      subtotal = subtotal.add(lineTotal);
+      taxAmount = taxAmount.add(lineTax);
 
       computedLines.push({
         companyId,
@@ -169,11 +197,16 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
         description: l.description ?? null,
         quantity: qtyDec,
         unitCost: unitDec,
-        lineTotal,
+        discountAmount: disc,
+        lineTotal, // net subtotal
+        taxRate: rate,
+        taxAmount: lineTax,
       });
     }
 
-    total = total.toDecimalPlaces(2);
+    subtotal = subtotal.toDecimalPlaces(2);
+    taxAmount = taxAmount.toDecimalPlaces(2);
+    const total = subtotal.add(taxAmount).toDecimalPlaces(2);
 
     const created = await prisma.$transaction(async (tx: any) => {
       const creditNumber = await nextVendorCreditNumber(tx as any, companyId);
@@ -186,6 +219,8 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
           status: 'DRAFT',
           creditDate,
           currency: body.currency ?? null,
+          subtotal,
+          taxAmount,
           total,
           amountApplied: new Prisma.Decimal(0),
           lines: { create: computedLines },
@@ -339,17 +374,20 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
               const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } });
               if (!apAcc) throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), { statusCode: 400 });
 
-              let total = new Prisma.Decimal(0);
+              let subtotal = new Prisma.Decimal(0);
+              let taxAmount = new Prisma.Decimal(0);
               const creditByAccount = new Map<number, Prisma.Decimal>();
 
               for (const [idx, l] of (vc.lines ?? []).entries()) {
                 const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                 const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
                 const lineTotal = new Prisma.Decimal(l.lineTotal).toDecimalPlaces(2);
+                const lineTax = new Prisma.Decimal((l as any).taxAmount ?? 0).toDecimalPlaces(2);
                 if (qty.lessThanOrEqualTo(0) || unitCost.lessThanOrEqualTo(0) || lineTotal.lessThanOrEqualTo(0)) {
                   throw Object.assign(new Error(`invalid line[${idx}] quantity/unitCost`), { statusCode: 400 });
                 }
-                total = total.add(lineTotal);
+                subtotal = subtotal.add(lineTotal);
+                taxAmount = taxAmount.add(lineTax);
 
                 const item = (l as any).item;
                 const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
@@ -394,8 +432,10 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
                 creditByAccount.set(creditAccountId, prev.add(lineTotal));
               }
 
-              total = total.toDecimalPlaces(2);
+              subtotal = subtotal.toDecimalPlaces(2);
+              taxAmount = taxAmount.toDecimalPlaces(2);
               const storedTotal = new Prisma.Decimal(vc.total).toDecimalPlaces(2);
+              const total = subtotal.add(taxAmount).toDecimalPlaces(2);
               if (!total.equals(storedTotal)) {
                 throw Object.assign(
                   new Error(`rounding mismatch: recomputed total ${total.toString()} != stored total ${storedTotal.toString()}`),
@@ -408,6 +448,12 @@ export async function vendorCreditsRoutes(fastify: FastifyInstance) {
                 debit: new Prisma.Decimal(0),
                 credit: amt.toDecimalPlaces(2),
               }));
+
+              const taxReceivableId = await ensureTaxReceivableAccountIfNeeded(tx as any, companyId, taxAmount);
+              if (taxAmount.greaterThan(0)) {
+                if (!taxReceivableId) throw Object.assign(new Error('tax receivable account required when taxAmount > 0'), { statusCode: 400 });
+                creditLines.push({ accountId: taxReceivableId, debit: new Prisma.Decimal(0), credit: taxAmount });
+              }
 
               const je = await postJournalEntry(tx as any, {
                 companyId,

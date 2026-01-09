@@ -204,7 +204,7 @@ export default function PaymentQrSettingsPage() {
                 <li>Upload your payment QR codes (from KBZ Pay, AYA Pay, etc.)</li>
                 <li>Customers will see these QR codes when viewing shared invoices</li>
                 <li>They can scan to pay, then upload their payment screenshot as proof</li>
-                <li>You'll review the proof and record the payment manually</li>
+                <li>You&apos;ll review the proof and record the payment manually</li>
               </ul>
             </div>
           </div>

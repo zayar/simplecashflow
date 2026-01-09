@@ -17,6 +17,7 @@ import Link from 'next/link';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { ItemCombobox } from '@/components/item-combobox';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,6 +43,7 @@ export default function NewInvoicePage() {
   const [taxSearchTerm, setTaxSearchTerm] = useState('');
   const [openTaxIdx, setOpenTaxIdx] = useState<number | null>(null);
   const timeZone = companySettings?.timeZone ?? 'Asia/Yangon';
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
   const baseCurrency = useMemo(() => {
     const cur = String(companySettings?.baseCurrency ?? '').trim().toUpperCase();
     return cur || null;
@@ -222,6 +224,38 @@ export default function NewInvoicePage() {
     }
   }, [user?.companyId]);
 
+  // Load stock on hand for the selected location (for item picker UX).
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!invoiceWarehouseId) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(invoiceWarehouseId))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, invoiceWarehouseId]);
+
   useEffect(() => {
     // Default date should follow company time zone (not UTC).
     if (!formData.invoiceDate) {
@@ -253,6 +287,13 @@ export default function NewInvoicePage() {
     }
     setLines(newLines);
   };
+
+  const selectedLocationLabel = useMemo(() => {
+    const id = invoiceWarehouseId ?? defaultWarehouseId;
+    if (!id) return null;
+    const loc = (warehouses ?? []).find((w: any) => Number(w?.id) === Number(id));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [warehouses, invoiceWarehouseId, defaultWarehouseId]);
 
   const updateLine = (index: number, field: string, value: any) => {
     const newLines = [...lines];
@@ -586,17 +627,29 @@ export default function NewInvoicePage() {
                             <div className="space-y-2">
                               <div className="space-y-2">
                                 <Input
-                                  placeholder="Type or click to select an item…"
-                                  list={`invoice-items-${index}`}
-                                  className="h-12 px-4 text-base"
-                                  value={(line as any).itemText ?? (line.itemId ? (items.find((i) => String(i.id) === String(line.itemId))?.name ?? '') : '')}
-                                  onChange={(e) => handleItemTextChange(index, e.target.value)}
+                                  className="hidden"
                                 />
-                                <datalist id={`invoice-items-${index}`}>
-                                  {items.map((i) => (
-                                    <option key={i.id} value={i.name} />
-                                  ))}
-                                </datalist>
+                                <ItemCombobox
+                                  items={(items ?? []).map((i: any) => ({
+                                    id: Number(i.id),
+                                    name: String(i.name ?? ''),
+                                    sku: i.sku ?? null,
+                                    sellingPrice: i.sellingPrice,
+                                    trackInventory: !!i.trackInventory,
+                                  }))}
+                                  valueText={
+                                    (line as any).itemText ??
+                                    (line.itemId ? (items.find((i) => String(i.id) === String(line.itemId))?.name ?? '') : '')
+                                  }
+                                  placeholder="Type or click to select an item…"
+                                  onChangeText={(text) => handleItemTextChange(index, text)}
+                                  onSelectItem={(it) => handleItemTextChange(index, it.name)}
+                                  stockByItemId={stockByItemId}
+                                  selectedLocationLabel={selectedLocationLabel}
+                                  currencyLabel={customerCurrency ?? baseCurrency ?? null}
+                                  addNewHref="/items/new"
+                                  disabled={!items.length}
+                                />
                                 <Textarea
                                   value={(line as any).description ?? ''}
                                   onChange={(e) => updateLine(index, 'description', e.target.value)}

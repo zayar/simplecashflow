@@ -394,9 +394,16 @@ export default function InvoiceDetailPage() {
   const canReceivePayment = invoice.status === "POSTED" || invoice.status === "PARTIAL"
   const creditsAvailable = Number((invoice as any)?.creditsAvailable ?? 0)
   const canApplyCredits = canReceivePayment && creditsAvailable > 0 && Number((invoice as any)?.remainingBalance ?? 0) > 0
-  const canEdit = invoice.status === "DRAFT"
+  const hasTrackedInventoryLines =
+    (invoice?.lines ?? []).some((l: any) => l?.item?.type === "GOODS" && !!l?.item?.trackInventory)
+  const issuedCreditNotesPostedCount = Number((invoice as any)?.issuedCreditNotesPostedCount ?? 0) || 0
+  const isUnpaid = Number((invoice as any)?.totalPaid ?? 0) <= 0
+
+  const canEditDraft = invoice.status === "DRAFT"
+  const canEditPosted = invoice.status === "POSTED" && isUnpaid && issuedCreditNotesPostedCount <= 0 && !hasTrackedInventoryLines
+  const canEdit = canEditDraft || canEditPosted
   const canDelete = (invoice.status === "DRAFT" || invoice.status === "APPROVED") && !invoice.journalEntryId
-  const canVoid = invoice.status === "POSTED" && Number((invoice as any)?.totalPaid ?? 0) <= 0
+  const canVoid = invoice.status === "POSTED" && isUnpaid && issuedCreditNotesPostedCount <= 0
 
   return (
     <div className="space-y-6">
@@ -468,10 +475,12 @@ export default function InvoiceDetailPage() {
                   <Pencil className="h-4 w-4" /> Edit
                 </Button>
               </Link>
-              <Button onClick={postInvoice} disabled={posting}>
-                {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                {posting ? "Posting..." : "Post"}
-              </Button>
+              {canEditDraft ? (
+                <Button onClick={postInvoice} disabled={posting}>
+                  {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  {posting ? "Posting..." : "Post"}
+                </Button>
+              ) : null}
             </>
           ) : null}
           {canReceivePayment && (
@@ -518,7 +527,7 @@ export default function InvoiceDetailPage() {
                 }}
                 disabled={!canVoid}
               >
-                Void invoice
+                Delete (void) invoice
               </DropdownMenuItem>
               {canDelete ? (
                 <DropdownMenuItem

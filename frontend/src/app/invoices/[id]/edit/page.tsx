@@ -18,6 +18,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { AccountPicker } from '@/components/account-picker';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { ItemCombobox } from '@/components/item-combobox';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,6 +43,14 @@ export default function EditInvoicePage() {
   const [loading, setLoading] = useState(false);
   const [loadingDoc, setLoadingDoc] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [docStatus, setDocStatus] = useState<string | null>(null);
+  const [adjustReason, setAdjustReason] = useState('');
+
+  const makeIdempotencyKey = () => {
+    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? (crypto as any).randomUUID()
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
 
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
@@ -53,6 +62,7 @@ export default function EditInvoicePage() {
   const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
   const [taxSearchTerm, setTaxSearchTerm] = useState('');
   const [openTaxIdx, setOpenTaxIdx] = useState<number | null>(null);
+  const [stockByItemId, setStockByItemId] = useState<Record<number, number>>({});
   // Accounting is always visible on the line items table (per reference UI).
 
   const incomeAccounts = useMemo(
@@ -155,6 +165,45 @@ export default function EditInvoicePage() {
       .catch(console.error);
   }, [user?.companyId]);
 
+  // Load stock on hand for selected location (for item picker UX).
+  useEffect(() => {
+    if (!user?.companyId) return;
+    if (!invoiceWarehouseId) {
+      setStockByItemId({});
+      return;
+    }
+    let cancelled = false;
+    const qs = `?locationId=${encodeURIComponent(String(invoiceWarehouseId))}`;
+    fetchApi(`/companies/${user.companyId}/reports/inventory-summary${qs}`)
+      .then((rows) => {
+        if (cancelled) return;
+        const map: Record<number, number> = {};
+        (Array.isArray(rows) ? rows : []).forEach((r: any) => {
+          const itemId = Number(r?.item?.id ?? r?.itemId ?? 0);
+          const qty = Number(r?.qtyOnHand ?? r?.qty ?? 0);
+          if (Number.isFinite(itemId) && itemId > 0 && Number.isFinite(qty)) {
+            map[itemId] = qty;
+          }
+        });
+        setStockByItemId(map);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStockByItemId({});
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.companyId, invoiceWarehouseId]);
+
+  const selectedLocationLabel = useMemo(() => {
+    const id = invoiceWarehouseId ?? defaultWarehouseId;
+    if (!id) return null;
+    const loc = (warehouses ?? []).find((w: any) => Number(w?.id) === Number(id));
+    return loc ? String(loc.name ?? '').trim() || null : null;
+  }, [warehouses, invoiceWarehouseId, defaultWarehouseId]);
+
   useEffect(() => {
     if (!formData.invoiceDate) {
       setFormData((prev) => ({ ...prev, invoiceDate: todayInTimeZone(timeZone) }));
@@ -240,9 +289,37 @@ export default function EditInvoicePage() {
     setError(null);
     fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`)
       .then((inv) => {
-        if (inv?.status !== 'DRAFT') {
-          setError('Only DRAFT invoices can be edited.');
+        const status = String(inv?.status ?? '');
+        const totalPaid = Number(inv?.totalPaid ?? 0);
+        const issuedCn = Number(inv?.issuedCreditNotesPostedCount ?? 0) || 0;
+        const hasTracked = ((inv?.lines ?? []) as any[]).some(
+          (l: any) => l?.item?.type === 'GOODS' && !!l?.item?.trackInventory
+        );
+        const hasCustom = ((inv?.lines ?? []) as any[]).some((l: any) => !Number(l?.itemId ?? 0));
+
+        setDocStatus(status);
+
+        if (status === 'PAID' || status === 'PARTIAL' || totalPaid > 0) {
+          setError("This invoice has been paid/partially paid and can't be edited.");
           return;
+        }
+        if (status !== 'DRAFT' && status !== 'POSTED') {
+          setError('This invoice cannot be edited in its current status.');
+          return;
+        }
+        if (status === 'POSTED') {
+          if (issuedCn > 0) {
+            setError("This invoice has posted credit notes. Void the credit notes first (or void & reissue the invoice).");
+            return;
+          }
+          if (hasTracked) {
+            setError("This invoice contains tracked inventory lines and can't be adjusted. Use credit note / void + reissue.");
+            return;
+          }
+          if (hasCustom) {
+            setError("This posted invoice has custom (no-item) lines and can't be adjusted. Void + reissue.");
+            return;
+          }
         }
         setFormData({
           customerId: String(inv.customerId ?? inv.customer?.id ?? ''),
@@ -359,32 +436,69 @@ export default function EditInvoicePage() {
     try {
       const showFx = !!(isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0);
       const factor = showFx ? fxRateToBase! : 1;
-      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          customerId: Number(formData.customerId),
-          locationId: invoiceWarehouseId || undefined,
-          invoiceDate: formData.invoiceDate,
-          dueDate: formData.dueDate || null,
-          customerNotes: formData.customerNotes || null,
-          termsAndConditions: formData.termsAndConditions || null,
-          lines: lines.map((l: any) => {
-            const itemIdNum = Number(l.itemId || 0);
-            return {
-              ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
-              description: String(l.description ?? l.itemText ?? '').trim() || undefined,
-            quantity: Number(l.quantity),
-            unitPrice: Number(l.unitPrice) * factor,
-            taxRate: Number((l as any).taxRate || 0),
-            discountAmount: Number((l as any).discount || 0) * factor,
-            incomeAccountId:
-              Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
-                ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
-                : undefined,
-            };
-          }),
-        }),
+      const status = String(docStatus ?? 'DRAFT');
+      const payloadLines = lines.map((l: any) => {
+        const itemIdNum = Number(l.itemId || 0);
+        return {
+          ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
+          description: String(l.description ?? l.itemText ?? '').trim() || undefined,
+          quantity: Number(l.quantity),
+          unitPrice: Number(l.unitPrice) * factor,
+          taxRate: Number((l as any).taxRate || 0),
+          discountAmount: Number((l as any).discount || 0) * factor,
+          incomeAccountId:
+            Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
+              ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
+              : undefined,
+        };
       });
+
+      if (status === 'POSTED') {
+        const reason = adjustReason.trim();
+        if (!reason) {
+          setError('Adjustment reason is required for posted invoices.');
+          return;
+        }
+        const badLineIdx = payloadLines.findIndex((l: any) => !Number(l?.itemId ?? 0));
+        if (badLineIdx >= 0) {
+          setError('Posted invoice adjustments require selecting an item for every line (no custom/free-text lines).');
+          return;
+        }
+
+        await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/adjust`, {
+          method: 'POST',
+          headers: { 'Idempotency-Key': makeIdempotencyKey() },
+          body: JSON.stringify({
+            reason,
+            adjustmentDate: formData.invoiceDate,
+            dueDate: formData.dueDate || null,
+            customerNotes: formData.customerNotes || null,
+            termsAndConditions: formData.termsAndConditions || null,
+            lines: payloadLines.map((l: any) => ({
+              itemId: Number(l.itemId),
+              description: l.description,
+              quantity: l.quantity,
+              unitPrice: l.unitPrice,
+              taxRate: l.taxRate,
+              discountAmount: l.discountAmount,
+              incomeAccountId: l.incomeAccountId,
+            })),
+          }),
+        });
+      } else {
+        await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            customerId: Number(formData.customerId),
+            locationId: invoiceWarehouseId || undefined,
+            invoiceDate: formData.invoiceDate,
+            dueDate: formData.dueDate || null,
+            customerNotes: formData.customerNotes || null,
+            termsAndConditions: formData.termsAndConditions || null,
+            lines: payloadLines,
+          }),
+        });
+      }
       router.push(`/invoices/${invoiceId}`);
     } catch (err: any) {
       console.error(err);
@@ -404,7 +518,11 @@ export default function EditInvoicePage() {
         </Link>
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Edit Invoice</h1>
-          <p className="text-sm text-muted-foreground">Edit a draft invoice before posting.</p>
+          <p className="text-sm text-muted-foreground">
+            {String(docStatus ?? 'DRAFT') === 'POSTED'
+              ? 'This invoice is posted. Saving will create an adjustment journal entry (ledger-safe).'
+              : 'Edit a draft invoice before posting.'}
+          </p>
         </div>
       </div>
 
@@ -431,6 +549,7 @@ export default function EditInvoicePage() {
                     id="customer"
                     required
                     value={formData.customerId}
+                    disabled={String(docStatus ?? 'DRAFT') === 'POSTED'}
                     onChange={(e) => setFormData({ ...formData, customerId: e.target.value })}
                   >
                     <option value="">Select Customer</option>
@@ -448,6 +567,7 @@ export default function EditInvoicePage() {
                     type="date"
                     required
                     value={formData.invoiceDate}
+                    disabled={String(docStatus ?? 'DRAFT') === 'POSTED'}
                     onChange={(e) => setFormData({ ...formData, invoiceDate: e.target.value })}
                   />
                 </div>
@@ -466,6 +586,7 @@ export default function EditInvoicePage() {
                     <SelectNative
                       id="branch"
                       value={invoiceWarehouseId ? String(invoiceWarehouseId) : ''}
+                      disabled={String(docStatus ?? 'DRAFT') === 'POSTED'}
                       onChange={(e) => {
                         const nextId = e.target.value ? Number(e.target.value) : null;
                         setInvoiceWarehouseId(nextId);
@@ -497,7 +618,7 @@ export default function EditInvoicePage() {
                           alert(err?.message ?? 'Failed to update company default warehouse');
                         }
                       }}
-                      disabled={!invoiceWarehouseId}
+                      disabled={!invoiceWarehouseId || String(docStatus ?? 'DRAFT') === 'POSTED'}
                     >
                       Set as default
                     </Button>
@@ -508,6 +629,24 @@ export default function EditInvoicePage() {
                 </div>
               </CardContent>
             </Card>
+
+            {String(docStatus ?? 'DRAFT') === 'POSTED' ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Adjustment Reason</CardTitle>
+                </CardHeader>
+                <CardContent className="grid gap-2">
+                  <Label htmlFor="adjustReason">Reason *</Label>
+                  <Input
+                    id="adjustReason"
+                    placeholder="e.g. Price correction / quantity correction"
+                    value={adjustReason}
+                    onChange={(e) => setAdjustReason(e.target.value)}
+                    required
+                  />
+                </CardContent>
+              </Card>
+            ) : null}
 
             {isFxCustomer ? (
               <Card>
@@ -644,17 +783,31 @@ export default function EditInvoicePage() {
                             <TableCell className="align-top">
                               <div className="space-y-2">
                                 <Input
-                                  placeholder="Type or click to select an item…"
-                                  list={`invoice-items-${index}`}
-                                  className="h-12 px-4 text-base"
-                                  value={(line as any).itemText ?? ((line as any).itemId ? (items.find((i) => String(i.id) === String((line as any).itemId))?.name ?? '') : '')}
-                                  onChange={(e) => handleItemTextChange(index, e.target.value)}
+                                  className="hidden"
                                 />
-                                <datalist id={`invoice-items-${index}`}>
-                                  {items.map((i) => (
-                                    <option key={i.id} value={i.name} />
-                                  ))}
-                                </datalist>
+                                <ItemCombobox
+                                  items={(items ?? []).map((i: any) => ({
+                                    id: Number(i.id),
+                                    name: String(i.name ?? ''),
+                                    sku: i.sku ?? null,
+                                    sellingPrice: i.sellingPrice,
+                                    trackInventory: !!i.trackInventory,
+                                  }))}
+                                  valueText={
+                                    (line as any).itemText ??
+                                    ((line as any).itemId
+                                      ? (items.find((i) => String(i.id) === String((line as any).itemId))?.name ?? '')
+                                      : '')
+                                  }
+                                  placeholder="Type or click to select an item…"
+                                  onChangeText={(text) => handleItemTextChange(index, text)}
+                                  onSelectItem={(it) => handleItemTextChange(index, it.name)}
+                                  stockByItemId={stockByItemId}
+                                  selectedLocationLabel={selectedLocationLabel}
+                                  currencyLabel={customerCurrency ?? baseCurrency ?? null}
+                                  addNewHref="/items/new"
+                                  disabled={!items.length}
+                                />
                                 <Textarea
                                   value={(line as any).description ?? ''}
                                   onChange={(e) => updateLine(index, 'description', e.target.value)}
