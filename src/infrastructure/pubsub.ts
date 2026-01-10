@@ -1,6 +1,7 @@
 import { PubSub } from '@google-cloud/pubsub';
 import type { DomainEventEnvelopeV1 } from '../events/domainEvent.js';
 import { prisma } from './db.js';
+import { runWithoutPerf } from './perf.js';
 
 const pubsub = new PubSub();
 const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC || 'cashflow-events';
@@ -109,8 +110,11 @@ export function buildEventEnvelope(eventRow: {
  * @param eventId - The eventId to publish (must exist in the Event table)
  */
 export function publishEventFastPath(eventId: string): void {
-  // Fire and forget - don't await
-  void publishEventFastPathAsync(eventId);
+  // Fire and forget - don't await.
+  // Detach perf context so request timings measure only synchronous work.
+  runWithoutPerf(() => {
+    void publishEventFastPathAsync(eventId);
+  });
 }
 
 /**
@@ -119,9 +123,11 @@ export function publishEventFastPath(eventId: string): void {
  * @param eventIds - Array of eventIds to publish
  */
 export function publishEventsFastPath(eventIds: string[]): void {
-  for (const eventId of eventIds) {
-    void publishEventFastPathAsync(eventId);
-  }
+  runWithoutPerf(() => {
+    for (const eventId of eventIds) {
+      void publishEventFastPathAsync(eventId);
+    }
+  });
 }
 
 /**

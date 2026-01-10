@@ -253,7 +253,7 @@ export default function InvoiceDetailPage() {
 
   const deleteInvoice = async () => {
     if (!user?.companyId || !invoiceId) return
-    if (!confirm("Delete this invoice? This is only allowed for DRAFT/APPROVED invoices.")) return
+    if (!confirm("Delete this invoice? This is only allowed for DRAFT/APPROVED invoices (no payments, no applied credits/advances, no credit notes).")) return
     try {
       await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}`, {
         method: "DELETE",
@@ -396,11 +396,13 @@ export default function InvoiceDetailPage() {
   const canApplyCredits = canReceivePayment && creditsAvailable > 0 && Number((invoice as any)?.remainingBalance ?? 0) > 0
   const hasTrackedInventoryLines =
     (invoice?.lines ?? []).some((l: any) => l?.item?.type === "GOODS" && !!l?.item?.trackInventory)
+  const hasCustomLines = (invoice?.lines ?? []).some((l: any) => !Number(l?.itemId ?? 0))
   const issuedCreditNotesPostedCount = Number((invoice as any)?.issuedCreditNotesPostedCount ?? 0) || 0
   const isUnpaid = Number((invoice as any)?.totalPaid ?? 0) <= 0
 
   const canEditDraft = invoice.status === "DRAFT"
-  const canEditPosted = invoice.status === "POSTED" && isUnpaid && issuedCreditNotesPostedCount <= 0 && !hasTrackedInventoryLines
+  const canEditPosted =
+    invoice.status === "POSTED" && isUnpaid && issuedCreditNotesPostedCount <= 0 && !hasTrackedInventoryLines && !hasCustomLines
   const canEdit = canEditDraft || canEditPosted
   const canDelete = (invoice.status === "DRAFT" || invoice.status === "APPROVED") && !invoice.journalEntryId
   const canVoid = invoice.status === "POSTED" && isUnpaid && issuedCreditNotesPostedCount <= 0

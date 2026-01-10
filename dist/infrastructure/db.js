@@ -1,5 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { getTenantCompanyId } from './tenantContext.js';
+import { addDbQuerySample, getPerfStore, isPerfEnabled } from './perf.js';
+import { performance } from 'node:perf_hooks';
 // Base Prisma client (no tenant isolation). Use ONLY when you intentionally need
 // cross-tenant access (e.g., global uniqueness checks for phone OTP).
 export const rawPrisma = new PrismaClient();
@@ -19,6 +21,30 @@ rawPrisma.$use(async (params, next) => {
         }
     }
     return next(params);
+});
+// Lightweight perf instrumentation (env-gated):
+// - counts Prisma operations per request (via AsyncLocalStorage context)
+// - sums DB time
+// - captures slow query samples
+const PERF_SLOW_QUERY_MS = Number(process.env.PERF_SLOW_QUERY_MS ?? 50);
+rawPrisma.$use(async (params, next) => {
+    // avoid any overhead if perf is disabled or no request context exists
+    if (!isPerfEnabled() || !getPerfStore())
+        return next(params);
+    const t0 = performance.now();
+    try {
+        return await next(params);
+    }
+    finally {
+        const ms = performance.now() - t0;
+        // With `exactOptionalPropertyTypes`, do not set optional fields to `undefined`.
+        const sample = { ms };
+        if (params.model)
+            sample.model = String(params.model);
+        if (params.action)
+            sample.operation = String(params.action);
+        addDbQuerySample(sample, PERF_SLOW_QUERY_MS);
+    }
 });
 // Tenant isolation (defense-in-depth): in request context (ALS), automatically inject companyId
 // into queries for tenant-scoped models. For operations that cannot safely accept extra filters

@@ -3,7 +3,7 @@ import { AccountType, BankingAccountKind, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
@@ -728,23 +728,14 @@ export async function purchaseBillsRoutes(fastify) {
         const lockKey = `lock:purchase-bill:post:${companyId}:${purchaseBillId}`;
         const pre = await prisma.purchaseBill.findFirst({
             where: { id: purchaseBillId, companyId },
-            select: {
-                id: true,
-                locationId: true,
-                lines: { select: { itemId: true, item: { select: { type: true, trackInventory: true } } } },
-            },
+            select: { id: true, locationId: true, lines: { select: { itemId: true } } },
         });
         if (!pre) {
             reply.status(404);
             return { error: 'purchase bill not found' };
         }
-        // Only lock stock for tracked inventory items (avoid unnecessary conflicts for services/non-inventory).
-        const trackedItemIds = Array.from(new Set((pre.lines ?? [])
-            .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
-            .map((l) => Number(l.itemId))
-            .filter((n) => Number.isFinite(n) && n > 0)));
-        const stockLocks = trackedItemIds.map((itemId) => `lock:stock:${companyId}:${pre.locationId}:${itemId}`);
-        const { replay, response: result } = await runWithResourceLockRetry(() => withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
+        const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 // DB-level serialization safety: lock the purchase bill row so concurrent posts
                 // (with different idempotency keys) cannot double-post.
@@ -765,24 +756,21 @@ export async function purchaseBillsRoutes(fastify) {
                 if (bill.status !== 'DRAFT' && bill.status !== 'APPROVED') {
                     throw Object.assign(new Error('only DRAFT/APPROVED purchase bills can be posted'), { statusCode: 400 });
                 }
-                // OPTIMIZED: Batch period check + inventory config + AP account validation in parallel
+                // Period-close guard: block posting into closed periods (backdating rule).
+                await assertOpenPeriodOrThrow(tx, {
+                    companyId,
+                    transactionDate: new Date(bill.billDate),
+                    action: 'purchase_bill.post',
+                });
+                const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
+                if (!cfg.inventoryAssetAccountId) {
+                    throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                }
                 const apId = bill.company.accountsPayableAccountId;
                 if (!apId) {
                     throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
                 }
-                const [periodCheck, cfg, apAcc] = await Promise.all([
-                    assertOpenPeriodOrThrow(tx, {
-                        companyId,
-                        transactionDate: new Date(bill.billDate),
-                        action: 'purchase_bill.post',
-                    }).then(() => true),
-                    ensureInventoryCompanyDefaults(tx, companyId),
-                    tx.account.findFirst({ where: { id: apId, companyId, type: 'LIABILITY' } }),
-                ]);
-                void periodCheck;
-                if (!cfg.inventoryAssetAccountId) {
-                    throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
-                }
+                const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: 'LIABILITY' } });
                 if (!apAcc) {
                     throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), {
                         statusCode: 400,
@@ -1012,9 +1000,7 @@ export async function purchaseBillsRoutes(fastify) {
                     date: bill.billDate,
                     description: `Purchase Bill ${bill.billNumber}${bill.vendor ? ` for ${bill.vendor.name}` : ''}`,
                     createdByUserId: request.user?.userId ?? null,
-                    skipAccountValidation: true, // OPTIMIZED: accounts validated above
-                    skipPeriodCheck: true, // OPTIMIZED: already checked above
-                    skipLocationValidation: true, // OPTIMIZED: not using locationId in this JE
+                    skipAccountValidation: true,
                     lines: [
                         ...finalDebitLines,
                         { accountId: apAcc.id, debit: new Prisma.Decimal(0), credit: total },
@@ -1109,7 +1095,7 @@ export async function purchaseBillsRoutes(fastify) {
                 };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-        }, redis))));
+        }, redis)));
         // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
         if (!replay && result._jeEventId) {
             const ids = [result._jeEventId];
@@ -1757,9 +1743,7 @@ export async function purchaseBillsRoutes(fastify) {
                         date: paymentDate,
                         description: `Payment for Purchase Bill ${bill.billNumber}`,
                         createdByUserId: request.user?.userId ?? null,
-                        skipAccountValidation: true, // OPTIMIZED: accounts validated above
-                        skipPeriodCheck: true, // OPTIMIZED: already checked above
-                        skipLocationValidation: true, // OPTIMIZED: not using locationId in this JE
+                        skipAccountValidation: true,
                         lines: [
                             { accountId: apAcc.id, debit: amount, credit: new Prisma.Decimal(0) },
                             { accountId: bankAccount.id, debit: new Prisma.Decimal(0), credit: amount },

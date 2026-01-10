@@ -54,6 +54,8 @@ export default function EditPurchaseBillPage() {
   const [loadingDoc, setLoadingDoc] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<'edit' | 'adjust'>('edit');
+  const [adjustReason, setAdjustReason] = useState('');
 
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [locations, setLocations] = useState<any[]>([]);
@@ -157,8 +159,14 @@ export default function EditPurchaseBillPage() {
     fetchApi(`/companies/${user.companyId}/purchase-bills/${id}`)
       .then((data) => {
         setBill(data);
-        if (data?.status !== 'DRAFT') {
-          setError('Only DRAFT purchase bills can be edited.');
+        const st = String(data?.status ?? '');
+        if (st === 'DRAFT' || st === 'APPROVED') {
+          setMode('edit');
+        } else if (st === 'POSTED') {
+          setMode('adjust');
+          if (!adjustReason.trim()) setAdjustReason('Adjustment to posted purchase bill');
+        } else {
+          setError('This purchase bill cannot be changed. (Only DRAFT/APPROVED can be edited; POSTED can be adjusted.)');
           return;
         }
         setForm({
@@ -423,21 +431,40 @@ export default function EditPurchaseBillPage() {
     try {
       const showFx = !!(isFx && enterInEntryCurrency && fxRateToBase && fxRateToBase > 0);
       const factor = showFx ? fxRateToBase! : 1;
-      await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          vendorId: form.vendorId ? Number(form.vendorId) : null,
-          billDate: form.billDate,
-          dueDate: form.dueDate || null,
-          locationId: form.locationId ? Number(form.locationId) : undefined,
-          // Save in base currency; FX is only an entry helper.
-          lines: payloadLines.map((l) => ({
-            ...l,
-            unitCost: Number(l.unitCost) * factor,
-            discountAmount: Number(l.discountAmount ?? 0) * factor,
-          })),
-        }),
-      });
+      const baseLines = payloadLines.map((l) => ({
+        ...l,
+        unitCost: Number(l.unitCost) * factor,
+        discountAmount: Number(l.discountAmount ?? 0) * factor,
+      }));
+
+      if (mode === 'edit') {
+        await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            vendorId: form.vendorId ? Number(form.vendorId) : null,
+            billDate: form.billDate,
+            dueDate: form.dueDate || null,
+            locationId: form.locationId ? Number(form.locationId) : undefined,
+            // Save in base currency; FX is only an entry helper.
+            lines: baseLines,
+          }),
+        });
+      } else {
+        const reason = String(adjustReason ?? '').trim();
+        if (!reason) {
+          setError('Adjustment reason is required.');
+          setSaving(false);
+          return;
+        }
+        await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}/adjust`, {
+          method: 'POST',
+          body: JSON.stringify({
+            reason,
+            adjustmentDate: form.billDate,
+            lines: baseLines,
+          }),
+        });
+      }
       router.push(`/purchase-bills/${id}`);
     } catch (err: any) {
       setError(err?.message ?? 'Failed to update purchase bill');
@@ -455,12 +482,37 @@ export default function EditPurchaseBillPage() {
           </Button>
         </Link>
         <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Edit Purchase Bill</h1>
-          <p className="text-sm text-muted-foreground">Edit a draft purchase bill before posting.</p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {mode === 'adjust' ? 'Adjust Posted Purchase Bill' : 'Edit Purchase Bill'}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {mode === 'adjust'
+              ? 'Posted bills are immutable. This will create an adjustment journal entry.'
+              : 'Edit a DRAFT/APPROVED purchase bill before posting.'}
+          </p>
         </div>
       </div>
 
       {error ? <div className="text-sm text-red-600">{error}</div> : null}
+
+      {mode === 'adjust' ? (
+        <Card className="shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-lg">Adjustment Reason</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-2">
+            <Label>Reason (required)</Label>
+            <Input
+              value={adjustReason}
+              onChange={(e) => setAdjustReason(e.target.value)}
+              placeholder="e.g. Price correction / vendor discount / tax correction"
+            />
+            <div className="text-xs text-muted-foreground">
+              Inventory-affecting bills can’t be adjusted (use void + recreate).
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {loadingDoc ? (
         <Card className="shadow-sm">
@@ -479,7 +531,11 @@ export default function EditPurchaseBillPage() {
               <div className="grid gap-4 md:grid-cols-3">
                 <div className="grid gap-2">
                   <Label>Vendor (optional)</Label>
-                  <SelectNative value={form.vendorId} onChange={(e) => setForm({ ...form, vendorId: e.target.value })}>
+                  <SelectNative
+                    value={form.vendorId}
+                    onChange={(e) => setForm({ ...form, vendorId: e.target.value })}
+                    disabled={mode === 'adjust'}
+                  >
                     <option value="">—</option>
                     {vendors.map((v) => (
                       <option key={v.id} value={String(v.id)}>
@@ -489,18 +545,23 @@ export default function EditPurchaseBillPage() {
                   </SelectNative>
                 </div>
                 <div className="grid gap-2">
-                  <Label>Bill Date</Label>
+                  <Label>{mode === 'adjust' ? 'Adjustment Date' : 'Bill Date'}</Label>
                   <Input type="date" value={form.billDate} onChange={(e) => setForm({ ...form, billDate: e.target.value })} />
                 </div>
                 <div className="grid gap-2">
                   <Label>Due Date (optional)</Label>
-                  <Input type="date" value={form.dueDate} onChange={(e) => setForm({ ...form, dueDate: e.target.value })} />
+                  <Input
+                    type="date"
+                    value={form.dueDate}
+                    onChange={(e) => setForm({ ...form, dueDate: e.target.value })}
+                    disabled={mode === 'adjust'}
+                  />
                 </div>
               </div>
 
               <div className="grid gap-2 md:max-w-sm">
                 <Label>Location</Label>
-                <SelectNative value={form.locationId} onChange={(e) => setForm({ ...form, locationId: e.target.value })}>
+                <SelectNative value={form.locationId} onChange={(e) => setForm({ ...form, locationId: e.target.value })} disabled={mode === 'adjust'}>
                   <option value="">Company default</option>
                   {locations.map((l) => (
                     <option key={l.id} value={String(l.id)}>

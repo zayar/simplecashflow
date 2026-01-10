@@ -41,6 +41,7 @@ export default function NewInvoiceWithTaxPage() {
   const { user, companySettings } = useAuth();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
+  const [posting, setPosting] = useState(false);
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
   const [taxOptions, setTaxOptions] = useState<TaxOption[]>([]);
@@ -168,34 +169,76 @@ export default function NewInvoiceWithTaxPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user?.companyId) return;
+    // default submit = Save & Draft
+    await saveDraft();
+  };
+
+  const makeIdempotencyKey = () => {
+    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? (crypto as any).randomUUID()
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
+
+  const buildCreatePayload = () => {
+    return {
+      customerId: Number(formData.customerId),
+      invoiceDate: formData.invoiceDate,
+      dueDate: formData.dueDate || undefined,
+      lines: lines.map((l) => ({
+        itemId: Number(l.itemId),
+        description: l.description,
+        quantity: Number(l.quantity),
+        unitPrice: Number(l.unitPrice),
+        // NOTE: this page is legacy; tax is not sent to backend here.
+      })),
+    };
+  };
+
+  const saveDraft = async () => {
+    if (!user?.companyId) return null;
+    if (loading || posting) return null;
     
     setLoading(true);
     try {
-      // For now, submit without tax (backend needs migration first)
-      // Once migrated, add taxRateId and taxType to each line
-      await fetchApi(`/companies/${user.companyId}/invoices`, {
+      const created = await fetchApi(`/companies/${user.companyId}/invoices`, {
         method: 'POST',
-        body: JSON.stringify({
-          customerId: Number(formData.customerId),
-          invoiceDate: formData.invoiceDate,
-          dueDate: formData.dueDate || undefined,
-          lines: lines.map(l => ({
-            itemId: Number(l.itemId),
-            description: l.description,
-            quantity: Number(l.quantity),
-            unitPrice: Number(l.unitPrice),
-            // TODO: After migration, include:
-            // taxRate: l.taxRateId ? taxOptions.find(o => o.id.toString() === l.taxRateId)?.ratePercent / 100 : 0,
-          }))
-        }),
+        body: JSON.stringify(buildCreatePayload()),
       });
       router.push('/invoices');
+      return created;
     } catch (err) {
       console.error(err);
       alert('Failed to create invoice');
+      return null;
     } finally {
       setLoading(false);
+    }
+  };
+
+  const saveAndPost = async () => {
+    if (!user?.companyId) return;
+    if (loading || posting) return;
+    setPosting(true);
+    try {
+      const created = await fetchApi(`/companies/${user.companyId}/invoices`, {
+        method: 'POST',
+        body: JSON.stringify(buildCreatePayload()),
+      });
+      const invoiceId = Number((created as any)?.id ?? 0);
+      if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+        throw new Error('Failed to create invoice (missing id)');
+      }
+      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/post`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': makeIdempotencyKey() },
+        body: JSON.stringify({}),
+      });
+      router.push(`/invoices/${invoiceId}`);
+    } catch (err: any) {
+      console.error(err);
+      alert(err?.message ?? 'Failed to post invoice');
+    } finally {
+      setPosting(false);
     }
   };
 
@@ -492,11 +535,11 @@ export default function NewInvoiceWithTaxPage() {
             <Button type="button" variant="outline" onClick={() => router.back()}>
               Cancel
             </Button>
-            <Button type="button" variant="outline" disabled={loading}>
-              Save as Draft
+            <Button type="button" variant="outline" onClick={saveDraft} disabled={loading || posting}>
+              {loading ? 'Saving...' : 'Save & Draft'}
             </Button>
-            <Button type="submit" disabled={loading}>
-              {loading ? 'Saving...' : 'Save and Send'}
+            <Button type="button" onClick={saveAndPost} disabled={loading || posting}>
+              {posting ? 'Posting...' : 'Save & Post'}
             </Button>
           </div>
         </div>

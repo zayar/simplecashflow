@@ -3,7 +3,7 @@ import { AccountType, ItemType, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
@@ -130,23 +130,20 @@ export async function purchaseReceiptsRoutes(fastify) {
         const lockKey = `lock:purchase-receipt:create:${companyId}:${receiptDate.toISOString().slice(0, 10)}`;
         const { response } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const created = await prisma.$transaction(async (tx) => {
-                // OPTIMIZED: Batch validate vendor + location + purchaseOrder + all items in parallel
-                const lineItemIds = (body.lines ?? []).map((l) => Number(l.itemId)).filter((id) => Number.isInteger(id) && id > 0);
-                const [periodCheck, vendorResult, locResult, poResult, itemsResult] = await Promise.all([
-                    assertOpenPeriodOrThrow(tx, { companyId, transactionDate: receiptDate, action: 'purchase_receipt.create' }).then(() => true),
-                    body.vendorId ? tx.vendor.findFirst({ where: { id: body.vendorId, companyId }, select: { id: true } }) : Promise.resolve({ id: body.vendorId }),
-                    tx.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } }),
-                    body.purchaseOrderId ? tx.purchaseOrder.findFirst({ where: { id: body.purchaseOrderId, companyId }, select: { id: true } }) : Promise.resolve({ id: body.purchaseOrderId }),
-                    lineItemIds.length > 0 ? tx.item.findMany({ where: { id: { in: lineItemIds }, companyId }, select: { id: true, type: true, trackInventory: true } }) : Promise.resolve([]),
-                ]);
-                void periodCheck;
-                if (body.vendorId && !vendorResult)
-                    throw Object.assign(new Error('vendorId not found in this company'), { statusCode: 400 });
-                if (!locResult)
+                await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: receiptDate, action: 'purchase_receipt.create' });
+                if (body.vendorId) {
+                    const vendor = await tx.vendor.findFirst({ where: { id: body.vendorId, companyId } });
+                    if (!vendor)
+                        throw Object.assign(new Error('vendorId not found in this company'), { statusCode: 400 });
+                }
+                const loc = await tx.location.findFirst({ where: { id: locationId, companyId } });
+                if (!loc)
                     throw Object.assign(new Error('locationId not found in this company'), { statusCode: 400 });
-                if (body.purchaseOrderId && !poResult)
-                    throw Object.assign(new Error('purchaseOrderId not found in this company'), { statusCode: 400 });
-                const itemsById = new Map(itemsResult.map((i) => [i.id, i]));
+                if (body.purchaseOrderId) {
+                    const po = await tx.purchaseOrder.findFirst({ where: { id: body.purchaseOrderId, companyId } });
+                    if (!po)
+                        throw Object.assign(new Error('purchaseOrderId not found in this company'), { statusCode: 400 });
+                }
                 let total = new Prisma.Decimal(0);
                 const computedLines = [];
                 for (const [idx, l] of (body.lines ?? []).entries()) {
@@ -162,8 +159,10 @@ export async function purchaseReceiptsRoutes(fastify) {
                         throw Object.assign(new Error(`lines[${idx}].unitCost must be > 0`), { statusCode: 400 });
                     if (!Number.isFinite(discountAmount) || discountAmount < 0)
                         throw Object.assign(new Error(`lines[${idx}].discountAmount must be >= 0`), { statusCode: 400 });
-                    // OPTIMIZED: Check against pre-fetched items instead of individual query
-                    const item = itemsById.get(itemId);
+                    const item = await tx.item.findFirst({
+                        where: { id: itemId, companyId },
+                        select: { id: true, type: true, trackInventory: true },
+                    });
                     if (!item)
                         throw Object.assign(new Error(`lines[${idx}].itemId not found in this company`), { statusCode: 400 });
                     if (item.type !== ItemType.GOODS || !item.trackInventory) {
@@ -461,7 +460,7 @@ export async function purchaseReceiptsRoutes(fastify) {
         const correlationId = randomUUID();
         const occurredAt = isoNow();
         const lockKey = `lock:purchase-receipt:post:${companyId}:${purchaseReceiptId}`;
-        const { replay, response: result } = await runWithResourceLockRetry(() => withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 await tx.$queryRaw `
               SELECT id FROM PurchaseReceipt
@@ -476,21 +475,14 @@ export async function purchaseReceiptsRoutes(fastify) {
                     throw Object.assign(new Error('purchase receipt not found'), { statusCode: 404 });
                 if (r.status !== 'DRAFT')
                     throw Object.assign(new Error('only DRAFT purchase receipts can be posted'), { statusCode: 400 });
-                // OPTIMIZED: Batch period check + inventory config + GRNI in parallel
-                const [periodCheck, cfg, grniId] = await Promise.all([
-                    assertOpenPeriodOrThrow(tx, { companyId, transactionDate: new Date(r.receiptDate), action: 'purchase_receipt.post' }).then(() => true),
-                    ensureInventoryCompanyDefaults(tx, companyId),
-                    ensureGrniAccount(tx, companyId),
-                ]);
-                void periodCheck;
+                await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: new Date(r.receiptDate), action: 'purchase_receipt.post' });
+                const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                 if (!cfg.inventoryAssetAccountId)
                     throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                const grniId = await ensureGrniAccount(tx, companyId);
                 const grniAcc = await tx.account.findFirst({ where: { id: grniId, companyId, type: AccountType.LIABILITY } });
                 if (!grniAcc)
                     throw Object.assign(new Error('GRNI account must be a LIABILITY in this company'), { statusCode: 400 });
-                // OPTIMIZED: Batch ensure inventory items
-                const itemIdsToEnsure = (r.lines ?? []).map((l) => l.itemId);
-                await Promise.all(itemIdsToEnsure.map((itemId) => ensureInventoryItem(tx, companyId, itemId)));
                 // Apply stock moves and compute total from lines
                 let total = new Prisma.Decimal(0);
                 let inventoryRecalcFromDate = null;
@@ -499,6 +491,7 @@ export async function purchaseReceiptsRoutes(fastify) {
                     if (!item || item.type !== ItemType.GOODS || !item.trackInventory) {
                         throw Object.assign(new Error(`line[${idx}] item must be tracked GOODS`), { statusCode: 400 });
                     }
+                    await ensureInventoryItem(tx, companyId, l.itemId);
                     const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                     const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
                     const lineTotal = new Prisma.Decimal(l.lineTotal).toDecimalPlaces(2);
@@ -541,9 +534,7 @@ export async function purchaseReceiptsRoutes(fastify) {
                     description: `Purchase Receipt ${r.receiptNumber}${r.vendor ? ` from ${r.vendor.name}` : ''}`,
                     locationId: r.locationId,
                     createdByUserId: request.user?.userId ?? null,
-                    skipAccountValidation: true, // OPTIMIZED: accounts from ensured company defaults
-                    skipPeriodCheck: true, // OPTIMIZED: already checked above
-                    skipLocationValidation: true, // OPTIMIZED: locationId from receipt row
+                    skipAccountValidation: true,
                     lines: [
                         { accountId: cfg.inventoryAssetAccountId, debit: total, credit: new Prisma.Decimal(0) },
                         { accountId: grniAcc.id, debit: new Prisma.Decimal(0), credit: total },
@@ -630,7 +621,7 @@ export async function purchaseReceiptsRoutes(fastify) {
                 };
             });
             return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-        }, redis))));
+        }, redis)));
         if (!replay && result._jeEventId) {
             const ids = [result._jeEventId];
             if (result._inventoryRecalcEventId)

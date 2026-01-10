@@ -3,7 +3,7 @@ import { AccountType, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { postJournalEntry } from '../ledger/posting.service.js';
 import { isoNow, parseDateInput } from '../../utils/date.js';
@@ -15,7 +15,6 @@ import { writeAuditLog } from '../../infrastructure/auditLog.js';
 import { createReversalJournalEntry } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
 import { ensureTaxReceivableAccountIfNeeded } from '../../utils/tax.js';
-import { assertOpenPeriodOrThrow } from '../../utils/periodClosePolicy.js';
 export async function vendorCreditsRoutes(fastify) {
     fastify.addHook('preHandler', fastify.authenticate);
     const redis = getRedis();
@@ -293,22 +292,13 @@ export async function vendorCreditsRoutes(fastify) {
         const lockKey = `lock:vendor-credit:post:${companyId}:${vendorCreditId}`;
         const pre = await prisma.vendorCredit.findFirst({
             where: { id: vendorCreditId, companyId },
-            select: {
-                id: true,
-                locationId: true,
-                lines: { select: { itemId: true, item: { select: { type: true, trackInventory: true } } } },
-            },
+            select: { id: true, locationId: true, lines: { select: { itemId: true } } },
         });
         if (!pre) {
             reply.status(404);
             return { error: 'vendor credit not found' };
         }
-        // Only lock stock for tracked inventory items (avoid unnecessary lock conflicts for services/non-inventory).
-        const trackedItemIds = Array.from(new Set((pre.lines ?? [])
-            .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
-            .map((l) => Number(l.itemId))
-            .filter((n) => Number.isFinite(n) && n > 0)));
-        const stockLocks = trackedItemIds.map((itemId) => `lock:stock:${companyId}:${pre.locationId}:${itemId}`);
+        const stockLocks = (pre.lines ?? []).map((l) => `lock:stock:${companyId}:${pre.locationId}:${l.itemId}`);
         try {
             const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
@@ -330,44 +320,16 @@ export async function vendorCreditsRoutes(fastify) {
                         // already posted
                         return { vendorCreditId: vc.id, status: vc.status, journalEntryId: vc.journalEntryId };
                     }
+                    const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                     const apId = vc.company.accountsPayableAccountId;
                     if (!apId)
                         throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
-                    const [periodCheck, cfg, apAcc] = await Promise.all([
-                        assertOpenPeriodOrThrow(tx, { companyId, transactionDate: new Date(vc.creditDate), action: 'vendor_credit.post' }).then(() => true),
-                        ensureInventoryCompanyDefaults(tx, companyId),
-                        tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } }),
-                    ]);
-                    void periodCheck;
+                    const apAcc = await tx.account.findFirst({ where: { id: apId, companyId, type: AccountType.LIABILITY } });
                     if (!apAcc)
                         throw Object.assign(new Error('accountsPayableAccountId must be a LIABILITY account in this company'), { statusCode: 400 });
                     let subtotal = new Prisma.Decimal(0);
                     let taxAmount = new Prisma.Decimal(0);
                     const creditByAccount = new Map();
-                    // Performance: precompute tracked and non-tracked needs to avoid N+1 validations.
-                    const trackedLineItemIds = Array.from(new Set((vc.lines ?? [])
-                        .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
-                        .map((l) => Number(l.itemId))
-                        .filter((n) => Number.isFinite(n) && n > 0)));
-                    if (trackedLineItemIds.length > 0) {
-                        if (!cfg.inventoryAssetAccountId) {
-                            throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
-                        }
-                        await Promise.all(trackedLineItemIds.map((itemId) => ensureInventoryItem(tx, companyId, itemId)));
-                    }
-                    const nonTrackedAccountIds = Array.from(new Set((vc.lines ?? [])
-                        .filter((l) => !(l?.item?.type === 'GOODS' && !!l?.item?.trackInventory))
-                        .map((l) => Number(l.accountId ?? l.item?.expenseAccountId ?? 0))
-                        .filter((n) => Number.isFinite(n) && n > 0)));
-                    const validExpenseAccounts = new Set();
-                    if (nonTrackedAccountIds.length > 0) {
-                        const rows = await tx.account.findMany({
-                            where: { companyId, type: AccountType.EXPENSE, id: { in: nonTrackedAccountIds } },
-                            select: { id: true },
-                        });
-                        for (const r of rows)
-                            validExpenseAccounts.add(r.id);
-                    }
                     for (const [idx, l] of (vc.lines ?? []).entries()) {
                         const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                         const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
@@ -382,7 +344,11 @@ export async function vendorCreditsRoutes(fastify) {
                         const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
                         let creditAccountId = l.accountId ?? null;
                         if (isTracked) {
+                            if (!cfg.inventoryAssetAccountId) {
+                                throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                            }
                             creditAccountId = cfg.inventoryAssetAccountId;
+                            await ensureInventoryItem(tx, companyId, l.itemId);
                             await applyStockMoveWac(tx, {
                                 companyId,
                                 locationId: vc.locationId,
@@ -409,12 +375,9 @@ export async function vendorCreditsRoutes(fastify) {
                             if (!creditAccountId) {
                                 throw Object.assign(new Error(`line[${idx}].accountId is required for non-inventory items`), { statusCode: 400 });
                             }
-                            if (!validExpenseAccounts.has(creditAccountId)) {
+                            const exp = await tx.account.findFirst({ where: { id: creditAccountId, companyId, type: AccountType.EXPENSE } });
+                            if (!exp)
                                 throw Object.assign(new Error(`line[${idx}].accountId must be an EXPENSE account`), { statusCode: 400 });
-                            }
-                        }
-                        if (!creditAccountId) {
-                            throw Object.assign(new Error(`line[${idx}] is missing credit account mapping`), { statusCode: 400 });
                         }
                         const prev = creditByAccount.get(creditAccountId) ?? new Prisma.Decimal(0);
                         creditByAccount.set(creditAccountId, prev.add(lineTotal));
@@ -443,7 +406,6 @@ export async function vendorCreditsRoutes(fastify) {
                         description: `Vendor Credit ${vc.creditNumber}${vc.vendor ? ` for ${vc.vendor.name}` : ''}`,
                         createdByUserId: request.user?.userId ?? null,
                         skipAccountValidation: true,
-                        skipPeriodCheck: true,
                         lines: [
                             { accountId: apAcc.id, debit: total, credit: new Prisma.Decimal(0) },
                             ...creditLines,
@@ -539,7 +501,7 @@ export async function vendorCreditsRoutes(fastify) {
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
-            const { replay, response: result } = await runWithResourceLockRetry(() => wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { replay, response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
               SELECT id FROM VendorCredit
@@ -643,7 +605,7 @@ export async function vendorCreditsRoutes(fastify) {
                     return { vendorCreditId: vc.id, status: 'VOID', voidJournalEntryId: reversal.id, _jeEventId: jeEventId };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-            }, redis)));
+            }, redis));
             // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
             if (!replay && result._jeEventId) {
                 publishEventsFastPath([result._jeEventId]);

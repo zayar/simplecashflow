@@ -235,7 +235,7 @@ export async function purchaseOrdersRoutes(fastify: FastifyInstance) {
     return response as any;
   });
 
-  // Update (DRAFT only)
+  // Update (DRAFT/APPROVED only; APPROVED requires no linked receipts/bills)
   fastify.put('/companies/:companyId/purchase-orders/:purchaseOrderId', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
     requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
@@ -295,9 +295,25 @@ export async function purchaseOrdersRoutes(fastify: FastifyInstance) {
               FOR UPDATE
             `;
 
-            const existing = await tx.purchaseOrder.findFirst({ where: { id: purchaseOrderId, companyId }, select: { id: true, status: true, poNumber: true } });
+            const existing = await tx.purchaseOrder.findFirst({
+              where: { id: purchaseOrderId, companyId },
+              select: { id: true, status: true, poNumber: true },
+            });
             if (!existing) throw Object.assign(new Error('purchase order not found'), { statusCode: 404 });
-            if (existing.status !== 'DRAFT') throw Object.assign(new Error('only DRAFT purchase orders can be edited'), { statusCode: 400 });
+            if (existing.status !== 'DRAFT' && existing.status !== 'APPROVED') {
+              throw Object.assign(new Error('only DRAFT/APPROVED purchase orders can be edited'), { statusCode: 400 });
+            }
+            if (existing.status === 'APPROVED') {
+              const [rc, bc] = await Promise.all([
+                tx.purchaseReceipt.count({ where: { companyId, purchaseOrderId } }),
+                tx.purchaseBill.count({ where: { companyId, purchaseOrderId } }),
+              ]);
+              if (rc > 0 || bc > 0) {
+                throw Object.assign(new Error('cannot edit an APPROVED purchase order that already has receipts/bills'), {
+                  statusCode: 400,
+                });
+              }
+            }
 
             await assertOpenPeriodOrThrow(tx as any, { companyId, transactionDate: orderDate, action: 'purchase_order.update' });
 
@@ -391,7 +407,7 @@ export async function purchaseOrdersRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Delete (DRAFT only)
+  // Delete (DRAFT/APPROVED only; APPROVED requires no linked receipts/bills)
   fastify.delete('/companies/:companyId/purchase-orders/:purchaseOrderId', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
     requireAnyRole(request as any, reply as any, [Roles.OWNER, Roles.ACCOUNTANT], 'OWNER or ACCOUNTANT');
@@ -417,9 +433,22 @@ export async function purchaseOrdersRoutes(fastify: FastifyInstance) {
               WHERE id = ${purchaseOrderId} AND companyId = ${companyId}
               FOR UPDATE
             `;
-            const po = await tx.purchaseOrder.findFirst({ where: { id: purchaseOrderId, companyId }, select: { id: true, status: true, poNumber: true, orderDate: true } });
+            const po = await tx.purchaseOrder.findFirst({
+              where: { id: purchaseOrderId, companyId },
+              select: { id: true, status: true, poNumber: true, orderDate: true },
+            });
             if (!po) throw Object.assign(new Error('purchase order not found'), { statusCode: 404 });
-            if (po.status !== 'DRAFT') throw Object.assign(new Error('only DRAFT purchase orders can be deleted'), { statusCode: 400 });
+            if (po.status !== 'DRAFT' && po.status !== 'APPROVED') {
+              throw Object.assign(new Error('only DRAFT/APPROVED purchase orders can be deleted'), { statusCode: 400 });
+            }
+
+            const [rc, bc] = await Promise.all([
+              tx.purchaseReceipt.count({ where: { companyId, purchaseOrderId: po.id } }),
+              tx.purchaseBill.count({ where: { companyId, purchaseOrderId: po.id } }),
+            ]);
+            if (rc > 0 || bc > 0) {
+              throw Object.assign(new Error('cannot delete a purchase order that already has receipts/bills'), { statusCode: 400 });
+            }
 
             await assertOpenPeriodOrThrow(tx as any, { companyId, transactionDate: new Date(po.orderDate), action: 'purchase_order.delete' });
 

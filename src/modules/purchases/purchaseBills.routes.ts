@@ -1245,6 +1245,7 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
   });
 
   // Adjust posted purchase bill (immutable ledger): only supported for non-inventory bills (no stock moves).
+  // Supports tax (tax-exclusive line totals; tax posted to Tax Receivable).
   // POST /companies/:companyId/purchase-bills/:purchaseBillId/adjust
   fastify.post('/companies/:companyId/purchase-bills/:purchaseBillId/adjust', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
@@ -1264,7 +1265,15 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
     const body = (request.body ?? {}) as {
       reason?: string;
       adjustmentDate?: string;
-      lines?: { itemId?: number; quantity?: number; unitCost?: number; discountAmount?: number; description?: string; accountId?: number }[];
+      lines?: {
+        itemId?: number;
+        quantity?: number;
+        unitCost?: number;
+        discountAmount?: number;
+        taxRate?: number;
+        description?: string;
+        accountId?: number;
+      }[];
     };
     if (!body.reason || !String(body.reason).trim()) {
       reply.status(400);
@@ -1319,15 +1328,27 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
               action: 'purchase_bill.adjust',
             });
 
-            const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
-            if (payCount > 0) throw Object.assign(new Error('cannot adjust a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
+            const [payCount, creditAppCount, advAppCount] = await Promise.all([
+              tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } }),
+              tx.vendorCreditApplication.count({ where: { companyId, purchaseBillId: bill.id } }),
+              tx.vendorAdvanceApplication.count({ where: { companyId, purchaseBillId: bill.id } }),
+            ]);
+            if (payCount > 0) {
+              throw Object.assign(new Error('cannot adjust a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
+            }
+            if (creditAppCount > 0 || advAppCount > 0) {
+              throw Object.assign(new Error('cannot adjust a purchase bill that has credits/advances applied (reverse applications first)'), {
+                statusCode: 400,
+              });
+            }
 
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
             const apId = (bill.company as any).accountsPayableAccountId;
             if (!apId) throw Object.assign(new Error('company.accountsPayableAccountId is not set'), { statusCode: 400 });
 
-            // Compute new lines + total (non-inventory only)
-            let total = new Prisma.Decimal(0);
+            // Compute new lines + totals (non-inventory only). lineTotal is tax-exclusive.
+            let subtotal = new Prisma.Decimal(0);
+            let taxAmount = new Prisma.Decimal(0);
             const computedLines: any[] = [];
             const debitByAccount = new Map<number, Prisma.Decimal>();
 
@@ -1365,7 +1386,13 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                 throw Object.assign(new Error(`lines[${idx}].discountAmount cannot exceed line subtotal`), { statusCode: 400 });
               }
               const lineTotal = gross.sub(disc).toDecimalPlaces(2);
-              total = total.add(lineTotal);
+              const rate = new Prisma.Decimal(Number((l as any).taxRate ?? 0)).toDecimalPlaces(4);
+              if (rate.lessThan(0) || rate.greaterThan(1)) {
+                throw Object.assign(new Error(`lines[${idx}].taxRate must be between 0 and 1 (e.g., 0.07 for 7%)`), { statusCode: 400 });
+              }
+              const lineTax = lineTotal.mul(rate).toDecimalPlaces(2);
+              subtotal = subtotal.add(lineTotal);
+              taxAmount = taxAmount.add(lineTax);
               computedLines.push({
                 companyId,
                 locationId: bill.locationId,
@@ -1376,11 +1403,20 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                 unitCost: unitDec,
                 discountAmount: disc,
                 lineTotal,
+                taxRate: rate,
+                taxAmount: lineTax,
               });
               const prev = debitByAccount.get(accountId) ?? new Prisma.Decimal(0);
               debitByAccount.set(accountId, prev.add(lineTotal).toDecimalPlaces(2));
             }
-            total = total.toDecimalPlaces(2);
+            subtotal = subtotal.toDecimalPlaces(2);
+            taxAmount = taxAmount.toDecimalPlaces(2);
+            const total = subtotal.add(taxAmount).toDecimalPlaces(2);
+
+            const taxReceivableId = await ensureTaxReceivableAccountIfNeeded(tx as any, companyId, taxAmount);
+            if (taxAmount.greaterThan(0) && !taxReceivableId) {
+              throw Object.assign(new Error('tax receivable account required when taxAmount > 0'), { statusCode: 400 });
+            }
 
             const desiredPostingLines: Array<{ accountId: number; debit: Prisma.Decimal; credit: Prisma.Decimal }> = [
               ...Array.from(debitByAccount.entries()).map(([accountId, amt]) => ({
@@ -1388,6 +1424,9 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
                 debit: amt.toDecimalPlaces(2),
                 credit: new Prisma.Decimal(0),
               })),
+              ...(taxAmount.greaterThan(0) && taxReceivableId
+                ? [{ accountId: taxReceivableId, debit: taxAmount.toDecimalPlaces(2), credit: new Prisma.Decimal(0) }]
+                : []),
               { accountId: apId, debit: new Prisma.Decimal(0), credit: total },
             ];
 
@@ -1481,6 +1520,8 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
             await tx.purchaseBill.update({
               where: { id: bill.id },
               data: {
+                subtotal,
+                taxAmount,
                 total,
                 lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
                 updatedByUserId: (request as any).user?.userId ?? null,
@@ -1598,8 +1639,17 @@ export async function purchaseBillsRoutes(fastify: FastifyInstance) {
 
             await assertOpenPeriodOrThrow(tx as any, { companyId, transactionDate: voidDate, action: 'purchase_bill.void' });
 
-            const payCount = await tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } });
+            const [payCount, creditAppCount, advAppCount] = await Promise.all([
+              tx.purchaseBillPayment.count({ where: { companyId, purchaseBillId: bill.id, reversedAt: null } }),
+              tx.vendorCreditApplication.count({ where: { companyId, purchaseBillId: bill.id } }),
+              tx.vendorAdvanceApplication.count({ where: { companyId, purchaseBillId: bill.id } }),
+            ]);
             if (payCount > 0) throw Object.assign(new Error('cannot void a purchase bill that has payments (reverse payments first)'), { statusCode: 400 });
+            if (creditAppCount > 0 || advAppCount > 0) {
+              throw Object.assign(new Error('cannot void a purchase bill that has credits/advances applied (reverse applications first)'), {
+                statusCode: 400,
+              });
+            }
 
             const priorAdjId = Number((bill as any).lastAdjustmentJournalEntryId ?? 0) || null;
             let reversedPriorAdjustmentJournalEntryId: number | null = null;

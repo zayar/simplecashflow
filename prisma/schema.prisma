@@ -40,6 +40,7 @@ model Company {
   creditNotes                   CreditNote[]
   creditNoteLines               CreditNoteLine[]
   creditNoteRefunds             CreditNoteRefund[]
+  creditNoteApplications        CreditNoteApplication[]
   currencies                    Currency[]
   customers                     Customer[]
   customerAdvances              CustomerAdvance[]
@@ -438,6 +439,12 @@ model StockMove {
   @@index([companyId, date])
   @@index([companyId, itemId])
   @@index([companyId, locationId])
+  // PERF: hot inventory queries filter by (companyId, locationId, itemId) and order by date/id.
+  @@index([companyId, locationId, itemId, date, id], map: "StockMove_co_loc_item_date_id")
+  // PERF: linking moves created during a posting transaction uses correlationId.
+  @@index([companyId, correlationId], map: "StockMove_co_corr_idx")
+  // PERF: void/reversal flows often find moves by reference.
+  @@index([companyId, referenceType, referenceId], map: "StockMove_co_ref_idx")
   @@index([itemId], map: "StockMove_itemId_fkey")
   @@index([locationId], map: "StockMove_warehouseId_fkey")
 }
@@ -471,6 +478,7 @@ model Invoice {
   appliedCreditNotes           CreditNote[]                 @relation("CreditNote_AppliedInvoice")
   creditNotes                  CreditNote[]                 @relation("CreditNote_SourceInvoice")
   customerAdvanceApplications  CustomerAdvanceApplication[]
+  creditNoteApplications       CreditNoteApplication[]
   location                     Location?                    @relation(fields: [locationId], references: [id], map: "Inv_wh_fk")
   company                      Company                      @relation(fields: [companyId], references: [id])
   customer                     Customer                     @relation(fields: [customerId], references: [id])
@@ -517,6 +525,9 @@ model CreditNote {
   lastAdjustmentJournalEntryId Int?
   updatedByUserId              Int?
   appliedInvoiceId             Int?
+  // Total amount of this credit note applied to invoices (sum of applications).
+  // Credits remaining = total - amountRefunded - amountApplied.
+  amountApplied                Decimal            @default(0.00) @db.Decimal(18, 2)
   amountRefunded               Decimal            @default(0.00) @db.Decimal(18, 2)
   appliedInvoice               Invoice?           @relation("CreditNote_AppliedInvoice", fields: [appliedInvoiceId], references: [id])
   company                      Company            @relation(fields: [companyId], references: [id])
@@ -529,6 +540,7 @@ model CreditNote {
   voidedByUser                 User?              @relation("User_VoidedCreditNotes", fields: [voidedByUserId], references: [id])
   lines                        CreditNoteLine[]
   refunds                      CreditNoteRefund[]
+  applications                 CreditNoteApplication[]
 
   @@unique([companyId, creditNoteNumber])
   @@index([companyId, creditNoteDate])
@@ -541,6 +553,29 @@ model CreditNote {
   @@index([lastAdjustmentJournalEntryId], map: "CreditNote_lastAdjustmentJournalEntryId_fkey")
   @@index([updatedByUserId], map: "CreditNote_updatedByUserId_fkey")
   @@index([voidedByUserId], map: "CreditNote_voidedByUserId_fkey")
+}
+
+model CreditNoteApplication {
+  id              Int       @id @default(autoincrement())
+  companyId       Int
+  creditNoteId    Int
+  invoiceId       Int
+  appliedDate     DateTime
+  amount          Decimal   @db.Decimal(18, 2)
+  createdByUserId Int?
+  createdAt       DateTime  @default(now())
+
+  company       Company    @relation(fields: [companyId], references: [id])
+  creditNote    CreditNote @relation(fields: [creditNoteId], references: [id])
+  invoice       Invoice    @relation(fields: [invoiceId], references: [id])
+  createdByUser User?      @relation("User_CreatedCreditNoteApplications", fields: [createdByUserId], references: [id])
+
+  @@index([companyId, appliedDate])
+  @@index([companyId, creditNoteId])
+  @@index([companyId, invoiceId])
+  @@index([createdByUserId], map: "CreditNoteApplication_createdByUserId_fkey")
+  @@index([creditNoteId], map: "CreditNoteApplication_creditNoteId_fkey")
+  @@index([invoiceId], map: "CreditNoteApplication_invoiceId_fkey")
 }
 
 model CreditNoteRefund {
@@ -644,6 +679,7 @@ model Payment {
 
   @@index([companyId, paymentDate])
   @@index([invoiceId])
+  @@index([companyId, invoiceId, reversedAt], map: "Payment_co_invoice_rev_idx")
   @@index([bankAccountId], map: "Payment_bankAccountId_fkey")
   @@index([reversedByUserId], map: "Payment_reversedByUserId_fkey")
 }
@@ -1184,6 +1220,7 @@ model User {
   updatedCreditNotes                 CreditNote[]                 @relation("User_UpdatedCreditNotes")
   voidedCreditNotes                  CreditNote[]                 @relation("User_VoidedCreditNotes")
   creditNoteRefundsCreated           CreditNoteRefund[]           @relation("User_CreatedCreditNoteRefunds")
+  creditNoteApplicationsCreated      CreditNoteApplication[]      @relation("User_CreatedCreditNoteApplications")
   customerAdvancesCreated            CustomerAdvance[]            @relation("User_CreatedCustomerAdvances")
   customerAdvanceApplicationsCreated CustomerAdvanceApplication[] @relation("User_CreatedCustomerAdvanceApplications")
   updatedExpenses                    Expense[]                    @relation("User_UpdatedExpenses")

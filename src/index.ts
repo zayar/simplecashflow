@@ -22,6 +22,8 @@ import { taxesRoutes } from './modules/taxes/taxes.routes.js';
 import { currenciesRoutes } from './modules/currencies/currencies.routes.js';
 import { cashflowRoutes } from './modules/cashflow/cashflow.routes.js';
 import { runWithTenant } from './infrastructure/tenantContext.js';
+import { createPerfStore, getPerfStore, isPerfEnabled, runWithPerf } from './infrastructure/perf.js';
+import { performance } from 'node:perf_hooks';
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -148,6 +150,76 @@ async function buildApp() {
       }
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Perf logs (env-gated): per-request latency + DB time + query count.
+  // ---------------------------------------------------------------------------
+  const perfOn = isPerfEnabled();
+  fastify.addHook(
+    'onRequest',
+    ((request: any, _reply: any, done: any) => {
+      if (!perfOn) return done();
+      const store = createPerfStore();
+      // Prefer Fastify request id if present (useful for log correlation)
+      if (request?.id) store.requestId = String(request.id);
+      // IMPORTANT: do not return the value of done(); keep callback signature.
+      runWithPerf(store, () => done());
+    }) as any
+  );
+
+  fastify.addHook(
+    'onResponse',
+    ((request: any, reply: any, done: any) => {
+      if (!perfOn) return done();
+      const s = getPerfStore?.() ?? null;
+      if (!s) return done();
+
+      const route = request?.routeOptions?.url ?? request?.routerPath ?? null;
+      const method = request?.method ?? null;
+      const statusCode = reply?.statusCode ?? null;
+      const totalMs = performance.now() - s.startMs;
+      const companyId = Number(request?.user?.companyId ?? 0) || null;
+      const dbMs = s.dbMs;
+      const dbCount = s.dbCount;
+      const slow = (s.slowQueries ?? [])
+        .slice()
+        .sort((a: any, b: any) => (b.ms ?? 0) - (a.ms ?? 0))
+        .slice(0, 5);
+
+      // Keep noise low: focus on the known slow flows unless explicitly enabled.
+      const path = String(route ?? request?.url ?? '');
+      const isHot =
+        (method === 'POST' && path === '/companies/:companyId/invoices/:invoiceId/post') ||
+        (method === 'POST' && path === '/companies/:companyId/invoices/:invoiceId/payments') ||
+        (method === 'POST' && path === '/companies/:companyId/invoices');
+
+      const logAll = String(process.env.PERF_LOG_ALL ?? '').toLowerCase() === 'true';
+      if (isHot || logAll) {
+        request.log.info(
+          {
+            kind: 'perf',
+            requestId: s.requestId,
+            companyId,
+            method,
+            route,
+            statusCode,
+            totalMs: Number(totalMs.toFixed(1)),
+            dbMs: Number(dbMs.toFixed(1)),
+            dbCount,
+            appMs: Number((totalMs - dbMs).toFixed(1)),
+            topSlowQueries: slow.map((q: any) => ({
+              ms: Number((q.ms ?? 0).toFixed(1)),
+              model: q.model,
+              op: q.operation,
+            })),
+            spans: s.spans,
+          },
+          'perf summary'
+        );
+      }
+      return done();
+    }) as any
+  );
 
   // Decorate fastify with authenticate
   fastify.decorate('authenticate', async function (request: any, reply: any) {

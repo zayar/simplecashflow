@@ -13,7 +13,7 @@ import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { BankingAccountKind } from '@prisma/client';
 import { getRedis } from '../../infrastructure/redis.js';
-import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { applyStockMoveWac } from '../inventory/stock.service.js';
 import { ensureInventoryCompanyDefaults, ensureInventoryItem, getStockBalanceForUpdate } from '../inventory/stock.service.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
@@ -22,6 +22,7 @@ import { nextCreditNoteNumber } from '../sequence/sequence.service.js';
 import { resolveLocationForStockIssue } from './warehousePolicy.js';
 import { buildAdjustmentLinesFromNets, computeNetByAccount, createReversalJournalEntry, diffNets, } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
+import { span } from '../../infrastructure/perf.js';
 function generateInvoiceNumber() {
     // Beginner-friendly and “good enough” for now.
     // Later we can make this per-company sequential numbers (INV-0001).
@@ -765,12 +766,18 @@ export async function booksRoutes(fastify) {
             reply.status(404);
             return { error: 'invoice not found' };
         }
-        // Calculate total paid from payments + applied customer advances (source of truth), excluding reversed payments.
-        // This keeps UI correct even if Invoice.amountPaid wasn't backfilled for older invoices.
-        const totalPayments = invoice.payments
+        // Calculate total paid from payments + applied customer advances + applied credit notes (source of truth),
+        // excluding reversed payments.
+        //
+        // IMPORTANT: use Decimal arithmetic end-to-end (avoid JS Number float drift).
+        // Float drift can cause remainingBalance to be slightly > 0 (e.g. 0.0000001) and show PARTIAL instead of PAID.
+        const totalPaymentsDec = (invoice.payments ?? [])
             .filter((p) => !p.reversedAt)
-            .reduce((sum, p) => sum + Number(p.amount), 0);
-        const totalCredits = (invoice.customerAdvanceApplications ?? []).reduce((sum, a) => sum + Number(a.amount), 0);
+            .reduce((sum, p) => sum.add(new Prisma.Decimal(p.amount ?? 0)), new Prisma.Decimal(0))
+            .toDecimalPlaces(2);
+        const totalCreditsDec = (invoice.customerAdvanceApplications ?? [])
+            .reduce((sum, a) => sum.add(new Prisma.Decimal(a.amount ?? 0)), new Prisma.Decimal(0))
+            .toDecimalPlaces(2);
         // Credit notes applied to this invoice reduce the invoice balance due.
         const creditNotes = await prisma.creditNote.findMany({
             where: { companyId, appliedInvoiceId: invoice.id, status: 'POSTED' },
@@ -782,7 +789,9 @@ export async function booksRoutes(fastify) {
         const issuedCreditNotesPostedCount = await prisma.creditNote.count({
             where: { companyId, invoiceId: invoice.id, status: 'POSTED' },
         });
-        const totalPaid = totalPayments + totalCredits + totalCreditNotes;
+        const totalCreditNotesDec = new Prisma.Decimal(totalCreditNotes ?? 0).toDecimalPlaces(2);
+        const totalPaidDec = totalPaymentsDec.add(totalCreditsDec).add(totalCreditNotesDec).toDecimalPlaces(2);
+        const totalPaid = Number(totalPaidDec);
         const creditsAgg = await prisma.customerAdvance.aggregate({
             where: { companyId, customerId: invoice.customerId },
             _sum: { amount: true, amountApplied: true },
@@ -792,24 +801,31 @@ export async function booksRoutes(fastify) {
         // Credits available to apply on this invoice:
         // - Customer Advances remaining balance
         // - Unapplied (open) Customer Credit Notes remaining balance
+        //
+        // IMPORTANT: Credit notes may be partially refunded. The remaining balance is (total - amountRefunded).
+        // Those remaining balances SHOULD still be available to apply to invoices.
         // Credit notes created from an invoice (invoiceId) are NOT applied until user applies them (appliedInvoiceId).
-        const openCnAgg = await prisma.creditNote.aggregate({
+        const openCreditNotesRows = await prisma.creditNote.findMany({
             where: {
                 companyId,
                 customerId: invoice.customerId,
                 status: 'POSTED',
                 appliedInvoiceId: null,
-                // For now: exclude refunded credits from "available to apply" (refund means cash-out, not credit against invoice)
-                amountRefunded: 0,
             },
-            _sum: { total: true },
+            select: { total: true, amountRefunded: true },
         });
-        const openCreditNotes = new Prisma.Decimal(openCnAgg._sum.total ?? 0).toDecimalPlaces(2);
+        const openCreditNotes = openCreditNotesRows.reduce((sum, cn) => {
+            const total = new Prisma.Decimal(cn?.total ?? 0).toDecimalPlaces(2);
+            const refunded = new Prisma.Decimal(cn?.amountRefunded ?? 0).toDecimalPlaces(2);
+            const remaining = total.sub(refunded).toDecimalPlaces(2);
+            if (remaining.lessThanOrEqualTo(0))
+                return sum;
+            return sum.add(remaining).toDecimalPlaces(2);
+        }, new Prisma.Decimal(0));
         const creditsAvailable = totalAdv.sub(totalApplied).add(openCreditNotes).toDecimalPlaces(2);
         // Compute a display status based on actual settlements (payments + applied advances + applied credit notes).
         // This avoids showing PARTIAL just because a credit note was POSTED (not applied yet).
         const invTotalDec = new Prisma.Decimal(invoice.total ?? 0).toDecimalPlaces(2);
-        const totalPaidDec = new Prisma.Decimal(totalPaid ?? 0).toDecimalPlaces(2);
         const remainingBalanceDec = invTotalDec.sub(totalPaidDec).toDecimalPlaces(2);
         const remainingBalance = Math.max(0, Number(remainingBalanceDec));
         const computedStatus = invoice.status === 'VOID' || invoice.status === 'DRAFT' || invoice.status === 'APPROVED'
@@ -1757,7 +1773,7 @@ export async function booksRoutes(fastify) {
             const wrapped = async (fn) => stockLockKeys.length > 0
                 ? withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, fn))
                 : withLockBestEffort(redis, lockKey, 30_000, fn);
-            const { response: result } = await runWithResourceLockRetry(() => wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { response: result } = await wrapped(async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
               SELECT id FROM Invoice
@@ -2010,7 +2026,7 @@ export async function booksRoutes(fastify) {
                     return { invoiceId: inv.id, status: 'VOID', voidJournalEntryId: reversal.id };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-            }, redis)));
+            }, redis));
             return {
                 invoiceId: result.invoiceId,
                 status: result.status,
@@ -2094,7 +2110,7 @@ export async function booksRoutes(fastify) {
                     throw new Error('default location is not set');
                 return `lock:stock:${companyId}:${lid}:${l.itemId}`;
             });
-        const { replay, response: result } = await runWithResourceLockRetry(() => withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+        const { replay, response: result } = await withLocksBestEffort(redis, stockLockKeys, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const txResult = await prisma.$transaction(async (tx) => {
                 // DB-level serialization safety: lock the invoice row so concurrent posts
                 // (with different idempotency keys) cannot double-post.
@@ -2207,43 +2223,45 @@ export async function booksRoutes(fastify) {
                     }
                     const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                     defaultLocationId = defaultLocationId ?? cfg.defaultLocationId;
-                    for (const line of tracked) {
-                        const lid = resolveLocationForStockIssue({
-                            invoiceLocationId,
-                            itemDefaultLocationId: line.item.defaultLocationId ?? null,
-                            companyDefaultLocationId: defaultLocationId,
-                        });
-                        if (!lid) {
-                            throw Object.assign(new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'), {
-                                statusCode: 400,
+                    await span('invoice.post.inventoryWac', async () => {
+                        for (const line of tracked) {
+                            const lid = resolveLocationForStockIssue({
+                                invoiceLocationId,
+                                itemDefaultLocationId: line.item.defaultLocationId ?? null,
+                                companyDefaultLocationId: defaultLocationId,
                             });
+                            if (!lid) {
+                                throw Object.assign(new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'), {
+                                    statusCode: 400,
+                                });
+                            }
+                            const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
+                            const applied = await applyStockMoveWac(tx, {
+                                companyId,
+                                locationId: Number(lid),
+                                itemId: Number(line.itemId),
+                                date: invoice.invoiceDate,
+                                allowBackdated: true,
+                                type: 'SALE_ISSUE',
+                                direction: 'OUT',
+                                quantity: qty,
+                                unitCostApplied: new Prisma.Decimal(0),
+                                referenceType: 'Invoice',
+                                referenceId: String(invoice.id),
+                                correlationId,
+                                createdByUserId: request.user?.userId ?? null,
+                                journalEntryId: null,
+                            });
+                            totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
+                            const from = applied?.requiresInventoryRecalcFromDate;
+                            if (from && !isNaN(new Date(from).getTime())) {
+                                inventoryRecalcFromDate =
+                                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                                        ? new Date(from)
+                                        : inventoryRecalcFromDate;
+                            }
                         }
-                        const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
-                        const applied = await applyStockMoveWac(tx, {
-                            companyId,
-                            locationId: Number(lid),
-                            itemId: Number(line.itemId),
-                            date: invoice.invoiceDate,
-                            allowBackdated: true,
-                            type: 'SALE_ISSUE',
-                            direction: 'OUT',
-                            quantity: qty,
-                            unitCostApplied: new Prisma.Decimal(0),
-                            referenceType: 'Invoice',
-                            referenceId: String(invoice.id),
-                            correlationId,
-                            createdByUserId: request.user?.userId ?? null,
-                            journalEntryId: null,
-                        });
-                        totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
-                        const from = applied?.requiresInventoryRecalcFromDate;
-                        if (from && !isNaN(new Date(from).getTime())) {
-                            inventoryRecalcFromDate =
-                                !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
-                                    ? new Date(from)
-                                    : inventoryRecalcFromDate;
-                        }
-                    }
+                    });
                     totalCogs = totalCogs.toDecimalPlaces(2);
                 }
                 // Build journal entry lines including tax (and optional inventory COGS).
@@ -2258,23 +2276,20 @@ export async function booksRoutes(fastify) {
                     cogsAccountId: invCfgForCogs?.cogsAccountId ?? null,
                     inventoryAssetAccountId: invCfgForCogs?.inventoryAssetAccountId ?? null,
                 });
-                const journalEntry = await postJournalEntry(tx, {
+                const journalEntry = await span('invoice.post.postJournalEntry', async () => postJournalEntry(tx, {
                     companyId,
                     date: invoice.invoiceDate,
                     description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
                     locationId: invoice.locationId ?? null,
                     createdByUserId: request.user?.userId ?? null,
-                    skipAccountValidation: true, // OPTIMIZED: accounts already validated above
-                    skipPeriodCheck: true, // OPTIMIZED: already checked via assertOpenPeriodOrThrow above
-                    skipLocationValidation: true, // OPTIMIZED: locationId is from the invoice row itself
                     lines: jeLines,
-                });
+                }));
                 // Link inventory moves to the invoice posting JournalEntry (best-effort)
                 if (totalCogs.greaterThan(0)) {
-                    await tx.stockMove.updateMany({
+                    await span('invoice.post.linkStockMoves', async () => tx.stockMove.updateMany({
                         where: { companyId, correlationId, journalEntryId: null },
                         data: { journalEntryId: journalEntry.id },
-                    });
+                    }));
                 }
                 // Update invoice to POSTED and link journal entry (tenant-safe).
                 const upd = await tx.invoice.updateMany({
@@ -2293,13 +2308,13 @@ export async function booksRoutes(fastify) {
                 if (upd.count !== 1) {
                     throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                 }
-                // OPTIMIZED: avoid extra findFirst - we know the values from the update
-                const updatedInvoice = {
-                    id: invoice.id,
-                    status: 'POSTED',
-                    total,
-                    journalEntryId: journalEntry.id,
-                };
+                const updatedInvoice = await tx.invoice.findFirst({
+                    where: { id: invoice.id, companyId },
+                    select: { id: true, status: true, total: true, journalEntryId: true },
+                });
+                if (!updatedInvoice) {
+                    throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+                }
                 await writeAuditLog(tx, {
                     companyId,
                     userId: request.user?.userId ?? null,
@@ -2403,7 +2418,7 @@ export async function booksRoutes(fastify) {
                 _correlationId: correlationId,
                 _occurredAt: occurredAt,
             };
-        }, redis))));
+        }, redis)));
         // Fast-path publish: fire-and-forget to Pub/Sub (non-blocking)
         // If this fails, the outbox publisher will pick up the events
         if (!replay && result._jeEventId) {
@@ -2450,15 +2465,15 @@ export async function booksRoutes(fastify) {
             const { replay, response: result } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     // DB-level serialization safety: lock the invoice row so concurrent payments can't overspend.
-                    await tx.$queryRaw `
-                  SELECT id FROM Invoice
-                  WHERE id = ${invoiceId} AND companyId = ${companyId}
-                  FOR UPDATE
-                `;
-                    const invoice = await tx.invoice.findFirst({
+                    await span('invoice.payment.lockInvoice', async () => tx.$queryRaw `
+                    SELECT id FROM Invoice
+                    WHERE id = ${invoiceId} AND companyId = ${companyId}
+                    FOR UPDATE
+                  `);
+                    const invoice = await span('invoice.payment.loadInvoice', async () => tx.invoice.findFirst({
                         where: { id: invoiceId, companyId },
                         include: { company: { select: { accountsReceivableAccountId: true, baseCurrency: true } } },
-                    });
+                    }));
                     if (!invoice) {
                         throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                     }
@@ -2477,49 +2492,43 @@ export async function booksRoutes(fastify) {
                             statusCode: 400,
                         });
                     }
+                    const arAccountId = Number(invoice.company.accountsReceivableAccountId);
+                    if (!Number.isInteger(arAccountId) || arAccountId <= 0) {
+                        throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+                    }
                     // Currency policy: if company has baseCurrency, invoice currency must match it.
                     const baseCurrency = normalizeCurrencyOrNull(invoice.company.baseCurrency ?? null);
                     const invCurrency = normalizeCurrencyOrNull(invoice.currency ?? null);
                     enforceSingleCurrency(baseCurrency, invCurrency ?? baseCurrency);
-                    const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
-                    if (body.paymentDate && isNaN(paymentDate.getTime())) {
-                        throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
-                    }
-                    const amount = toMoneyDecimal(amountNumber);
-                    // OPTIMIZED: Batch fetch accounts + banking + period check + payment sum in parallel
-                    const [accountsResult, bankingResult, sumBefore] = await Promise.all([
-                        tx.account.findMany({
-                            where: {
-                                companyId,
-                                id: { in: [invoice.company.accountsReceivableAccountId, body.bankAccountId] },
-                                type: AccountType.ASSET,
-                            },
-                            select: { id: true },
-                        }),
-                        tx.bankingAccount.findFirst({
-                            where: { companyId, accountId: body.bankAccountId },
-                            select: { kind: true },
-                        }),
-                        tx.payment.aggregate({
-                            where: { invoiceId: invoice.id, companyId, reversedAt: null },
-                            _sum: { amount: true },
-                        }),
-                    ]);
-                    const arAccount = accountsResult.find((a) => a.id === invoice.company.accountsReceivableAccountId);
-                    const bankAccount = accountsResult.find((a) => a.id === body.bankAccountId);
+                    const arAccount = await span('invoice.payment.loadAccounts', async () => tx.account.findFirst({
+                        where: {
+                            id: arAccountId,
+                            companyId,
+                            type: AccountType.ASSET,
+                        },
+                    }));
                     if (!arAccount) {
-                        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), { statusCode: 400 });
+                        throw Object.assign(new Error('accountsReceivableAccountId must be an ASSET account in this company'), {
+                            statusCode: 400,
+                        });
                     }
+                    const bankAccount = await span('invoice.payment.loadAccounts', async () => tx.account.findFirst({
+                        where: { id: body.bankAccountId, companyId, type: AccountType.ASSET },
+                    }));
                     if (!bankAccount) {
                         throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
                             statusCode: 400,
                         });
                     }
                     // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
-                    if (!bankingResult) {
+                    const banking = await span('invoice.payment.bankingAccountCheck', async () => tx.bankingAccount.findFirst({
+                        where: { companyId, accountId: bankAccount.id },
+                        select: { kind: true },
+                    }));
+                    if (!banking) {
                         throw Object.assign(new Error('Deposit To must be a banking account (create it under Banking first)'), { statusCode: 400 });
                     }
-                    if (bankingResult.kind === BankingAccountKind.CREDIT_CARD) {
+                    if (banking.kind === BankingAccountKind.CREDIT_CARD) {
                         throw Object.assign(new Error('cannot deposit to a credit card account'), {
                             statusCode: 400,
                         });
@@ -2531,16 +2540,25 @@ export async function booksRoutes(fastify) {
                             : body.paymentMode === 'BANK'
                                 ? BankingAccountKind.BANK
                                 : BankingAccountKind.E_WALLET;
-                        if (bankingResult.kind !== expected) {
+                        if (banking.kind !== expected) {
                             throw Object.assign(new Error(`Deposit To account kind must be ${expected} for paymentMode ${body.paymentMode}`), { statusCode: 400 });
                         }
                     }
-                    await assertOpenPeriodOrThrow(tx, {
+                    const paymentDate = parseDateInput(body.paymentDate) ?? new Date();
+                    if (body.paymentDate && isNaN(paymentDate.getTime())) {
+                        throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
+                    }
+                    await span('invoice.payment.periodCloseCheck', async () => assertOpenPeriodOrThrow(tx, {
                         companyId,
                         transactionDate: paymentDate,
                         action: 'invoice.payment.create',
-                    });
+                    }));
+                    const amount = toMoneyDecimal(amountNumber);
                     // Prevent overpayment based on source-of-truth payments sum (non-reversed).
+                    const sumBefore = await span('invoice.payment.sumBefore', async () => tx.payment.aggregate({
+                        where: { invoiceId: invoice.id, companyId, reversedAt: null },
+                        _sum: { amount: true },
+                    }));
                     const totalPaidBefore = (sumBefore._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
                     const remainingBefore = new Prisma.Decimal(invoice.total)
                         .sub(totalPaidBefore)
@@ -2548,20 +2566,18 @@ export async function booksRoutes(fastify) {
                     if (amount.greaterThan(remainingBefore)) {
                         throw Object.assign(new Error(`amount cannot exceed remaining balance of ${remainingBefore.toString()}`), { statusCode: 400 });
                     }
-                    const journalEntry = await postJournalEntry(tx, {
+                    const journalEntry = await span('invoice.payment.postJournalEntry', async () => postJournalEntry(tx, {
                         companyId,
                         date: paymentDate,
                         description: `Payment for Invoice ${invoice.invoiceNumber}`,
                         locationId: invoice.locationId ?? null,
                         createdByUserId: request.user?.userId ?? null,
                         skipAccountValidation: true,
-                        skipPeriodCheck: true, // OPTIMIZED: already checked via assertOpenPeriodOrThrow above
-                        skipLocationValidation: true, // OPTIMIZED: locationId is from the invoice row itself
                         lines: [
                             { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
                             { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
                         ],
-                    });
+                    }));
                     // Payment attachment (optional). Prefer selecting from pending proofs by id.
                     const pendingProofId = typeof body.pendingProofId === 'string' && String(body.pendingProofId).trim()
                         ? String(body.pendingProofId).trim()
@@ -2580,7 +2596,7 @@ export async function booksRoutes(fastify) {
                             attachmentUrl = String(hit.url);
                         }
                     }
-                    const payment = await tx.payment.create({
+                    const payment = await span('invoice.payment.writePayment', async () => tx.payment.create({
                         data: {
                             companyId,
                             invoiceId: invoice.id,
@@ -2590,7 +2606,7 @@ export async function booksRoutes(fastify) {
                             journalEntryId: journalEntry.id,
                             attachmentUrl,
                         },
-                    });
+                    }));
                     // If attachmentUrl was selected from pendingPaymentProofs, DO NOT delete it.
                     // Keep it visible to the customer for reference, but lock edits once payment is recorded
                     // (public endpoints enforce that by status/amountPaid).
@@ -2608,18 +2624,20 @@ export async function booksRoutes(fastify) {
                                 usedByPaymentId: payment.id,
                             };
                         });
-                        await tx.invoice.updateMany({
+                        await span('invoice.payment.updateProofs', async () => tx.invoice.updateMany({
                             where: { id: invoice.id, companyId },
                             data: { pendingPaymentProofs: next.length > 0 ? next : Prisma.DbNull },
-                        });
+                        }));
                     }
-                    // OPTIMIZED: compute new total from pre-fetched sum + current amount (avoids extra aggregate)
+                    // With invoice row locked (FOR UPDATE), there cannot be concurrent non-reversed payments
+                    // inserted for this invoice within the same company. We can safely compute paid-after
+                    // from the "before" aggregate plus this amount (saves one aggregate query).
                     const totalPaid = totalPaidBefore.add(amount).toDecimalPlaces(2);
                     const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
-                    const updInv = await tx.invoice.updateMany({
+                    const updInv = await span('invoice.payment.updateInvoice', async () => tx.invoice.updateMany({
                         where: { id: invoice.id, companyId },
                         data: { amountPaid: totalPaid, status: newStatus },
-                    });
+                    }));
                     if (updInv.count !== 1) {
                         throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                     }
@@ -2644,50 +2662,53 @@ export async function booksRoutes(fastify) {
                             newAmountPaid: totalPaid.toString(),
                         },
                     });
-                    // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
-                    const jeEventId = randomUUID();
-                    await tx.event.create({
-                        data: {
-                            companyId,
-                            eventId: jeEventId,
-                            eventType: 'journal.entry.created',
-                            schemaVersion: 'v1',
-                            occurredAt: new Date(occurredAt),
-                            source: 'cashflow-api',
-                            partitionKey: String(companyId),
-                            correlationId,
-                            aggregateType: 'JournalEntry',
-                            aggregateId: String(journalEntry.id),
-                            type: 'JournalEntryCreated',
-                            payload: {
-                                journalEntryId: journalEntry.id,
+                    const { jeEventId, paymentEventId } = await span('invoice.payment.outbox', async () => {
+                        // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
+                        const jeEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
                                 companyId,
+                                eventId: jeEventId,
+                                eventType: 'journal.entry.created',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                aggregateType: 'JournalEntry',
+                                aggregateId: String(journalEntry.id),
+                                type: 'JournalEntryCreated',
+                                payload: {
+                                    journalEntryId: journalEntry.id,
+                                    companyId,
+                                },
                             },
-                        },
-                    });
-                    // Event: payment.recorded (document-level)
-                    const paymentEventId = randomUUID();
-                    await tx.event.create({
-                        data: {
-                            companyId,
-                            eventId: paymentEventId,
-                            eventType: 'payment.recorded',
-                            schemaVersion: 'v1',
-                            occurredAt: new Date(occurredAt),
-                            source: 'cashflow-api',
-                            partitionKey: String(companyId),
-                            correlationId,
-                            aggregateType: 'Payment',
-                            aggregateId: String(payment.id),
-                            type: 'PaymentRecorded',
-                            payload: {
-                                paymentId: payment.id,
-                                invoiceId: invoice.id,
-                                journalEntryId: journalEntry.id,
-                                amount: amount.toString(),
-                                bankAccountId: bankAccount.id,
+                        });
+                        // Event: payment.recorded (document-level)
+                        const paymentEventId = randomUUID();
+                        await tx.event.create({
+                            data: {
+                                companyId,
+                                eventId: paymentEventId,
+                                eventType: 'payment.recorded',
+                                schemaVersion: 'v1',
+                                occurredAt: new Date(occurredAt),
+                                source: 'cashflow-api',
+                                partitionKey: String(companyId),
+                                correlationId,
+                                aggregateType: 'Payment',
+                                aggregateId: String(payment.id),
+                                type: 'PaymentRecorded',
+                                payload: {
+                                    paymentId: payment.id,
+                                    invoiceId: invoice.id,
+                                    journalEntryId: journalEntry.id,
+                                    amount: amount.toString(),
+                                    bankAccountId: bankAccount.id,
+                                },
                             },
-                        },
+                        });
+                        return { jeEventId, paymentEventId };
                     });
                     return { updatedInvoice, payment, journalEntry, jeEventId, paymentEventId };
                 }, { timeout: 10_000 });
@@ -4484,12 +4505,6 @@ export async function booksRoutes(fastify) {
                     if (cn.status !== 'DRAFT' && cn.status !== 'APPROVED') {
                         throw Object.assign(new Error('only DRAFT/APPROVED credit notes can be posted'), { statusCode: 400 });
                     }
-                    // Period-close guard: block posting into closed periods (backdating rule).
-                    await assertOpenPeriodOrThrow(tx, {
-                        companyId,
-                        transactionDate: new Date(cn.creditNoteDate),
-                        action: 'credit_note.post',
-                    });
                     // CRITICAL FIX #1: Currency validation - ensure credit note currency matches company baseCurrency
                     const baseCurrency = (cn.company.baseCurrency ?? '').trim().toUpperCase() || null;
                     const cnCurrency = (cn.currency ?? '').trim().toUpperCase() || null;
@@ -4508,73 +4523,10 @@ export async function booksRoutes(fastify) {
                     // If there is no invoice linkage, we still allow posting the credit note for financial purposes,
                     // but we treat tracked items as "credit-only" (no stock moves, no COGS reversal).
                     const sourceInvoiceId = cn.invoiceId ? Number(cn.invoiceId) : null;
-                    // Inventory (performance): prefetch inventory config + stock move inputs once per credit note
-                    // to avoid N+1 queries per line during posting.
-                    let invAssetId = null;
-                    let cogsId = null;
-                    const saleMovesByItemId = new Map();
-                    const returnedByItemIdLocation = new Map();
-                    const trackedInvoiceLinkedItemIds = Array.from(new Set((cn.lines ?? [])
-                        .filter((line) => {
-                        const item = line.item;
-                        const isTracked = item?.type === 'GOODS' && !!item?.trackInventory;
-                        return Boolean(sourceInvoiceId && isTracked && line.invoiceLineId && line.itemId);
-                    })
-                        .map((line) => Number(line.itemId))
-                        .filter((n) => Number.isFinite(n) && n > 0)));
-                    if (sourceInvoiceId && trackedInvoiceLinkedItemIds.length > 0) {
-                        const invCfg = await ensureInventoryCompanyDefaults(tx, companyId);
-                        invAssetId = invCfg.inventoryAssetAccountId ?? null;
-                        cogsId = invCfg.cogsAccountId ?? null;
-                        if (!invAssetId || !cogsId) {
-                            throw Object.assign(new Error('company inventory accounts not configured (inventoryAssetAccountId/cogsAccountId)'), { statusCode: 400 });
-                        }
-                        // Ensure inventory items in parallel (best-effort performance)
-                        await Promise.all(trackedInvoiceLinkedItemIds.map((itemId) => ensureInventoryItem(tx, companyId, itemId)));
-                        // Prefetch original sale moves for all items (used for clean return allocation).
-                        const saleMovesAll = (await tx.stockMove.findMany({
-                            where: {
-                                companyId,
-                                itemId: { in: trackedInvoiceLinkedItemIds },
-                                type: 'SALE_ISSUE',
-                                direction: 'OUT',
-                                referenceType: 'Invoice',
-                                referenceId: String(sourceInvoiceId),
-                            },
-                            orderBy: [{ itemId: 'asc' }, { locationId: 'asc' }, { id: 'asc' }],
-                            select: { id: true, itemId: true, locationId: true, quantity: true, unitCostApplied: true },
-                        }));
-                        for (const m of saleMovesAll) {
-                            const iid = Number(m.itemId);
-                            const list = saleMovesByItemId.get(iid) ?? [];
-                            list.push(m);
-                            saleMovesByItemId.set(iid, list);
-                        }
-                        // Prefetch already-returned quantities by item+location (posted credit notes only) for this invoice.
-                        const returnedRows = (await tx.$queryRaw `
-                  SELECT sm.itemId as itemId, sm.warehouseId as locationId, SUM(sm.quantity) as qty
-                  FROM StockMove sm
-                  JOIN CreditNote cn2
-                    ON cn2.id = CAST(sm.referenceId AS SIGNED)
-                  WHERE sm.companyId = ${companyId}
-                    AND sm.itemId IN (${Prisma.join(trackedInvoiceLinkedItemIds)})
-                    AND sm.type = 'SALE_RETURN'
-                    AND sm.direction = 'IN'
-                    AND sm.referenceType = 'CreditNote'
-                    AND cn2.companyId = ${companyId}
-                    AND cn2.invoiceId = ${sourceInvoiceId}
-                    AND cn2.status = 'POSTED'
-                  GROUP BY sm.itemId, sm.warehouseId
-                `);
-                        for (const r of returnedRows ?? []) {
-                            const iid = Number(r.itemId);
-                            const lid = Number(r.locationId);
-                            const qty = new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2);
-                            const byLoc = returnedByItemIdLocation.get(iid) ?? new Map();
-                            byLoc.set(lid, qty);
-                            returnedByItemIdLocation.set(iid, byLoc);
-                        }
-                    }
+                    // Inventory config for COGS reversal when we restock tracked items.
+                    const invCfg = await ensureInventoryCompanyDefaults(tx, companyId);
+                    const invAssetId = invCfg.inventoryAssetAccountId ?? null;
+                    const cogsId = invCfg.cogsAccountId ?? null;
                     // Recompute totals + bucket by income account + compute return cost for tracked lines.
                     // Tax-aware credit notes:
                     // - revenue reversal uses subtotal (qty*unitPrice)
@@ -4612,10 +4564,22 @@ export async function booksRoutes(fastify) {
                             if (!invAssetId || !cogsId) {
                                 throw Object.assign(new Error('company inventory accounts not configured (inventoryAssetAccountId/cogsAccountId)'), { statusCode: 400 });
                             }
+                            await ensureInventoryItem(tx, companyId, line.itemId);
                             // Clean cost + location allocation:
                             // Allocate return quantity across the original SALE_ISSUE StockMoves for this invoice+item.
                             // This guarantees the return uses the same cost basis and location(s) as the original sale.
-                            const saleMoves = (saleMovesByItemId.get(Number(line.itemId)) ?? []);
+                            const saleMoves = (await tx.stockMove.findMany({
+                                where: {
+                                    companyId,
+                                    itemId: line.itemId,
+                                    type: 'SALE_ISSUE',
+                                    direction: 'OUT',
+                                    referenceType: 'Invoice',
+                                    referenceId: String(sourceInvoiceId),
+                                },
+                                orderBy: [{ locationId: 'asc' }, { id: 'asc' }],
+                                select: { id: true, locationId: true, quantity: true, unitCostApplied: true },
+                            }));
                             if (!saleMoves.length) {
                                 throw Object.assign(new Error('cannot locate original sale stock moves for return (invoice linkage missing or inventory not tracked at sale time)'), {
                                     statusCode: 400,
@@ -4624,7 +4588,22 @@ export async function booksRoutes(fastify) {
                                 });
                             }
                             // Returned qty for this invoice+item by location (posted credit notes only)
-                            const returnedWhMap = returnedByItemIdLocation.get(Number(line.itemId)) ?? new Map();
+                            const returnedByLocation = (await tx.$queryRaw `
+                    SELECT sm.warehouseId as locationId, SUM(sm.quantity) as qty
+                    FROM StockMove sm
+                    JOIN CreditNote cn2
+                      ON cn2.id = CAST(sm.referenceId AS SIGNED)
+                    WHERE sm.companyId = ${companyId}
+                      AND sm.itemId = ${line.itemId}
+                      AND sm.type = 'SALE_RETURN'
+                      AND sm.direction = 'IN'
+                      AND sm.referenceType = 'CreditNote'
+                      AND cn2.companyId = ${companyId}
+                      AND cn2.invoiceId = ${sourceInvoiceId}
+                      AND cn2.status = 'POSTED'
+                    GROUP BY sm.warehouseId
+                  `);
+                            const returnedWhMap = new Map((returnedByLocation ?? []).map((r) => [Number(r.locationId), new Prisma.Decimal(r.qty ?? 0).toDecimalPlaces(2)]));
                             // Compute remaining quantities per sale move after previous returns (FIFO per location)
                             const movesByLocation = new Map();
                             for (const m of saleMoves) {

@@ -331,7 +331,12 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
               _sum: { amount: true },
             });
             const creditsAlready = (creditsAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
-            const settled = paid.add(creditsAlready).toDecimalPlaces(2);
+            const cnAppAgg = await tx.creditNoteApplication.aggregate({
+              where: { invoiceId: inv.id, companyId },
+              _sum: { amount: true },
+            });
+            const cnApplied = (cnAppAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+            const settled = paid.add(creditsAlready).add(cnApplied).toDecimalPlaces(2);
             const remainingInvoice = new Prisma.Decimal(inv.total).sub(settled).toDecimalPlaces(2);
             if (amount.greaterThan(remainingInvoice)) {
               throw Object.assign(new Error(`amount cannot exceed remaining invoice balance of ${remainingInvoice.toString()}`), { statusCode: 400 });
@@ -370,7 +375,7 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
             });
 
             const newCredits = creditsAlready.add(amount).toDecimalPlaces(2);
-            const newSettled = paid.add(newCredits).toDecimalPlaces(2);
+            const newSettled = paid.add(newCredits).add(cnApplied).toDecimalPlaces(2);
             const newStatus = newSettled.greaterThanOrEqualTo(inv.total) ? 'PAID' : 'PARTIAL';
             await tx.invoice.updateMany({
               where: { id: inv.id, companyId },
@@ -435,25 +440,38 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
         companyId,
         customerId,
         status: 'POSTED' as any,
-        ...(onlyOpen ? { appliedInvoiceId: null } : {}),
-        // v1: credit notes can only be applied in full; exclude partially refunded credits from apply list
-        ...(onlyOpen ? { amountRefunded: 0 } : {}),
       } as any,
-      select: { id: true, creditNoteNumber: true, creditNoteDate: true, total: true, appliedInvoiceId: true } as any,
+      select: {
+        id: true,
+        creditNoteNumber: true,
+        creditNoteDate: true,
+        total: true,
+        amountRefunded: true,
+        amountApplied: true,
+      } as any,
       orderBy: [{ creditNoteDate: 'desc' }, { id: 'desc' }],
     });
 
-    return (rows ?? []).map((cn: any) => ({
-      id: cn.id,
-      creditNoteNumber: cn.creditNoteNumber,
-      creditNoteDate: cn.creditNoteDate,
-      total: new Prisma.Decimal(cn.total ?? 0).toDecimalPlaces(2).toString(),
-      // Frontend type still calls this field invoiceId; here it means "applied invoice id"
-      invoiceId: (cn as any).appliedInvoiceId ?? null,
-    }));
+    const out = (rows ?? [])
+      .map((cn: any) => {
+        const total = new Prisma.Decimal(cn.total ?? 0).toDecimalPlaces(2);
+        const refunded = new Prisma.Decimal(cn.amountRefunded ?? 0).toDecimalPlaces(2);
+        const applied = new Prisma.Decimal(cn.amountApplied ?? 0).toDecimalPlaces(2);
+        const remaining = total.sub(refunded).sub(applied).toDecimalPlaces(2);
+        return {
+          id: cn.id,
+          creditNoteNumber: cn.creditNoteNumber,
+          creditNoteDate: cn.creditNoteDate,
+          total: total.toString(),
+          remaining: remaining.toString(),
+        };
+      })
+      .filter((cn: any) => (onlyOpen ? new Prisma.Decimal(cn.remaining ?? 0).greaterThan(0) : true));
+
+    return out;
   });
 
-  // Apply a POSTED credit note to an invoice (sub-ledger link only: attach credit note to invoice).
+  // Apply a POSTED credit note to an invoice (sub-ledger application; supports partial amounts).
   // POST /companies/:companyId/invoices/:invoiceId/apply-credit-note
   fastify.post('/companies/:companyId/invoices/:invoiceId/apply-credit-note', async (request, reply) => {
     const companyId = requireCompanyIdParam(request, reply);
@@ -470,11 +488,21 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
       return { error: 'Idempotency-Key header is required' };
     }
 
-    const body = (request.body ?? {}) as { creditNoteId?: number };
+    const body = (request.body ?? {}) as { creditNoteId?: number; amount?: number; appliedDate?: string };
     const creditNoteId = Number(body.creditNoteId);
     if (!creditNoteId || Number.isNaN(creditNoteId)) {
       reply.status(400);
       return { error: 'creditNoteId is required' };
+    }
+    if (body.amount == null || !Number.isFinite(Number(body.amount)) || Number(body.amount) <= 0) {
+      reply.status(400);
+      return { error: 'amount (>0) is required' };
+    }
+    const amount = toMoneyDecimal(body.amount);
+    const appliedDate = parseDateInput(body.appliedDate) ?? new Date();
+    if (body.appliedDate && isNaN(appliedDate.getTime())) {
+      reply.status(400);
+      return { error: 'invalid appliedDate' };
     }
 
     const correlationId = randomUUID();
@@ -502,23 +530,33 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
 
             const cn = await tx.creditNote.findFirst({
               where: { id: creditNoteId, companyId },
-              select: { id: true, status: true, total: true, amountRefunded: true, customerId: true, appliedInvoiceId: true, creditNoteNumber: true, creditNoteDate: true, journalEntryId: true } as any,
+              select: {
+                id: true,
+                status: true,
+                total: true,
+                amountRefunded: true,
+                amountApplied: true,
+                customerId: true,
+                creditNoteNumber: true,
+                creditNoteDate: true,
+                journalEntryId: true,
+              } as any,
             });
             if (!cn) throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
             if (cn.status !== 'POSTED') throw Object.assign(new Error('only POSTED credit notes can be applied'), { statusCode: 400 });
             if (cn.customerId !== inv.customerId) {
               throw Object.assign(new Error('credit note customer does not match invoice customer'), { statusCode: 400 });
             }
-            if ((cn as any).appliedInvoiceId && Number((cn as any).appliedInvoiceId) !== inv.id) {
-              throw Object.assign(new Error('credit note is already applied to another invoice'), { statusCode: 400 });
-            }
-            const alreadyRefunded = new Prisma.Decimal((cn as any).amountRefunded ?? 0).toDecimalPlaces(2);
-            if (alreadyRefunded.greaterThan(0)) {
-              throw Object.assign(new Error('cannot apply a credit note that has refunds (refunds must be voided/reversed first)'), { statusCode: 400 });
-            }
+
             const cnTotal = new Prisma.Decimal(cn.total ?? 0).toDecimalPlaces(2);
             if (cnTotal.lessThanOrEqualTo(0)) {
               throw Object.assign(new Error('credit note total must be > 0'), { statusCode: 400 });
+            }
+            const refunded = new Prisma.Decimal((cn as any).amountRefunded ?? 0).toDecimalPlaces(2);
+            const appliedSoFar = new Prisma.Decimal((cn as any).amountApplied ?? 0).toDecimalPlaces(2);
+            const remainingCn = cnTotal.sub(refunded).sub(appliedSoFar).toDecimalPlaces(2);
+            if (amount.greaterThan(remainingCn)) {
+              throw Object.assign(new Error(`amount cannot exceed remaining credit note balance of ${remainingCn.toString()}`), { statusCode: 400 });
             }
 
             // Remaining invoice balance at this moment: invoices - (payments + customer advances + credit notes already applied)
@@ -532,26 +570,36 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
               _sum: { amount: true },
             });
             const advApplied = (advAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
-            const cnAgg = await tx.creditNote.aggregate({
-              where: { companyId, appliedInvoiceId: inv.id, status: 'POSTED' as any } as any,
-              _sum: { total: true },
+            const cnAppAgg = await tx.creditNoteApplication.aggregate({
+              where: { companyId, invoiceId: inv.id },
+              _sum: { amount: true },
             });
-            const cnApplied = (cnAgg._sum.total ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+            const cnApplied = (cnAppAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
             const settled = paid.add(advApplied).add(cnApplied).toDecimalPlaces(2);
             const remaining = new Prisma.Decimal(inv.total).sub(settled).toDecimalPlaces(2);
-            if (cnTotal.greaterThan(remaining)) {
-              throw Object.assign(new Error(`credit note total cannot exceed remaining invoice balance of ${remaining.toString()}`), { statusCode: 400 });
+            if (amount.greaterThan(remaining)) {
+              throw Object.assign(new Error(`amount cannot exceed remaining invoice balance of ${remaining.toString()}`), { statusCode: 400 });
             }
 
-            // Attach the credit note to the invoice (sub-ledger application).
-            if (!(cn as any).appliedInvoiceId) {
-              await tx.creditNote.updateMany({
-                where: { id: cn.id, companyId, appliedInvoiceId: null },
-                data: { appliedInvoiceId: inv.id } as any,
-              });
-            }
+            // Create application row and update credit note applied amount (sub-ledger only; no new JE).
+            const app = await tx.creditNoteApplication.create({
+              data: {
+                companyId,
+                creditNoteId: cn.id,
+                invoiceId: inv.id,
+                appliedDate,
+                amount,
+                createdByUserId: (request as any).user?.userId ?? null,
+              } as any,
+            });
 
-            const newSettled = settled.add(cnTotal).toDecimalPlaces(2);
+            const nextApplied = appliedSoFar.add(amount).toDecimalPlaces(2);
+            await tx.creditNote.updateMany({
+              where: { id: cn.id, companyId },
+              data: { amountApplied: nextApplied } as any,
+            });
+
+            const newSettled = settled.add(amount).toDecimalPlaces(2);
             const newStatus = newSettled.greaterThanOrEqualTo(inv.total) ? 'PAID' : 'PARTIAL';
             await tx.invoice.updateMany({
               where: { id: inv.id, companyId },
@@ -584,8 +632,8 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
               companyId,
               userId: (request as any).user?.userId ?? null,
               action: 'invoice.credit_note.apply',
-              entityType: 'CreditNote',
-              entityId: cn.id,
+              entityType: 'CreditNoteApplication',
+              entityId: String(app.id),
               idempotencyKey,
               correlationId,
               metadata: {
@@ -593,12 +641,13 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
                 invoiceNumber: inv.invoiceNumber,
                 creditNoteId: cn.id,
                 creditNoteNumber: cn.creditNoteNumber,
-                amount: cnTotal.toString(),
+                amount: amount.toString(),
+                appliedDate,
                 occurredAt,
               },
             });
 
-            return { invoiceId: inv.id, creditNoteId: cn.id, status: newStatus, _jeEventId: jeEventId };
+            return { invoiceId: inv.id, creditNoteId: cn.id, creditNoteApplicationId: app.id, status: newStatus, _jeEventId: jeEventId };
           });
 
           return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
@@ -609,7 +658,12 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
         publishEventsFastPath([(result as any)._jeEventId]);
       }
 
-      return { invoiceId: (result as any).invoiceId, creditNoteId: (result as any).creditNoteId, status: (result as any).status };
+      return {
+        invoiceId: (result as any).invoiceId,
+        creditNoteId: (result as any).creditNoteId,
+        creditNoteApplicationId: (result as any).creditNoteApplicationId,
+        status: (result as any).status,
+      };
     } catch (err: any) {
       if (err?.statusCode) {
         reply.status(err.statusCode);
@@ -637,6 +691,7 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
       return { error: 'Idempotency-Key header is required' };
     }
 
+    const body = (request.body ?? {}) as { invoiceId?: number };
     const correlationId = randomUUID();
     const occurredAt = isoNow();
     const lockKey = `lock:credit-note:unapply:${companyId}:${creditNoteId}`;
@@ -654,12 +709,30 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
 
             const cn = await tx.creditNote.findFirst({
               where: { id: creditNoteId, companyId },
-              select: { id: true, status: true, total: true, appliedInvoiceId: true, creditNoteNumber: true } as any,
+              select: { id: true, status: true, total: true, amountRefunded: true, amountApplied: true, creditNoteNumber: true } as any,
             });
             if (!cn) throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
             if (cn.status !== 'POSTED') throw Object.assign(new Error('only POSTED credit notes can be unapplied'), { statusCode: 400 });
-            const invoiceId = Number((cn as any).appliedInvoiceId ?? 0);
-            if (!invoiceId) throw Object.assign(new Error('credit note is not applied to any invoice'), { statusCode: 400 });
+
+            const apps = await tx.creditNoteApplication.findMany({
+              where: { companyId, creditNoteId: cn.id },
+              select: { id: true, invoiceId: true, amount: true },
+              orderBy: [{ appliedDate: 'desc' }, { id: 'desc' }],
+            });
+            if ((apps ?? []).length === 0) throw Object.assign(new Error('credit note is not applied to any invoice'), { statusCode: 400 });
+
+            const reqInvoiceId = Number((body as any)?.invoiceId ?? 0) || null;
+            const chosen =
+              reqInvoiceId
+                ? (apps as any[]).find((a) => Number(a.invoiceId) === Number(reqInvoiceId)) ?? null
+                : (apps as any[]).length === 1
+                  ? (apps as any[])[0]
+                  : null;
+            if (!chosen) {
+              throw Object.assign(new Error('credit note is applied to multiple invoices; specify invoiceId to unapply'), { statusCode: 400 });
+            }
+            const invoiceId = Number(chosen.invoiceId);
+            const unapplyAmount = new Prisma.Decimal((chosen as any).amount ?? 0).toDecimalPlaces(2);
 
             // Lock invoice row
             await tx.$queryRaw`
@@ -675,11 +748,12 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
             if (!inv) throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
             if (inv.status === 'VOID') throw Object.assign(new Error('cannot unapply credit from a VOID invoice'), { statusCode: 400 });
 
-            // Unapply
-            await tx.creditNote.updateMany({
-              where: { id: cn.id, companyId, appliedInvoiceId: invoiceId },
-              data: { appliedInvoiceId: null } as any,
-            });
+            // Unapply (delete application and decrement amountApplied)
+            await tx.creditNoteApplication.delete({ where: { id: (chosen as any).id } });
+
+            const appliedSoFar = new Prisma.Decimal((cn as any).amountApplied ?? 0).toDecimalPlaces(2);
+            const nextApplied = appliedSoFar.sub(unapplyAmount).toDecimalPlaces(2);
+            await tx.creditNote.updateMany({ where: { id: cn.id, companyId }, data: { amountApplied: nextApplied.lessThan(0) ? 0 : nextApplied } as any });
 
             // Recompute invoice settlement: payments + customer advances + applied credit notes (after unapply)
             const paymentsAgg = await tx.payment.aggregate({
@@ -692,11 +766,11 @@ export async function customerAdvancesRoutes(fastify: FastifyInstance) {
               _sum: { amount: true },
             });
             const advApplied = (advAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
-            const cnAgg = await tx.creditNote.aggregate({
-              where: { companyId, appliedInvoiceId: inv.id, status: 'POSTED' as any } as any,
-              _sum: { total: true },
+            const cnAppAgg = await tx.creditNoteApplication.aggregate({
+              where: { companyId, invoiceId: inv.id },
+              _sum: { amount: true },
             });
-            const cnsApplied = (cnAgg._sum.total ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+            const cnsApplied = (cnAppAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
             const settled = paid.add(advApplied).add(cnsApplied).toDecimalPlaces(2);
 
             const newStatus =

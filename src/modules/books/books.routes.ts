@@ -28,6 +28,7 @@ import {
   diffNets,
 } from '../ledger/reversal.service.js';
 import { publishEventsFastPath } from '../../infrastructure/pubsub.js';
+import { span } from '../../infrastructure/perf.js';
 
 function generateInvoiceNumber(): string {
   // Beginner-friendly and “good enough” for now.
@@ -896,6 +897,12 @@ export async function booksRoutes(fastify: FastifyInstance) {
           },
           orderBy: { appliedDate: 'desc' },
         },
+        creditNoteApplications: {
+          include: {
+            creditNote: { select: { id: true, creditNoteNumber: true, creditNoteDate: true, status: true } },
+          },
+          orderBy: [{ appliedDate: 'desc' }, { id: 'desc' }],
+        },
       },
     });
 
@@ -904,26 +911,30 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'invoice not found' };
     }
 
-    // Calculate total paid from payments + applied customer advances (source of truth), excluding reversed payments.
-    // This keeps UI correct even if Invoice.amountPaid wasn't backfilled for older invoices.
-    const totalPayments = invoice.payments
+    // Calculate total paid from payments + applied customer advances + applied credit notes (source of truth),
+    // excluding reversed payments.
+    //
+    // IMPORTANT: use Decimal arithmetic end-to-end (avoid JS Number float drift).
+    // Float drift can cause remainingBalance to be slightly > 0 (e.g. 0.0000001) and show PARTIAL instead of PAID.
+    const totalPaymentsDec = (invoice.payments ?? [])
       .filter((p: any) => !p.reversedAt)
-      .reduce((sum, p) => sum + Number(p.amount), 0);
-    const totalCredits = (invoice.customerAdvanceApplications ?? []).reduce((sum: number, a: any) => sum + Number(a.amount), 0);
-    // Credit notes applied to this invoice reduce the invoice balance due.
-    const creditNotes = await prisma.creditNote.findMany({
-      where: { companyId, appliedInvoiceId: invoice.id, status: 'POSTED' as any } as any,
-      select: { id: true, creditNoteNumber: true, creditNoteDate: true, total: true },
-      orderBy: [{ creditNoteDate: 'desc' }, { id: 'desc' }],
-    });
-    const totalCreditNotes = (creditNotes ?? []).reduce((sum, cn: any) => sum + Number(cn.total ?? 0), 0);
+      .reduce((sum: Prisma.Decimal, p: any) => sum.add(new Prisma.Decimal(p.amount ?? 0)), new Prisma.Decimal(0))
+      .toDecimalPlaces(2);
+    const totalCreditsDec = (invoice.customerAdvanceApplications ?? [])
+      .reduce((sum: Prisma.Decimal, a: any) => sum.add(new Prisma.Decimal(a.amount ?? 0)), new Prisma.Decimal(0))
+      .toDecimalPlaces(2);
+    const creditNoteApps = (invoice as any).creditNoteApplications ?? [];
+    const totalCreditNotesDec = (creditNoteApps ?? [])
+      .reduce((sum: Prisma.Decimal, a: any) => sum.add(new Prisma.Decimal(a.amount ?? 0)), new Prisma.Decimal(0))
+      .toDecimalPlaces(2);
 
     // Credit notes issued FROM this invoice (returns). These block adjusting/voiding unless voided first.
     const issuedCreditNotesPostedCount = await prisma.creditNote.count({
       where: { companyId, invoiceId: invoice.id, status: 'POSTED' as any } as any,
     });
 
-    const totalPaid = totalPayments + totalCredits + totalCreditNotes;
+    const totalPaidDec = totalPaymentsDec.add(totalCreditsDec).add(totalCreditNotesDec).toDecimalPlaces(2);
+    const totalPaid = Number(totalPaidDec);
 
     const creditsAgg = await prisma.customerAdvance.aggregate({
       where: { companyId, customerId: invoice.customerId },
@@ -934,25 +945,31 @@ export async function booksRoutes(fastify: FastifyInstance) {
     // Credits available to apply on this invoice:
     // - Customer Advances remaining balance
     // - Unapplied (open) Customer Credit Notes remaining balance
-    // Credit notes created from an invoice (invoiceId) are NOT applied until user applies them (appliedInvoiceId).
-    const openCnAgg = await prisma.creditNote.aggregate({
+    //
+    // IMPORTANT: Credit notes may be partially refunded. The remaining balance is (total - amountRefunded).
+    // Those remaining balances SHOULD still be available to apply to invoices.
+    // Credit notes created from an invoice (invoiceId) are NOT applied until user applies them (CreditNoteApplication rows).
+    const openCreditNotesRows = await prisma.creditNote.findMany({
       where: {
         companyId,
         customerId: invoice.customerId,
         status: 'POSTED' as any,
-        appliedInvoiceId: null as any,
-        // For now: exclude refunded credits from "available to apply" (refund means cash-out, not credit against invoice)
-        amountRefunded: 0 as any,
       } as any,
-      _sum: { total: true },
+      select: { total: true, amountRefunded: true, amountApplied: true },
     });
-    const openCreditNotes = new Prisma.Decimal(openCnAgg._sum.total ?? 0).toDecimalPlaces(2);
+    const openCreditNotes = openCreditNotesRows.reduce((sum: Prisma.Decimal, cn: any) => {
+      const total = new Prisma.Decimal(cn?.total ?? 0).toDecimalPlaces(2);
+      const refunded = new Prisma.Decimal(cn?.amountRefunded ?? 0).toDecimalPlaces(2);
+      const applied = new Prisma.Decimal(cn?.amountApplied ?? 0).toDecimalPlaces(2);
+      const remaining = total.sub(refunded).sub(applied).toDecimalPlaces(2);
+      if (remaining.lessThanOrEqualTo(0)) return sum;
+      return sum.add(remaining).toDecimalPlaces(2);
+    }, new Prisma.Decimal(0));
     const creditsAvailable = totalAdv.sub(totalApplied).add(openCreditNotes).toDecimalPlaces(2);
 
     // Compute a display status based on actual settlements (payments + applied advances + applied credit notes).
     // This avoids showing PARTIAL just because a credit note was POSTED (not applied yet).
     const invTotalDec = new Prisma.Decimal(invoice.total ?? 0).toDecimalPlaces(2);
-    const totalPaidDec = new Prisma.Decimal(totalPaid ?? 0).toDecimalPlaces(2);
     const remainingBalanceDec = invTotalDec.sub(totalPaidDec).toDecimalPlaces(2);
     const remainingBalance = Math.max(0, Number(remainingBalanceDec));
     const computedStatus =
@@ -1048,13 +1065,13 @@ export async function booksRoutes(fastify: FastifyInstance) {
           creditNoteId: null,
           creditNoteNumber: null,
         })),
-        ...(creditNotes ?? []).map((cn: any) => ({
-          id: cn.id,
-          appliedDate: cn.creditNoteDate,
-          amount: cn.total,
+        ...((creditNoteApps ?? []) as any[]).map((a: any) => ({
+          id: a.id,
+          appliedDate: a.appliedDate,
+          amount: a.amount,
           customerAdvanceId: null,
-          creditNoteId: cn.id,
-          creditNoteNumber: cn.creditNoteNumber,
+          creditNoteId: a.creditNoteId,
+          creditNoteNumber: a.creditNote?.creditNoteNumber ?? null,
         })),
       ],
       issuedCreditNotesPostedCount,
@@ -1528,7 +1545,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
       return { error: 'invalid companyId or invoiceId' };
     }
 
-    const idempotencyKey = (request.headers as any)?.['idempotency-key'] as string | undefined;
+    const hdrs = request.headers as any;
+    const idempotencyKey = (hdrs?.['idempotency-key'] ?? hdrs?.['Idempotency-Key']) as string | undefined;
     if (!idempotencyKey) {
       reply.status(400);
       return { error: 'Idempotency-Key header is required' };
@@ -1560,9 +1578,24 @@ export async function booksRoutes(fastify: FastifyInstance) {
               throw Object.assign(new Error('cannot delete an invoice that already has a journal entry'), { statusCode: 400 });
             }
 
-            const payCount = await tx.payment.count({ where: { companyId, invoiceId: inv.id } });
+            const [payCount, advanceAppCount, appliedCreditNoteCount, anyCreditNoteCount] = await Promise.all([
+              tx.payment.count({ where: { companyId, invoiceId: inv.id } }),
+              tx.customerAdvanceApplication.count({ where: { companyId, invoiceId: inv.id } }),
+              tx.creditNoteApplication.count({ where: { companyId, invoiceId: inv.id } }),
+              tx.creditNote.count({ where: { companyId, invoiceId: inv.id } }),
+            ]);
             if (payCount > 0) {
-              throw Object.assign(new Error('cannot delete an invoice that has payments'), { statusCode: 400 });
+              throw Object.assign(new Error('cannot delete an invoice that has payments (reverse payments first)'), { statusCode: 400 });
+            }
+            if (advanceAppCount > 0 || appliedCreditNoteCount > 0) {
+              throw Object.assign(new Error('cannot delete an invoice that has credits/advances applied (remove applications first)'), {
+                statusCode: 400,
+              });
+            }
+            if (anyCreditNoteCount > 0) {
+              throw Object.assign(new Error('cannot delete an invoice that has related credit notes (delete/void credit notes first)'), {
+                statusCode: 400,
+              });
             }
 
             await tx.invoiceLine.deleteMany({ where: { companyId, invoiceId: inv.id } });
@@ -1586,6 +1619,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
       );
       return { invoiceId: (result as any).invoiceId, deleted: true };
     } catch (err: any) {
+      // Prisma FK constraint failure (e.g., an invoice is referenced by another record).
+      if (err?.code === 'P2003') {
+        reply.status(400);
+        return { error: 'cannot delete invoice because it is linked to other records (payments/credits/credit notes). Void instead.' };
+      }
       if (err?.statusCode) {
         reply.status(err.statusCode);
         return { error: err.message };
@@ -1620,11 +1658,14 @@ export async function booksRoutes(fastify: FastifyInstance) {
       if (inv.status !== 'DRAFT') throw Object.assign(new Error('only DRAFT invoices can be approved'), { statusCode: 400 });
       if (inv.journalEntryId) throw Object.assign(new Error('cannot approve an invoice that already has a journal entry'), { statusCode: 400 });
 
-      const upd = await tx.invoice.update({
-        where: { id: inv.id },
+      const updRes = await tx.invoice.updateMany({
+        where: { id: inv.id, companyId },
         data: { status: 'APPROVED', updatedByUserId: (request as any).user?.userId ?? null } as any,
-        select: { id: true, status: true, invoiceNumber: true },
       });
+      if ((updRes as any)?.count !== 1) {
+        throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+      }
+      const upd = { id: inv.id, status: 'APPROVED', invoiceNumber: inv.invoiceNumber };
 
       await writeAuditLog(tx as any, {
         companyId,
@@ -1738,6 +1779,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
               throw Object.assign(new Error('cannot adjust an invoice that has POSTED credit notes (void credit notes first)'), {
                 statusCode: 400,
               });
+            }
+
+            // Safety: if any advances/credits have been applied TO this invoice, do not allow adjusting totals.
+            // Reverse/remove applications first to avoid inconsistencies.
+            const [advanceAppCount, appliedCreditNoteCount] = await Promise.all([
+              tx.customerAdvanceApplication.count({ where: { companyId, invoiceId: inv.id } }),
+              tx.creditNoteApplication.count({ where: { companyId, invoiceId: inv.id } }),
+            ]);
+            if (advanceAppCount > 0 || appliedCreditNoteCount > 0) {
+              throw Object.assign(
+                new Error('cannot adjust an invoice that has credits/advances applied (remove applications first)'),
+                { statusCode: 400 }
+              );
             }
 
             // Safety: inventory-backed invoices require stock moves; we force void+reissue for now.
@@ -1964,20 +2018,36 @@ export async function booksRoutes(fastify: FastifyInstance) {
             // Update the invoice document (keeps UI consistent with correction) + track last adjustment JE.
             const before = { subtotal: (inv as any).subtotal?.toString?.() ?? null, taxAmount: (inv as any).taxAmount?.toString?.() ?? null, total: inv.total?.toString?.() ?? null };
 
-            await tx.invoice.update({
-              where: { id: inv.id },
+            const nextDueDate =
+              body.dueDate === undefined ? inv.dueDate : body.dueDate ? parseDateInput(body.dueDate) : null;
+            const nextCustomerNotes = body.customerNotes === undefined ? ((inv as any).customerNotes ?? null) : body.customerNotes;
+            const nextTerms = body.termsAndConditions === undefined ? ((inv as any).termsAndConditions ?? null) : body.termsAndConditions;
+
+            // Nested writes are blocked by tenant-isolation guards for Invoice.update; do line writes explicitly.
+            await tx.invoiceLine.deleteMany({ where: { companyId, invoiceId: inv.id } });
+            await tx.invoiceLine.createMany({
+              data: (computedLines as any[]).map((l: any) => ({
+                ...l,
+                invoiceId: inv.id,
+              })),
+            });
+
+            const updRes = await tx.invoice.updateMany({
+              where: { id: inv.id, companyId },
               data: {
-                dueDate: body.dueDate === undefined ? inv.dueDate : body.dueDate ? parseDateInput(body.dueDate) : null,
-                customerNotes: body.customerNotes === undefined ? (inv as any).customerNotes ?? null : body.customerNotes,
-                termsAndConditions: body.termsAndConditions === undefined ? (inv as any).termsAndConditions ?? null : body.termsAndConditions,
+                dueDate: nextDueDate,
+                customerNotes: nextCustomerNotes,
+                termsAndConditions: nextTerms,
                 subtotal,
                 taxAmount,
                 total,
                 lastAdjustmentJournalEntryId: adjustmentJournalEntryId,
                 updatedByUserId: (request as any).user?.userId ?? null,
-                lines: { deleteMany: {}, create: computedLines },
               } as any,
             });
+            if ((updRes as any)?.count !== 1) {
+              throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+            }
 
             const after = { subtotal: subtotal.toString(), taxAmount: taxAmount.toString(), total: total.toString() };
 
@@ -2299,8 +2369,8 @@ export async function booksRoutes(fastify: FastifyInstance) {
             });
 
             const voidedAt = new Date();
-            await tx.invoice.update({
-              where: { id: inv.id },
+            const updRes = await tx.invoice.updateMany({
+              where: { id: inv.id, companyId },
               data: {
                 status: 'VOID',
                 voidedAt,
@@ -2311,6 +2381,9 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 updatedByUserId: (request as any).user?.userId ?? null,
               } as any,
             });
+            if ((updRes as any)?.count !== 1) {
+              throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
+            }
 
             await tx.journalEntry.updateMany({
               where: { id: inv.journalEntryId, companyId },
@@ -2589,43 +2662,48 @@ export async function booksRoutes(fastify: FastifyInstance) {
             const cfg = await ensureInventoryCompanyDefaults(tx as any, companyId);
             defaultLocationId = defaultLocationId ?? (cfg as any).defaultLocationId;
 
-            for (const line of tracked) {
-              const lid = resolveLocationForStockIssue({
-                invoiceLocationId,
-                itemDefaultLocationId: (line.item as any).defaultLocationId ?? null,
-                companyDefaultLocationId: defaultLocationId,
-              });
-              if (!lid) {
-                throw Object.assign(new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'), {
-                  statusCode: 400,
+            await span('invoice.post.inventoryWac', async () => {
+              for (const line of tracked) {
+                const lid = resolveLocationForStockIssue({
+                  invoiceLocationId,
+                  itemDefaultLocationId: (line.item as any).defaultLocationId ?? null,
+                  companyDefaultLocationId: defaultLocationId,
                 });
+                if (!lid) {
+                  throw Object.assign(
+                    new Error('default location is not set (set company.defaultLocationId or item.defaultLocationId)'),
+                    {
+                      statusCode: 400,
+                    }
+                  );
+                }
+                const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
+                const applied = await applyStockMoveWac(tx as any, {
+                  companyId,
+                  locationId: Number(lid),
+                  itemId: Number(line.itemId),
+                  date: invoice.invoiceDate,
+                  allowBackdated: true,
+                  type: 'SALE_ISSUE',
+                  direction: 'OUT',
+                  quantity: qty,
+                  unitCostApplied: new Prisma.Decimal(0),
+                  referenceType: 'Invoice',
+                  referenceId: String(invoice.id),
+                  correlationId,
+                  createdByUserId: (request as any).user?.userId ?? null,
+                  journalEntryId: null,
+                });
+                totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
+                const from = (applied as any)?.requiresInventoryRecalcFromDate as Date | null | undefined;
+                if (from && !isNaN(new Date(from).getTime())) {
+                  inventoryRecalcFromDate =
+                    !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
+                      ? new Date(from)
+                      : inventoryRecalcFromDate;
+                }
               }
-              const qty = new Prisma.Decimal(line.quantity).toDecimalPlaces(2);
-              const applied = await applyStockMoveWac(tx as any, {
-                companyId,
-                locationId: Number(lid),
-                itemId: Number(line.itemId),
-                date: invoice.invoiceDate,
-                allowBackdated: true,
-                type: 'SALE_ISSUE',
-                direction: 'OUT',
-                quantity: qty,
-                unitCostApplied: new Prisma.Decimal(0),
-                referenceType: 'Invoice',
-                referenceId: String(invoice.id),
-                correlationId,
-                createdByUserId: (request as any).user?.userId ?? null,
-                journalEntryId: null,
-              });
-              totalCogs = totalCogs.add(new Prisma.Decimal(applied.totalCostApplied));
-              const from = (applied as any)?.requiresInventoryRecalcFromDate as Date | null | undefined;
-              if (from && !isNaN(new Date(from).getTime())) {
-                inventoryRecalcFromDate =
-                  !inventoryRecalcFromDate || new Date(from).getTime() < inventoryRecalcFromDate.getTime()
-                    ? new Date(from)
-                    : inventoryRecalcFromDate;
-              }
-            }
+            });
 
             totalCogs = totalCogs.toDecimalPlaces(2);
           }
@@ -2643,21 +2721,25 @@ export async function booksRoutes(fastify: FastifyInstance) {
             inventoryAssetAccountId: invCfgForCogs?.inventoryAssetAccountId ?? null,
           }) as any;
 
-          const journalEntry = await postJournalEntry(tx, {
-            companyId,
-            date: invoice.invoiceDate,
-            description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
-            locationId: (invoice as any).locationId ?? null,
-            createdByUserId: (request as any).user?.userId ?? null,
-            lines: jeLines,
-          });
+          const journalEntry = await span('invoice.post.postJournalEntry', async () =>
+            postJournalEntry(tx, {
+              companyId,
+              date: invoice.invoiceDate,
+              description: `Invoice ${invoice.invoiceNumber} for ${invoice.customer.name}`,
+              locationId: (invoice as any).locationId ?? null,
+              createdByUserId: (request as any).user?.userId ?? null,
+              lines: jeLines,
+            })
+          );
 
           // Link inventory moves to the invoice posting JournalEntry (best-effort)
           if (totalCogs.greaterThan(0)) {
-            await (tx as any).stockMove.updateMany({
-              where: { companyId, correlationId, journalEntryId: null },
-              data: { journalEntryId: journalEntry.id },
-            });
+            await span('invoice.post.linkStockMoves', async () =>
+              (tx as any).stockMove.updateMany({
+                where: { companyId, correlationId, journalEntryId: null },
+                data: { journalEntryId: journalEntry.id },
+              })
+            );
           }
 
           // Update invoice to POSTED and link journal entry (tenant-safe).
@@ -2867,16 +2949,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
             const txResult = await prisma.$transaction(
               async (tx) => {
                 // DB-level serialization safety: lock the invoice row so concurrent payments can't overspend.
-                await tx.$queryRaw`
-                  SELECT id FROM Invoice
-                  WHERE id = ${invoiceId} AND companyId = ${companyId}
-                  FOR UPDATE
-                `;
+                await span('invoice.payment.lockInvoice', async () =>
+                  tx.$queryRaw`
+                    SELECT id FROM Invoice
+                    WHERE id = ${invoiceId} AND companyId = ${companyId}
+                    FOR UPDATE
+                  `
+                );
 
-                const invoice = await tx.invoice.findFirst({
-                  where: { id: invoiceId, companyId },
-                  include: { company: { select: { accountsReceivableAccountId: true, baseCurrency: true } } },
-                });
+                const invoice = await span('invoice.payment.loadInvoice', async () =>
+                  tx.invoice.findFirst({
+                    where: { id: invoiceId, companyId },
+                    include: { company: { select: { accountsReceivableAccountId: true, baseCurrency: true } } },
+                  })
+                );
                 if (!invoice) {
                   throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                 }
@@ -2896,19 +2982,25 @@ export async function booksRoutes(fastify: FastifyInstance) {
                     statusCode: 400,
                   });
                 }
+                const arAccountId = Number(invoice.company.accountsReceivableAccountId);
+                if (!Number.isInteger(arAccountId) || arAccountId <= 0) {
+                  throw Object.assign(new Error('company.accountsReceivableAccountId is not set'), { statusCode: 400 });
+                }
 
                 // Currency policy: if company has baseCurrency, invoice currency must match it.
                 const baseCurrency = normalizeCurrencyOrNull((invoice.company as any).baseCurrency ?? null);
                 const invCurrency = normalizeCurrencyOrNull((invoice as any).currency ?? null);
                 enforceSingleCurrency(baseCurrency, invCurrency ?? baseCurrency);
 
-                const arAccount = await tx.account.findFirst({
-                  where: {
-                    id: invoice.company.accountsReceivableAccountId,
-                    companyId,
-                    type: AccountType.ASSET,
-                  },
-                });
+                const arAccount = await span('invoice.payment.loadAccounts', async () =>
+                  tx.account.findFirst({
+                    where: {
+                      id: arAccountId,
+                      companyId,
+                      type: AccountType.ASSET,
+                    },
+                  })
+                );
                 if (!arAccount) {
                   throw Object.assign(
                     new Error('accountsReceivableAccountId must be an ASSET account in this company'),
@@ -2918,9 +3010,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   );
                 }
 
-                const bankAccount = await tx.account.findFirst({
-                  where: { id: body.bankAccountId!, companyId, type: AccountType.ASSET },
-                });
+                const bankAccount = await span('invoice.payment.loadAccounts', async () =>
+                  tx.account.findFirst({
+                    where: { id: body.bankAccountId!, companyId, type: AccountType.ASSET },
+                  })
+                );
                 if (!bankAccount) {
                   throw Object.assign(new Error('bankAccountId must be an ASSET account in this company'), {
                     statusCode: 400,
@@ -2928,10 +3022,12 @@ export async function booksRoutes(fastify: FastifyInstance) {
                 }
 
                 // Enforce "Deposit To" must be a BankingAccount (created via Banking module)
-                const banking = await tx.bankingAccount.findFirst({
-                  where: { companyId, accountId: bankAccount.id },
-                  select: { kind: true },
-                });
+                const banking = await span('invoice.payment.bankingAccountCheck', async () =>
+                  tx.bankingAccount.findFirst({
+                    where: { companyId, accountId: bankAccount.id },
+                    select: { kind: true },
+                  })
+                );
                 if (!banking) {
                   throw Object.assign(
                     new Error('Deposit To must be a banking account (create it under Banking first)'),
@@ -2966,18 +3062,22 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   throw Object.assign(new Error('invalid paymentDate'), { statusCode: 400 });
                 }
 
-                await assertOpenPeriodOrThrow(tx as any, {
-                  companyId,
-                  transactionDate: paymentDate,
-                  action: 'invoice.payment.create',
-                });
+                await span('invoice.payment.periodCloseCheck', async () =>
+                  assertOpenPeriodOrThrow(tx as any, {
+                    companyId,
+                    transactionDate: paymentDate,
+                    action: 'invoice.payment.create',
+                  })
+                );
                 const amount = toMoneyDecimal(amountNumber);
 
                 // Prevent overpayment based on source-of-truth payments sum (non-reversed).
-                const sumBefore = await tx.payment.aggregate({
-                  where: { invoiceId: invoice.id, companyId, reversedAt: null },
-                  _sum: { amount: true },
-                });
+                const sumBefore = await span('invoice.payment.sumBefore', async () =>
+                  tx.payment.aggregate({
+                    where: { invoiceId: invoice.id, companyId, reversedAt: null },
+                    _sum: { amount: true },
+                  })
+                );
                 const totalPaidBefore = (sumBefore._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
                 const remainingBefore = new Prisma.Decimal(invoice.total)
                   .sub(totalPaidBefore)
@@ -2989,18 +3089,20 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   );
                 }
 
-                const journalEntry = await postJournalEntry(tx, {
-                  companyId,
-                  date: paymentDate,
-                  description: `Payment for Invoice ${invoice.invoiceNumber}`,
-                  locationId: (invoice as any).locationId ?? null,
-                  createdByUserId: (request as any).user?.userId ?? null,
-                  skipAccountValidation: true,
-                  lines: [
-                    { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
-                    { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
-                  ],
-                });
+                const journalEntry = await span('invoice.payment.postJournalEntry', async () =>
+                  postJournalEntry(tx, {
+                    companyId,
+                    date: paymentDate,
+                    description: `Payment for Invoice ${invoice.invoiceNumber}`,
+                    locationId: (invoice as any).locationId ?? null,
+                    createdByUserId: (request as any).user?.userId ?? null,
+                    skipAccountValidation: true,
+                    lines: [
+                      { accountId: bankAccount.id, debit: amount, credit: new Prisma.Decimal(0) },
+                      { accountId: arAccount.id, debit: new Prisma.Decimal(0), credit: amount },
+                    ],
+                  })
+                );
 
                 // Payment attachment (optional). Prefer selecting from pending proofs by id.
                 const pendingProofId =
@@ -3026,17 +3128,19 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   }
                 }
 
-                const payment = await tx.payment.create({
-                  data: {
-                    companyId,
-                    invoiceId: invoice.id,
-                    paymentDate,
-                    amount,
-                    bankAccountId: bankAccount.id,
-                    journalEntryId: journalEntry.id,
-                    attachmentUrl,
-                  },
-                });
+                const payment = await span('invoice.payment.writePayment', async () =>
+                  tx.payment.create({
+                    data: {
+                      companyId,
+                      invoiceId: invoice.id,
+                      paymentDate,
+                      amount,
+                      bankAccountId: bankAccount.id,
+                      journalEntryId: journalEntry.id,
+                      attachmentUrl,
+                    },
+                  })
+                );
 
                 // If attachmentUrl was selected from pendingPaymentProofs, DO NOT delete it.
                 // Keep it visible to the customer for reference, but lock edits once payment is recorded
@@ -3055,24 +3159,26 @@ export async function booksRoutes(fastify: FastifyInstance) {
                       usedByPaymentId: payment.id,
                     };
                   });
-                  await tx.invoice.updateMany({
-                    where: { id: invoice.id, companyId },
-                    data: { pendingPaymentProofs: next.length > 0 ? next : Prisma.DbNull },
-                  });
+                  await span('invoice.payment.updateProofs', async () =>
+                    tx.invoice.updateMany({
+                      where: { id: invoice.id, companyId },
+                      data: { pendingPaymentProofs: next.length > 0 ? next : Prisma.DbNull },
+                    })
+                  );
                 }
 
-                // Guardrail: compute paid from source-of-truth (non-reversed payments) to prevent drift.
-                const sumAgg = await tx.payment.aggregate({
-                  where: { invoiceId: invoice.id, companyId, reversedAt: null },
-                  _sum: { amount: true },
-                });
-                const totalPaid = (sumAgg._sum.amount ?? new Prisma.Decimal(0)).toDecimalPlaces(2);
+                // With invoice row locked (FOR UPDATE), there cannot be concurrent non-reversed payments
+                // inserted for this invoice within the same company. We can safely compute paid-after
+                // from the "before" aggregate plus this amount (saves one aggregate query).
+                const totalPaid = totalPaidBefore.add(amount).toDecimalPlaces(2);
                 const newStatus = totalPaid.greaterThanOrEqualTo(invoice.total) ? 'PAID' : 'PARTIAL';
 
-                const updInv = await tx.invoice.updateMany({
-                  where: { id: invoice.id, companyId },
-                  data: { amountPaid: totalPaid, status: newStatus },
-                });
+                const updInv = await span('invoice.payment.updateInvoice', async () =>
+                  tx.invoice.updateMany({
+                    where: { id: invoice.id, companyId },
+                    data: { amountPaid: totalPaid, status: newStatus },
+                  })
+                );
                 if ((updInv as any).count !== 1) {
                   throw Object.assign(new Error('invoice not found'), { statusCode: 404 });
                 }
@@ -3099,51 +3205,54 @@ export async function booksRoutes(fastify: FastifyInstance) {
                   },
                 });
 
-                // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
-                const jeEventId = randomUUID();
-                await tx.event.create({
-                  data: {
-                    companyId,
-                    eventId: jeEventId,
-                    eventType: 'journal.entry.created',
-                    schemaVersion: 'v1',
-                    occurredAt: new Date(occurredAt),
-                    source: 'cashflow-api',
-                    partitionKey: String(companyId),
-                    correlationId,
-                    aggregateType: 'JournalEntry',
-                    aggregateId: String(journalEntry.id),
-                    type: 'JournalEntryCreated',
-                    payload: {
-                      journalEntryId: journalEntry.id,
+                const { jeEventId, paymentEventId } = await span('invoice.payment.outbox', async () => {
+                  // Event: journal.entry.created (so worker updates AccountBalance/DailySummary)
+                  const jeEventId = randomUUID();
+                  await tx.event.create({
+                    data: {
                       companyId,
+                      eventId: jeEventId,
+                      eventType: 'journal.entry.created',
+                      schemaVersion: 'v1',
+                      occurredAt: new Date(occurredAt),
+                      source: 'cashflow-api',
+                      partitionKey: String(companyId),
+                      correlationId,
+                      aggregateType: 'JournalEntry',
+                      aggregateId: String(journalEntry.id),
+                      type: 'JournalEntryCreated',
+                      payload: {
+                        journalEntryId: journalEntry.id,
+                        companyId,
+                      },
                     },
-                  },
-                });
+                  });
 
-                // Event: payment.recorded (document-level)
-                const paymentEventId = randomUUID();
-                await tx.event.create({
-                  data: {
-                    companyId,
-                    eventId: paymentEventId,
-                    eventType: 'payment.recorded',
-                    schemaVersion: 'v1',
-                    occurredAt: new Date(occurredAt),
-                    source: 'cashflow-api',
-                    partitionKey: String(companyId),
-                    correlationId,
-                    aggregateType: 'Payment',
-                    aggregateId: String(payment.id),
-                    type: 'PaymentRecorded',
-                    payload: {
-                      paymentId: payment.id,
-                      invoiceId: invoice.id,
-                      journalEntryId: journalEntry.id,
-                      amount: amount.toString(),
-                      bankAccountId: bankAccount.id,
+                  // Event: payment.recorded (document-level)
+                  const paymentEventId = randomUUID();
+                  await tx.event.create({
+                    data: {
+                      companyId,
+                      eventId: paymentEventId,
+                      eventType: 'payment.recorded',
+                      schemaVersion: 'v1',
+                      occurredAt: new Date(occurredAt),
+                      source: 'cashflow-api',
+                      partitionKey: String(companyId),
+                      correlationId,
+                      aggregateType: 'Payment',
+                      aggregateId: String(payment.id),
+                      type: 'PaymentRecorded',
+                      payload: {
+                        paymentId: payment.id,
+                        invoiceId: invoice.id,
+                        journalEntryId: journalEntry.id,
+                        amount: amount.toString(),
+                        bankAccountId: bankAccount.id,
+                      },
                     },
-                  },
+                  });
+                  return { jeEventId, paymentEventId };
                 });
 
                 return { updatedInvoice, payment, journalEntry, jeEventId, paymentEventId };
@@ -4211,6 +4320,17 @@ export async function booksRoutes(fastify: FastifyInstance) {
               throw Object.assign(new Error('credit note is POSTED but missing journal entry link'), { statusCode: 500 });
             }
 
+            const [appCount, refundedAmt] = await Promise.all([
+              tx.creditNoteApplication.count({ where: { companyId, creditNoteId: cn.id } }),
+              tx.creditNote.findFirst({ where: { id: cn.id, companyId }, select: { amountRefunded: true } as any }).then((r: any) => r?.amountRefunded ?? 0),
+            ]);
+            if (appCount > 0) {
+              throw Object.assign(new Error('cannot adjust a credit note that has been applied to invoices (unapply first)'), { statusCode: 400 });
+            }
+            if (new Prisma.Decimal(refundedAmt ?? 0).toDecimalPlaces(2).greaterThan(0)) {
+              throw Object.assign(new Error('cannot adjust a credit note that has refunds (void refunds first)'), { statusCode: 400 });
+            }
+
             // Validate items and optional income accounts (tenant-safe)
             const itemIds = Array.from(new Set(lines.map((l) => Number(l.itemId)).filter(Boolean)));
             type ItemRow = { id: number; name: string | null };
@@ -4530,6 +4650,11 @@ export async function booksRoutes(fastify: FastifyInstance) {
             if (cn.status !== 'POSTED') throw Object.assign(new Error('only POSTED credit notes can be voided'), { statusCode: 400 });
             if (!cn.journalEntryId || !cn.journalEntry) {
               throw Object.assign(new Error('credit note is POSTED but missing journal entry link'), { statusCode: 500 });
+            }
+
+            const appCount = await tx.creditNoteApplication.count({ where: { companyId, creditNoteId: cn.id } });
+            if (appCount > 0) {
+              throw Object.assign(new Error('cannot void a credit note that has been applied to invoices (unapply first)'), { statusCode: 400 });
             }
 
             // Reverse active adjustment first (if any)
@@ -4895,7 +5020,10 @@ export async function booksRoutes(fastify: FastifyInstance) {
       where: { id: creditNoteId, companyId },
       include: {
         customer: true,
-        appliedInvoice: { select: { id: true, invoiceNumber: true, invoiceDate: true, total: true } } as any,
+        applications: {
+          include: { invoice: { select: { id: true, invoiceNumber: true, invoiceDate: true, total: true } } },
+          orderBy: [{ appliedDate: 'desc' }, { id: 'desc' }],
+        } as any,
         lines: creditNoteLinesIncludeWithIncomeAccount,
         refunds: {
           orderBy: [{ refundDate: 'desc' }, { id: 'desc' }],
@@ -4910,7 +5038,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
     }
     const total = new Prisma.Decimal((cn as any).total ?? 0).toDecimalPlaces(2);
     const refunded = new Prisma.Decimal((cn as any).amountRefunded ?? 0).toDecimalPlaces(2);
-    const applied = (cn as any).appliedInvoiceId ? total : new Prisma.Decimal(0);
+    const applied = new Prisma.Decimal((cn as any).amountApplied ?? 0).toDecimalPlaces(2);
     const creditsRemaining = total.sub(refunded).sub(applied).toDecimalPlaces(2);
 
     return { ...(cn as any), creditsRemaining: creditsRemaining.toString() };
@@ -4991,17 +5119,15 @@ export async function booksRoutes(fastify: FastifyInstance) {
 
             const cn = await tx.creditNote.findFirst({
               where: { id: creditNoteId, companyId },
-              select: { id: true, status: true, total: true, amountRefunded: true, appliedInvoiceId: true, creditNoteNumber: true, customerId: true } as any,
+              select: { id: true, status: true, total: true, amountRefunded: true, amountApplied: true, creditNoteNumber: true, customerId: true } as any,
             });
             if (!cn) throw Object.assign(new Error('credit note not found'), { statusCode: 404 });
             if (cn.status !== 'POSTED') throw Object.assign(new Error('only POSTED credit notes can be refunded'), { statusCode: 400 });
-            if ((cn as any).appliedInvoiceId) {
-              throw Object.assign(new Error('credit note is applied to an invoice (unapply it before refunding)'), { statusCode: 400 });
-            }
 
             const total = new Prisma.Decimal((cn as any).total ?? 0).toDecimalPlaces(2);
             const refunded = new Prisma.Decimal((cn as any).amountRefunded ?? 0).toDecimalPlaces(2);
-            const remaining = total.sub(refunded).toDecimalPlaces(2);
+            const applied = new Prisma.Decimal((cn as any).amountApplied ?? 0).toDecimalPlaces(2);
+            const remaining = total.sub(refunded).sub(applied).toDecimalPlaces(2);
             if (amount.greaterThan(remaining)) {
               throw Object.assign(new Error(`amount cannot exceed remaining credit of ${remaining.toString()}`), { statusCode: 400 });
             }
@@ -5442,7 +5568,7 @@ export async function booksRoutes(fastify: FastifyInstance) {
               // IMPORTANT:
               // Do NOT update the source invoice settlement status here.
               // Posting a credit note creates an open customer credit balance; it becomes a "payment-like" settlement
-              // ONLY when user applies it to an invoice (CreditNote.appliedInvoiceId) via Apply Credits flow.
+              // ONLY when user applies it to an invoice (CreditNoteApplication) via Apply Credits flow.
 
               const jeEventId = randomUUID();
               await tx.event.create({

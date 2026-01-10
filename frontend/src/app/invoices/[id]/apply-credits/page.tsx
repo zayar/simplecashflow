@@ -6,7 +6,15 @@ import { useParams } from 'next/navigation';
 import { ArrowLeft } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
-import { applyCreditNoteToInvoice, applyCustomerAdvanceToInvoice, fetchApi, getCustomerAdvances, getCustomerCreditNotes, CreditNoteListRow, CustomerAdvanceListRow } from '@/lib/api';
+import {
+  applyCreditNoteToInvoice,
+  applyCustomerAdvanceToInvoice,
+  fetchApi,
+  getCustomerAdvances,
+  getCustomerCreditNotes,
+  CreditNoteListRow,
+  CustomerAdvanceListRow,
+} from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -28,6 +36,7 @@ export default function ApplyCreditsToInvoicePage() {
 
   const [form, setForm] = useState({ customerAdvanceId: '', amount: '', appliedDate: '' });
   const [cnId, setCnId] = useState('');
+  const [cnAmount, setCnAmount] = useState('');
 
   useEffect(() => {
     if (!user?.companyId || !invoiceId || Number.isNaN(invoiceId)) return;
@@ -54,6 +63,25 @@ export default function ApplyCreditsToInvoicePage() {
   }, [tz]);
 
   const remainingInvoice = useMemo(() => Number(invoice?.remainingBalance ?? 0), [invoice]);
+  const eligibleCreditNotes = useMemo(() => (creditNotes ?? []).filter((c) => Number((c as any).remaining ?? 0) > 0), [creditNotes]);
+  const selectedCn = useMemo(
+    () => eligibleCreditNotes.find((c) => String(c.id) === String(cnId)) ?? null,
+    [eligibleCreditNotes, cnId]
+  );
+
+  const suggestedCnMax = useMemo(() => {
+    const cnRemaining = Number((selectedCn as any)?.remaining ?? 0);
+    return Math.max(0, Math.min(cnRemaining, remainingInvoice));
+  }, [selectedCn, remainingInvoice]);
+
+  useEffect(() => {
+    // Prefill suggested amount when selecting a credit note
+    if (!selectedCn) return;
+    if (!cnAmount || Number(cnAmount) <= 0) {
+      if (suggestedCnMax > 0) setCnAmount(String(suggestedCnMax));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCn?.id, suggestedCnMax]);
   const eligibleCredits = useMemo(() => (credits ?? []).filter((c) => Number(c.remaining) > 0), [credits]);
   const selected = useMemo(
     () => eligibleCredits.find((c) => String(c.id) === String(form.customerAdvanceId)) ?? null,
@@ -91,9 +119,14 @@ export default function ApplyCreditsToInvoicePage() {
     e.preventDefault();
     if (!user?.companyId) return;
     if (!cnId) return alert('Select a credit note');
+    const amt = Number(cnAmount);
+    if (!amt || amt <= 0) return alert('Enter amount > 0');
     setSubmitting(true);
     try {
-      await applyCreditNoteToInvoice(user.companyId, invoiceId, Number(cnId));
+      await applyCreditNoteToInvoice(user.companyId, invoiceId, Number(cnId), {
+        amount: amt,
+        appliedDate: form.appliedDate || undefined,
+      });
       if (typeof window !== 'undefined') window.location.assign(`/invoices/${invoiceId}`);
     } catch (err: any) {
       alert(err?.message ?? 'Failed to apply credit note');
@@ -140,24 +173,52 @@ export default function ApplyCreditsToInvoicePage() {
           {creditNotes.length > 0 ? (
             <div className="mb-6 rounded-lg border bg-muted/10 p-4">
               <div className="mb-2 text-sm font-medium">Apply Credit Note (Return)</div>
-              <form onSubmit={applyCreditNote} className="flex flex-col gap-3 md:flex-row md:items-end">
+              <form onSubmit={applyCreditNote} className="grid gap-3 md:grid-cols-4 md:items-end">
                 <div className="grid gap-2 md:flex-1">
                   <Label>Credit Note</Label>
                   <SelectNative value={cnId} onChange={(e) => setCnId(e.target.value)}>
                     <option value="">Select a credit note…</option>
-                    {creditNotes.map((cn) => (
+                    {eligibleCreditNotes.map((cn) => (
                       <option key={cn.id} value={String(cn.id)}>
-                        {cn.creditNoteNumber} — {Number(cn.total).toLocaleString()}
+                        {cn.creditNoteNumber} — remaining {Number((cn as any).remaining ?? 0).toLocaleString()}
                       </option>
                     ))}
                   </SelectNative>
                   <div className="text-xs text-muted-foreground">
-                    Only POSTED credit notes that are not yet applied to any invoice are shown.
+                    Only POSTED credit notes with remaining balance are shown.
                   </div>
                 </div>
-                <Button type="submit" loading={submitting} loadingText="Applying..." disabled={remainingInvoice <= 0 || !cnId}>
-                  Apply Credit Note
-                </Button>
+                <div className="grid gap-2">
+                  <Label>Apply Date</Label>
+                  <Input
+                    type="date"
+                    value={form.appliedDate}
+                    onChange={(e) => setForm((p) => ({ ...p, appliedDate: e.target.value }))}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label>Amount</Label>
+                  <Input
+                    type="number"
+                    inputMode="decimal"
+                    step="0.01"
+                    min="0"
+                    value={cnAmount}
+                    onChange={(e) => setCnAmount(e.target.value)}
+                    placeholder={suggestedCnMax ? `Max ${suggestedCnMax.toLocaleString()}` : '0'}
+                    disabled={!cnId}
+                  />
+                  {selectedCn ? (
+                    <div className="text-xs text-muted-foreground">
+                      Credit remaining: <b>{Number((selectedCn as any).remaining ?? 0).toLocaleString()}</b>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="flex justify-end">
+                  <Button type="submit" loading={submitting} loadingText="Applying..." disabled={remainingInvoice <= 0 || !cnId}>
+                    Apply
+                  </Button>
+                </div>
               </form>
             </div>
           ) : null}

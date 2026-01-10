@@ -3,7 +3,7 @@ import { AccountType, ItemType, Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { requireCompanyIdParam } from '../../utils/tenant.js';
 import { getRedis } from '../../infrastructure/redis.js';
-import { runWithResourceLockRetry, withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
+import { withLockBestEffort, withLocksBestEffort } from '../../infrastructure/locks.js';
 import { runIdempotentRequest } from '../../infrastructure/commandIdempotency.js';
 import { isoNow, normalizeToDay, parseDateInput } from '../../utils/date.js';
 import { requireAnyRole, Roles } from '../../utils/rbac.js';
@@ -120,20 +120,15 @@ export async function purchaseOrdersRoutes(fastify) {
         const lockKey = `lock:purchase-order:create:${companyId}:${orderDate.toISOString().slice(0, 10)}`;
         const { response } = await withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
             const created = await prisma.$transaction(async (tx) => {
-                // OPTIMIZED: Batch validate vendor + location + all items in parallel
-                const lineItemIds = (body.lines ?? []).map((l) => Number(l.itemId)).filter((id) => Number.isInteger(id) && id > 0);
-                const [periodCheck, vendorResult, locResult, itemsResult] = await Promise.all([
-                    assertOpenPeriodOrThrow(tx, { companyId, transactionDate: orderDate, action: 'purchase_order.create' }).then(() => true),
-                    body.vendorId ? tx.vendor.findFirst({ where: { id: body.vendorId, companyId }, select: { id: true } }) : Promise.resolve({ id: body.vendorId }),
-                    tx.location.findFirst({ where: { id: locationId, companyId }, select: { id: true } }),
-                    lineItemIds.length > 0 ? tx.item.findMany({ where: { id: { in: lineItemIds }, companyId }, select: { id: true } }) : Promise.resolve([]),
-                ]);
-                void periodCheck;
-                if (body.vendorId && !vendorResult)
-                    throw Object.assign(new Error('vendorId not found in this company'), { statusCode: 400 });
-                if (!locResult)
+                await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: orderDate, action: 'purchase_order.create' });
+                if (body.vendorId) {
+                    const vendor = await tx.vendor.findFirst({ where: { id: body.vendorId, companyId } });
+                    if (!vendor)
+                        throw Object.assign(new Error('vendorId not found in this company'), { statusCode: 400 });
+                }
+                const loc = await tx.location.findFirst({ where: { id: locationId, companyId } });
+                if (!loc)
                     throw Object.assign(new Error('locationId not found in this company'), { statusCode: 400 });
-                const validItemIds = new Set(itemsResult.map((i) => i.id));
                 let total = new Prisma.Decimal(0);
                 const computedLines = [];
                 for (const [idx, l] of (body.lines ?? []).entries()) {
@@ -149,8 +144,8 @@ export async function purchaseOrdersRoutes(fastify) {
                         throw Object.assign(new Error(`lines[${idx}].unitCost must be > 0`), { statusCode: 400 });
                     if (!Number.isFinite(discountAmount) || discountAmount < 0)
                         throw Object.assign(new Error(`lines[${idx}].discountAmount must be >= 0`), { statusCode: 400 });
-                    // OPTIMIZED: Check against pre-fetched items instead of individual query
-                    if (!validItemIds.has(itemId))
+                    const item = await tx.item.findFirst({ where: { id: itemId, companyId }, select: { id: true } });
+                    if (!item)
                         throw Object.assign(new Error(`lines[${idx}].itemId not found in this company`), { statusCode: 400 });
                     const qtyDec = d2(qty);
                     const unitDec = d2(unitCost);
@@ -753,8 +748,8 @@ export async function purchaseOrdersRoutes(fastify) {
                     if (po.status === 'CANCELLED')
                         throw Object.assign(new Error('cannot bill a CANCELLED purchase order'), { statusCode: 400 });
                     const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
-                    // OPTIMIZED: Pre-analyze lines and batch validate expense accounts
-                    const nonTrackedLines = [];
+                    let total = new Prisma.Decimal(0);
+                    const linesCreate = [];
                     let skippedTracked = 0;
                     for (const [idx, l] of (po.lines ?? []).entries()) {
                         const item = l.item;
@@ -771,20 +766,9 @@ export async function purchaseOrdersRoutes(fastify) {
                                 statusCode: 400,
                             });
                         }
-                        nonTrackedLines.push({ idx, line: l, item, accountId });
-                    }
-                    // Batch validate all expense accounts in one query
-                    const accountIdsToCheck = Array.from(new Set(nonTrackedLines.map((x) => x.accountId)));
-                    const validAccounts = accountIdsToCheck.length > 0
-                        ? await tx.account.findMany({ where: { id: { in: accountIdsToCheck }, companyId, type: 'EXPENSE' }, select: { id: true } })
-                        : [];
-                    const validAccountIds = new Set(validAccounts.map((a) => a.id));
-                    let total = new Prisma.Decimal(0);
-                    const linesCreate = [];
-                    for (const { idx, line: l, accountId } of nonTrackedLines) {
-                        if (!validAccountIds.has(accountId)) {
+                        const acc = await tx.account.findFirst({ where: { id: accountId, companyId, type: 'EXPENSE' } });
+                        if (!acc)
                             throw Object.assign(new Error(`line[${idx}] item.expenseAccountId must be an EXPENSE account in this company`), { statusCode: 400 });
-                        }
                         const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                         const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
                         const disc = new Prisma.Decimal(l.discountAmount ?? 0).toDecimalPlaces(2);
@@ -896,27 +880,18 @@ export async function purchaseOrdersRoutes(fastify) {
         // Pre-read to compute stock locks (avoid concurrent WAC updates)
         const prePo = await prisma.purchaseOrder.findFirst({
             where: { companyId, id: purchaseOrderId },
-            select: {
-                id: true,
-                locationId: true,
-                lines: { select: { itemId: true, item: { select: { type: true, trackInventory: true } } } },
-            },
+            select: { id: true, locationId: true, lines: { select: { itemId: true } } },
         });
         if (!prePo) {
             reply.status(404);
             return { error: 'purchase order not found' };
         }
-        // Only lock stock for tracked inventory items (avoid unnecessary conflicts for services/non-inventory).
-        const trackedItemIds = Array.from(new Set((prePo.lines ?? [])
-            .filter((l) => l?.itemId && l?.item?.type === 'GOODS' && !!l?.item?.trackInventory)
-            .map((l) => Number(l.itemId))
-            .filter((n) => Number.isFinite(n) && n > 0)));
-        const stockLocks = Array.from(new Set(trackedItemIds.map((itemId) => `lock:stock:${companyId}:${prePo.locationId}:${itemId}`)));
+        const stockLocks = Array.from(new Set((prePo.lines ?? []).map((l) => `lock:stock:${companyId}:${prePo.locationId}:${l.itemId}`)));
         const correlationId = randomUUID();
         const occurredAt = isoNow();
         const lockKey = `lock:purchase-order:receive-and-bill:${companyId}:${purchaseOrderId}`;
         try {
-            const { replay, response: result } = await runWithResourceLockRetry(() => withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
+            const { replay, response: result } = await withLocksBestEffort(redis, stockLocks, 30_000, async () => withLockBestEffort(redis, lockKey, 30_000, async () => runIdempotentRequest(prisma, companyId, idempotencyKey, async () => {
                 const txResult = await prisma.$transaction(async (tx) => {
                     await tx.$queryRaw `
                 SELECT id FROM PurchaseOrder
@@ -1030,20 +1005,14 @@ export async function purchaseOrdersRoutes(fastify) {
                         metadata: { purchaseOrderId: po.id, poNumber: po.poNumber, receiptNumber, receiptDate, total: receiptTotal.toString() },
                     });
                     // Post receipt (DRAFT -> POSTED): creates stock moves + JE Dr Inventory / Cr GRNI
-                    // OPTIMIZED: Skip duplicate period check - same date already checked above
-                    // OPTIMIZED: Batch fetch inventory config + GRNI account in parallel
-                    const [cfg, grniId] = await Promise.all([
-                        ensureInventoryCompanyDefaults(tx, companyId),
-                        ensureGrniAccount(tx, companyId),
-                    ]);
+                    await assertOpenPeriodOrThrow(tx, { companyId, transactionDate: new Date(r.receiptDate), action: 'purchase_receipt.post' });
+                    const cfg = await ensureInventoryCompanyDefaults(tx, companyId);
                     if (!cfg.inventoryAssetAccountId)
                         throw Object.assign(new Error('company.inventoryAssetAccountId is not set'), { statusCode: 400 });
+                    const grniId = await ensureGrniAccount(tx, companyId);
                     const grniAcc = await tx.account.findFirst({ where: { id: grniId, companyId, type: AccountType.LIABILITY } });
                     if (!grniAcc)
                         throw Object.assign(new Error('GRNI account must be a LIABILITY in this company'), { statusCode: 400 });
-                    // OPTIMIZED: Batch ensure inventory items
-                    const itemIdsToEnsure = (r.lines ?? []).map((l) => l.itemId);
-                    await Promise.all(itemIdsToEnsure.map((itemId) => ensureInventoryItem(tx, companyId, itemId)));
                     let recomputedTotal = new Prisma.Decimal(0);
                     let inventoryRecalcFromDate = null;
                     for (const [idx, l] of (r.lines ?? []).entries()) {
@@ -1051,6 +1020,7 @@ export async function purchaseOrdersRoutes(fastify) {
                         if (!item || item.type !== ItemType.GOODS || !item.trackInventory) {
                             throw Object.assign(new Error(`line[${idx}] item must be tracked GOODS`), { statusCode: 400 });
                         }
+                        await ensureInventoryItem(tx, companyId, l.itemId);
                         const qty = new Prisma.Decimal(l.quantity).toDecimalPlaces(2);
                         const unitCost = new Prisma.Decimal(l.unitCost).toDecimalPlaces(2);
                         const lineTotal = new Prisma.Decimal(l.lineTotal).toDecimalPlaces(2);
@@ -1093,9 +1063,7 @@ export async function purchaseOrdersRoutes(fastify) {
                         description: `Purchase Receipt ${r.receiptNumber}${r.vendor ? ` from ${r.vendor.name}` : ''}`,
                         locationId: r.locationId,
                         createdByUserId: request.user?.userId ?? null,
-                        skipAccountValidation: true, // OPTIMIZED: accounts from ensured company defaults
-                        skipPeriodCheck: true, // OPTIMIZED: already checked above
-                        skipLocationValidation: true, // OPTIMIZED: locationId from PO row
+                        skipAccountValidation: true,
                         lines: [
                             { accountId: cfg.inventoryAssetAccountId, debit: storedTotal, credit: new Prisma.Decimal(0) },
                             { accountId: grniAcc.id, debit: new Prisma.Decimal(0), credit: storedTotal },
@@ -1233,7 +1201,7 @@ export async function purchaseOrdersRoutes(fastify) {
                     };
                 });
                 return { ...txResult, _correlationId: correlationId, _occurredAt: occurredAt };
-            }, redis))));
+            }, redis)));
             if (!replay && result?._eventIds?.length) {
                 publishEventsFastPath(result._eventIds);
             }

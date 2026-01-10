@@ -32,6 +32,7 @@ export default function NewInvoicePage() {
   const { user, companySettings } = useAuth();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
+  const [posting, setPosting] = useState(false);
   const [customers, setCustomers] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
@@ -347,6 +348,93 @@ export default function NewInvoicePage() {
     return { grossSubtotal, discountTotal, netSubtotal, tax, total: netSubtotal + tax };
   }, [lines]);
 
+  const makeIdempotencyKey = () => {
+    return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? (crypto as any).randomUUID()
+      : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  };
+
+  const buildCreatePayload = () => {
+    if (!user?.companyId) return null;
+    const showFx = !!(isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0);
+    const factor = showFx ? fxRateToBase! : 1;
+    return {
+      customerId: Number(formData.customerId),
+      locationId: invoiceWarehouseId || undefined,
+      invoiceDate: formData.invoiceDate,
+      dueDate: formData.dueDate || undefined,
+      customerNotes: formData.customerNotes || undefined,
+      termsAndConditions: formData.termsAndConditions || undefined,
+      lines: lines.map((l: any) => {
+        const itemIdNum = Number(l.itemId || 0);
+        return {
+          ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
+          description: String(l.description ?? l.itemText ?? '').trim() || undefined,
+          quantity: Number(l.quantity),
+          unitPrice: Number(l.unitPrice) * factor,
+          taxRate: Number((l as any).taxRate || 0),
+          discountAmount: Number((l as any).discount || 0) * factor,
+          incomeAccountId:
+            Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
+              ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
+              : undefined,
+        };
+      }),
+    };
+  };
+
+  const saveDraft = async () => {
+    if (!user?.companyId) return;
+    if (loading || posting) return;
+    setLoading(true);
+    try {
+      const payload = buildCreatePayload();
+      if (!payload) return;
+      const created = await fetchApi(`/companies/${user.companyId}/invoices`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      // Keep current behavior: return to list after saving draft
+      router.push('/invoices');
+      return created;
+    } catch (err: any) {
+      console.error(err);
+      alert(err?.message || 'Failed to create invoice');
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveAndPost = async () => {
+    if (!user?.companyId) return;
+    if (loading || posting) return;
+    setPosting(true);
+    try {
+      const payload = buildCreatePayload();
+      if (!payload) return;
+      const created = await fetchApi(`/companies/${user.companyId}/invoices`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      const invoiceId = Number((created as any)?.id ?? 0);
+      if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+        throw new Error('Failed to create invoice (missing id)');
+      }
+      await fetchApi(`/companies/${user.companyId}/invoices/${invoiceId}/post`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': makeIdempotencyKey() },
+        body: JSON.stringify({}),
+      });
+      router.push(`/invoices/${invoiceId}`);
+    } catch (err: any) {
+      console.error(err);
+      alert(err?.message || 'Failed to post invoice');
+    } finally {
+      setPosting(false);
+    }
+  };
+
   const toggleEntryCurrency = () => {
     // Convert existing line values in-place so numbers stay logically the same.
     if (!isFxCustomer || !fxRateToBase || fxRateToBase <= 0) {
@@ -366,53 +454,16 @@ export default function NewInvoicePage() {
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
+    // default submit = save draft
     e.preventDefault();
-    if (!user?.companyId) return;
-    
-    setLoading(true);
-    try {
-      const showFx = !!(isFxCustomer && enterInCustomerCurrency && fxRateToBase && fxRateToBase > 0);
-      const factor = showFx ? fxRateToBase! : 1;
-      await fetchApi(`/companies/${user.companyId}/invoices`, {
-        method: 'POST',
-        body: JSON.stringify({
-          customerId: Number(formData.customerId),
-          locationId: invoiceWarehouseId || undefined,
-          invoiceDate: formData.invoiceDate,
-          dueDate: formData.dueDate || undefined,
-          customerNotes: formData.customerNotes || undefined,
-          termsAndConditions: formData.termsAndConditions || undefined,
-          lines: lines.map((l: any) => {
-            const itemIdNum = Number(l.itemId || 0);
-            return {
-              ...(itemIdNum > 0 ? { itemId: itemIdNum } : {}),
-              description: String(l.description ?? l.itemText ?? '').trim() || undefined,
-            quantity: Number(l.quantity),
-            unitPrice: Number(l.unitPrice) * factor,
-            taxRate: Number((l as any).taxRate || 0),
-            discountAmount: Number((l as any).discount || 0) * factor,
-            incomeAccountId:
-              Number((l as any).incomeAccountId || defaultIncomeAccountId || 0) > 0
-                ? Number((l as any).incomeAccountId || defaultIncomeAccountId || 0)
-                : undefined,
-            };
-          }),
-        }),
-      });
-      router.push('/invoices');
-    } catch (err: any) {
-      console.error(err);
-      alert(err?.message || 'Failed to create invoice');
-    } finally {
-      setLoading(false);
-    }
+    await saveDraft();
   };
 
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">New Invoice</h1>
-        <p className="text-sm text-muted-foreground">Create a draft invoice.</p>
+        <p className="text-sm text-muted-foreground">Save as draft or post now.</p>
       </div>
       
       <form onSubmit={handleSubmit}>
@@ -851,8 +902,11 @@ export default function NewInvoicePage() {
             <Button type="button" variant="outline" onClick={() => router.back()}>
               Cancel
             </Button>
-            <Button type="submit" disabled={loading}>
-              {loading ? 'Saving...' : 'Save as Draft'}
+            <Button type="button" variant="outline" onClick={saveDraft} disabled={loading || posting}>
+              {loading ? 'Saving...' : 'Save & Draft'}
+            </Button>
+            <Button type="button" onClick={saveAndPost} disabled={loading || posting}>
+              {posting ? 'Posting...' : 'Save & Post'}
             </Button>
           </div>
         </div>

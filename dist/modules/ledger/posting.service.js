@@ -28,20 +28,17 @@ export async function postJournalEntry(tx, input) {
     }
     // Fintech safety: prevent posting into closed periods.
     // We compare by day (00:00) so callers can pass any time-of-day safely.
-    // Can be skipped if caller already validated (avoids duplicate DB query).
-    if (!input.skipPeriodCheck) {
-        const day = new Date(date);
-        day.setHours(0, 0, 0, 0);
-        // CRITICAL FIX #4: Block posting on or before ANY closed period (not just within range).
-        // This prevents backdating entries after period close, which would reopen prior periods.
-        const latestClosed = await tx.periodClose.findFirst({
-            where: { companyId },
-            orderBy: { toDate: 'desc' },
-            select: { fromDate: true, toDate: true },
-        });
-        if (latestClosed && day <= latestClosed.toDate) {
-            throw Object.assign(new Error(`cannot post on or before closed period (latest close: ${latestClosed.fromDate.toISOString().slice(0, 10)} to ${latestClosed.toDate.toISOString().slice(0, 10)})`), { statusCode: 400 });
-        }
+    const day = new Date(date);
+    day.setHours(0, 0, 0, 0);
+    // CRITICAL FIX #4: Block posting on or before ANY closed period (not just within range).
+    // This prevents backdating entries after period close, which would reopen prior periods.
+    const latestClosed = await tx.periodClose.findFirst({
+        where: { companyId },
+        orderBy: { toDate: 'desc' },
+        select: { fromDate: true, toDate: true },
+    });
+    if (latestClosed && day <= latestClosed.toDate) {
+        throw Object.assign(new Error(`cannot post on or before closed period (latest close: ${latestClosed.fromDate.toISOString().slice(0, 10)} to ${latestClosed.toDate.toISOString().slice(0, 10)})`), { statusCode: 400 });
     }
     // Allocate a gapless journal entry number inside the same DB transaction.
     // If the posting transaction rolls back, the sequence increment rolls back too (no gaps).
@@ -80,9 +77,9 @@ export async function postJournalEntry(tx, input) {
             });
         }
     }
-    // Optional location tagging. Validate tenant safety (can be skipped if caller validated).
+    // Optional location tagging. Validate tenant safety.
     const locationId = input.locationId ?? input.warehouseId ?? null;
-    if (locationId && !input.skipLocationValidation) {
+    if (locationId) {
         const loc = await tx.location.findFirst({
             where: { id: locationId, companyId },
             select: { id: true },

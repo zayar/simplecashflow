@@ -23,16 +23,6 @@ export type PostJournalEntryInput = {
      * Use ONLY when the caller already validated all accounts in a tenant-safe way.
      */
     skipAccountValidation?: boolean;
-    /**
-     * If true, skips the period close check.
-     * Use ONLY when the caller already checked period close for the same date.
-     */
-    skipPeriodCheck?: boolean;
-    /**
-     * If true, skips location validation.
-     * Use ONLY when the caller already validated the locationId belongs to the company.
-     */
-    skipLocationValidation?: boolean;
     lines: PostingLineInput[];
 };
 /**

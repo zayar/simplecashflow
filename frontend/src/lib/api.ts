@@ -443,7 +443,7 @@ export type CreditNoteListRow = {
   creditNoteNumber: string;
   creditNoteDate: string;
   total: string;
-  invoiceId: number | null;
+  remaining: string;
 };
 
 export async function getCustomerCreditNotes(companyId: number, customerId: number, onlyOpen: boolean = true): Promise<CreditNoteListRow[]> {
@@ -454,12 +454,13 @@ export async function getCustomerCreditNotes(companyId: number, customerId: numb
 export async function applyCreditNoteToInvoice(
   companyId: number,
   invoiceId: number,
-  creditNoteId: number
-): Promise<{ invoiceId: number; creditNoteId: number; status: string }> {
+  creditNoteId: number,
+  args: { amount: number; appliedDate?: string } 
+): Promise<{ invoiceId: number; creditNoteId: number; creditNoteApplicationId: number; status: string }> {
   return fetchApi(`/companies/${companyId}/invoices/${invoiceId}/apply-credit-note`, {
     method: 'POST',
     headers: { 'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}` },
-    body: JSON.stringify({ creditNoteId }),
+    body: JSON.stringify({ creditNoteId, amount: args.amount, appliedDate: args.appliedDate ?? undefined }),
   });
 }
 

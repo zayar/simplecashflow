@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { ArrowLeft, CheckCircle2, Ban } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, Ban, Pencil, Trash2 } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from '@/lib/api';
@@ -74,6 +74,8 @@ export default function PurchaseReceiptDetailPage() {
 
   const canPost = r?.status === 'DRAFT';
   const canVoid = r?.status === 'POSTED';
+  const canEdit = r?.status === 'DRAFT';
+  const canDelete = r?.status === 'DRAFT';
 
   const total = useMemo(() => Number(r?.total ?? 0), [r?.total]);
 
@@ -104,6 +106,20 @@ export default function PurchaseReceiptDetailPage() {
       await load();
     } catch (err: any) {
       alert(err?.message ?? 'Failed to void receipt');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteReceipt() {
+    if (!user?.companyId) return;
+    if (!confirm('Delete this DRAFT purchase receipt?')) return;
+    setSaving(true);
+    try {
+      await fetchApi(`/companies/${user.companyId}/purchase-receipts/${id}`, { method: 'DELETE' });
+      if (typeof window !== 'undefined') window.location.assign('/purchase-receipts');
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to delete receipt');
     } finally {
       setSaving(false);
     }
@@ -164,6 +180,20 @@ export default function PurchaseReceiptDetailPage() {
           <Button variant="outline" onClick={() => window.print()}>
             Print
           </Button>
+          {canEdit ? (
+            <Link href={`/purchase-receipts/${id}/edit`}>
+              <Button variant="outline" className="gap-2">
+                <Pencil className="h-4 w-4" />
+                Edit
+              </Button>
+            </Link>
+          ) : null}
+          {canDelete ? (
+            <Button variant="destructive" className="gap-2" onClick={deleteReceipt} disabled={saving}>
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </Button>
+          ) : null}
           {r?.journalEntryId ? (
             <Link href={`/journal/${r.journalEntryId}`}>
               <Button variant="outline">View Journal Entry</Button>

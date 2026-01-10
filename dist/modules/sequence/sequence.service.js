@@ -90,11 +90,13 @@ export async function nextJournalEntryNumber(tx, companyId, date) {
         return Number.isFinite(maxN) && maxN > 0 ? Math.floor(maxN) : 0;
     }
     // Ensure row exists (race-safe).
+    let createdNewRow = false;
     try {
         await tx.documentSequence.create({
             data: { companyId, key, nextNumber: 1 },
             select: { id: true },
         });
+        createdNewRow = true;
     }
     catch (err) {
         if (err?.code !== 'P2002')
@@ -115,16 +117,24 @@ export async function nextJournalEntryNumber(tx, companyId, date) {
     if (!Number.isInteger(nextNumber) || nextNumber <= 0) {
         nextNumber = 1;
     }
-    const maxExisting = await readMaxExisting();
-    const minNext = maxExisting + 1;
-    if (nextNumber < minNext) {
-        // Catch up (still inside lock).
-        await tx.$executeRaw `
-      UPDATE DocumentSequence
-      SET nextNumber = ${minNext}
-      WHERE companyId = ${companyId} AND \`key\` = ${key}
-    `;
-        nextNumber = minNext;
+    // PERF NOTE:
+    // The MAX(entryNumber) scan can get expensive as JournalEntry grows.
+    // In steady-state, DocumentSequence.nextNumber will already be correct.
+    //
+    // We only "self-heal" when the row is newly created (first JE of the year / after migration),
+    // or when nextNumber is still at its initial value.
+    if (createdNewRow || nextNumber <= 1) {
+        const maxExisting = await readMaxExisting();
+        const minNext = maxExisting + 1;
+        if (nextNumber < minNext) {
+            // Catch up (still inside lock).
+            await tx.$executeRaw `
+        UPDATE DocumentSequence
+        SET nextNumber = ${minNext}
+        WHERE companyId = ${companyId} AND \`key\` = ${key}
+      `;
+            nextNumber = minNext;
+        }
     }
     // Allocate current, then increment for next caller.
     const allocated = nextNumber;

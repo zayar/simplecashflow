@@ -257,6 +257,14 @@ export default function CreditNoteDetailPage() {
       <div className="print-area rounded-lg border bg-muted/20 p-4 sm:p-6">
         <div className="print-paper mx-auto max-w-4xl rounded-lg border bg-white shadow-sm">
           <div className="p-0">
+            {(() => {
+              const refunded = Math.max(0, Number((cn as any).amountRefunded ?? 0));
+              const applied = Math.max(0, Number((cn as any).amountApplied ?? 0));
+              const showRefunded = refunded > 0;
+              // In the paper totals block, show "Refunded" when refunds exist (instead of lumping it into "Credit used").
+              const settledLabel = showRefunded ? 'Refunded' : 'Credit used';
+              const settledValue = showRefunded ? refunded : Math.max(0, Number(cn.total ?? 0) - Number(cn.creditsRemaining ?? 0));
+              return (
             <InvoicePaper
               invoice={{
                 invoiceNumber: cn.creditNoteNumber ?? `CN-${cn.id}`,
@@ -265,7 +273,7 @@ export default function CreditNoteDetailPage() {
                 dueDate: null,
                 currency: cn.currency ?? null,
                 total: cn.total ?? 0,
-                totalPaid: Math.max(0, Number(cn.total ?? 0) - Number(cn.creditsRemaining ?? 0)),
+                totalPaid: settledValue,
                 remainingBalance: cn.creditsRemaining ?? 0,
                 customer: { name: cn.customer?.name ?? null },
                 location: { name: cn.location?.name ?? cn.warehouse?.name ?? null },
@@ -292,8 +300,10 @@ export default function CreditNoteDetailPage() {
               locationLabel="Location"
               rateLabel="Unit price"
               balanceLabel="Credits remaining"
-              settledLabel="Credit used"
+              settledLabel={settledLabel}
             />
+              );
+            })()}
           </div>
         </div>
       </div>
@@ -327,6 +337,14 @@ export default function CreditNoteDetailPage() {
             <div className="font-semibold tabular-nums">{formatMoney(cn.creditsRemaining ?? 0)}</div>
           </div>
           <div>
+            <div className="text-xs text-muted-foreground">Applied (to invoices)</div>
+            <div className="font-medium tabular-nums">{formatMoney((cn as any).amountApplied ?? 0)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">Refunded</div>
+            <div className="font-medium tabular-nums">{formatMoney((cn as any).amountRefunded ?? 0)}</div>
+          </div>
+          <div>
             <div className="text-xs text-muted-foreground">Subtotal / Tax</div>
             <div className="font-medium tabular-nums">
               {formatMoney(cn.subtotal ?? 0)} / {formatMoney(cn.taxAmount ?? 0)}
@@ -339,40 +357,47 @@ export default function CreditNoteDetailPage() {
         </CardContent>
       </Card>
 
-      {cn.appliedInvoice ? (
+      {Array.isArray((cn as any).applications) && (cn as any).applications.length > 0 ? (
         <Card className="no-print shadow-sm">
           <CardHeader className="flex flex-row items-center justify-between space-y-0">
             <CardTitle className="text-lg">Credit Applied Invoices</CardTitle>
-            <Button variant="outline" onClick={removeFromInvoice} disabled={unapplying}>
-              {unapplying ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Remove
-            </Button>
+            {((cn as any).applications ?? []).length === 1 ? (
+              <Button variant="outline" onClick={removeFromInvoice} disabled={unapplying}>
+                {unapplying ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Remove
+              </Button>
+            ) : null}
           </CardHeader>
           <CardContent className="pt-0">
             <div className="rounded-lg border">
               <Table>
                 <TableHeader>
                   <TableRow className="bg-muted/40">
-                    <TableHead className="w-[160px]">Date</TableHead>
+                    <TableHead className="w-[160px]">Applied Date</TableHead>
                     <TableHead>Invoice Number</TableHead>
                     <TableHead className="text-right">Amount Credited</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  <TableRow>
-                    <TableCell className="text-muted-foreground">
-                      {String(cn.creditNoteDate ?? '').slice(0, 10)}
-                    </TableCell>
-                    <TableCell className="font-medium">
-                      <Link href={`/invoices/${cn.appliedInvoice.id}`} className="text-primary hover:underline">
-                        {cn.appliedInvoice.invoiceNumber}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="text-right font-medium tabular-nums">{formatMoney(cn.total)}</TableCell>
-                  </TableRow>
+                  {((cn as any).applications ?? []).map((a: any) => (
+                    <TableRow key={a.id}>
+                      <TableCell className="text-muted-foreground">{String(a.appliedDate ?? '').slice(0, 10)}</TableCell>
+                      <TableCell className="font-medium">
+                        <Link href={`/invoices/${a.invoice?.id ?? a.invoiceId}`} className="text-primary hover:underline">
+                          {a.invoice?.invoiceNumber ?? `#${a.invoiceId}`}
+                        </Link>
+                      </TableCell>
+                      <TableCell className="text-right font-medium tabular-nums">{formatMoney(a.amount)}</TableCell>
+                    </TableRow>
+                  ))}
                 </TableBody>
               </Table>
             </div>
+            {((cn as any).applications ?? []).length > 1 ? (
+              <div className="mt-2 text-xs text-muted-foreground">
+                This credit note is applied to multiple invoices. To unapply, please unapply from the invoice side (v2).
+              </div>
+            ) : null}
           </CardContent>
         </Card>
       ) : null}

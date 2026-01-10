@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, PackagePlus, CheckCircle2, Ban, FileText } from 'lucide-react';
+import { ArrowLeft, PackagePlus, CheckCircle2, Ban, FileText, Pencil, Trash2 } from 'lucide-react';
 
 import { useAuth } from '@/contexts/auth-context';
 import { fetchApi, getInvoiceTemplate, type InvoiceTemplate } from '@/lib/api';
@@ -48,6 +48,8 @@ export default function PurchaseOrderDetailPage() {
 
   const canApprove = po?.status === 'DRAFT';
   const canCancel = po?.status === 'DRAFT' || po?.status === 'APPROVED';
+  const canEdit = (po?.status === 'DRAFT' || po?.status === 'APPROVED') && linkedReceipts.length === 0 && linkedBills.length === 0;
+  const canDelete = canEdit;
 
   async function load() {
     if (!user?.companyId || !id || Number.isNaN(id)) return;
@@ -186,6 +188,20 @@ export default function PurchaseOrderDetailPage() {
     }
   }
 
+  async function deletePo() {
+    if (!user?.companyId) return;
+    if (!confirm('Delete this purchase order? This is only allowed when there are no linked receipts/bills.')) return;
+    setSaving(true);
+    try {
+      await fetchApi(`/companies/${user.companyId}/purchase-orders/${id}`, { method: 'DELETE' });
+      router.push('/purchase-orders');
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to delete purchase order');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       {/* Print styles: show the paper only */}
@@ -241,6 +257,20 @@ export default function PurchaseOrderDetailPage() {
           <Button variant="outline" onClick={() => window.print()}>
             Print
           </Button>
+          {canEdit ? (
+            <Link href={`/purchase-orders/${id}/edit`}>
+              <Button variant="outline" className="gap-2">
+                <Pencil className="h-4 w-4" />
+                Edit
+              </Button>
+            </Link>
+          ) : null}
+          {canDelete ? (
+            <Button variant="destructive" className="gap-2" onClick={deletePo} disabled={saving}>
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </Button>
+          ) : null}
           {canApprove && (
             <Button className="gap-2" onClick={approve} disabled={saving}>
               <CheckCircle2 className="h-4 w-4" />

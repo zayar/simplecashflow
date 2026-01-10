@@ -143,6 +143,25 @@ export default function PurchaseBillDetailPage() {
   const canReceivePayment = bill?.status === 'POSTED' || bill?.status === 'PARTIAL';
   const canApplyCredits = canReceivePayment && remaining > 0 && hasEligibleCredits;
 
+  const canEditOrAdjust = useMemo(() => {
+    if (!bill) return false;
+    if (bill.status === 'DRAFT' || bill.status === 'APPROVED') return true;
+    if (bill.status !== 'POSTED') return false;
+    const payCount = ((bill.payments ?? []) as any[]).filter((p: any) => !p.reversedAt).length;
+    const creditCount = ((bill.creditsApplied ?? []) as any[]).length;
+    const advCount = ((bill.vendorAdvanceApplications ?? []) as any[]).length;
+    return payCount === 0 && creditCount === 0 && advCount === 0;
+  }, [bill]);
+
+  const canVoidPosted = useMemo(() => {
+    if (!bill) return false;
+    if (bill.status !== 'POSTED') return false;
+    const payCount = ((bill.payments ?? []) as any[]).filter((p: any) => !p.reversedAt).length;
+    const creditCount = ((bill.creditsApplied ?? []) as any[]).length;
+    const advCount = ((bill.vendorAdvanceApplications ?? []) as any[]).length;
+    return payCount === 0 && creditCount === 0 && advCount === 0;
+  }, [bill]);
+
   const postBill = async () => {
     if (!user?.companyId) return;
     if (!confirm('Post this purchase bill? This will increase Inventory and Accounts Payable.')) return;
@@ -170,6 +189,21 @@ export default function PurchaseBillDetailPage() {
       if (typeof window !== 'undefined') window.location.assign('/purchase-bills');
     } catch (err: any) {
       alert(err?.message ?? 'Failed to delete purchase bill');
+    }
+  };
+
+  const voidBill = async () => {
+    if (!user?.companyId || !id || Number.isNaN(id)) return;
+    const reason = prompt('Void reason (required):') ?? '';
+    if (!reason.trim()) return;
+    try {
+      await fetchApi(`/companies/${user.companyId}/purchase-bills/${id}/void`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      await load();
+    } catch (err: any) {
+      alert(err?.message ?? 'Failed to void purchase bill');
     }
   };
 
@@ -248,16 +282,26 @@ export default function PurchaseBillDetailPage() {
           <Button variant="outline" onClick={() => window.print()}>
             Print
           </Button>
-          {bill?.status === 'DRAFT' ? (
+          {canEditOrAdjust ? (
             <Link href={`/purchase-bills/${id}/edit`} className={buttonVariants({ variant: 'outline' })}>
               <span className="inline-flex items-center gap-2">
-                <Pencil className="h-4 w-4" /> Edit
+                <Pencil className="h-4 w-4" /> {bill?.status === 'POSTED' ? 'Adjust' : 'Edit'}
               </span>
             </Link>
           ) : null}
           {bill?.status === 'DRAFT' || bill?.status === 'APPROVED' ? (
             <Button variant="destructive" onClick={deleteBill}>
               Delete
+            </Button>
+          ) : null}
+          {bill?.status === 'POSTED' ? (
+            <Button
+              variant="destructive"
+              onClick={voidBill}
+              disabled={!canVoidPosted}
+              title={!canVoidPosted ? 'Reverse payments / applied credits / advances first.' : undefined}
+            >
+              Delete (void)
             </Button>
           ) : null}
           {bill?.status === 'DRAFT' ? (
